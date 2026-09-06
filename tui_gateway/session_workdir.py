@@ -207,8 +207,19 @@ def _workdir_row_model_config(session: dict) -> tuple[str, dict]:
     global default here wins the INSERT-OR-IGNORE race (a reconnect silently reverts to the profile default).
     model_config carries provider/reasoning/service_tier so resume restores effort + fast too."""
     override = raw if isinstance(raw := session.get("model_override"), dict) else {}
-    row_model = str(override.get("model") or "").strip() or _resolve_model()
-    model_config: dict = {k: str(v) for k in ("model", "provider", "base_url", "api_mode") if (v := override.get(k))}
+    # A branch/fork child (parent_session_id set, source not in {subagent, tool}) must NOT inherit the parent's
+    # runtime model/override — that pin often reflects a delegation or fallback (e.g. OpenRouter routing to deepseek)
+    # that has since ended. Seed the row from the config default so resume honors config.model.default + routing
+    # rules; the ``_branched_from`` fork marker below is still preserved so the prompt-cache fork fence works.
+    # Genuine subagent/tool children DO inherit the orchestrator-chosen model (delegate_tool stamps _delegate_from
+    # on them intentionally).
+    is_fork_child = bool(session.get("parent_session_id")) and _session_source(session) not in {"subagent", "tool"}
+    if is_fork_child:
+        row_model = _resolve_model()
+        model_config: dict = {}
+    else:
+        row_model = str(override.get("model") or "").strip() or _resolve_model()
+        model_config: dict = {k: str(v) for k in ("model", "provider", "base_url", "api_mode") if (v := override.get(k))}
     # A RESOLVED provider "custom" (named ``providers:``/``custom_providers:`` entry) persisted bare here is the origin
     # of "No LLM provider configured" rows (resume routes to OpenRouter with no key). Recover the durable
     # ``custom:<name>`` identity (matches _runtime_model_config).

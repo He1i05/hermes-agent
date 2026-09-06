@@ -3090,6 +3090,34 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
             self.system_prompt = "\n\n".join(p for p in (self.system_prompt, skills_prompt) if p).strip()
             self.preloaded_skills = loaded_skills
 
+    def _resolve_model_default(self) -> str:
+        """Resolve the ambient config default model for a fresh session.
+
+        Used by /branch so a forked conversation lands on config.model.default
+        (plus routing rules), not the parent's transient runtime pin. Mirrors
+        the TUI gateway's ``_resolve_model()``: HERMES_MODEL env, then
+        config.model.default, then the cost-safe silent default.
+        """
+        env = (
+            os.environ.get("HERMES_MODEL", "")
+            or os.environ.get("HERMES_INFERENCE_MODEL", "")
+        ).strip()
+        if env:
+            return env
+        m = (self.config or {}).get("model", "")
+        if isinstance(m, dict):
+            default = str(m.get("default", "") or "").strip()
+            if default:
+                return default
+        elif isinstance(m, str) and m.strip():
+            return m.strip()
+        try:
+            from hermes_cli.models import get_preferred_silent_default_model
+
+            return get_preferred_silent_default_model()
+        except Exception:
+            return "z-ai/glm-5.2"
+
     def _show_tool_availability_warnings(self):
         """Warn about tools disabled by missing API keys (not system deps)."""
         try:

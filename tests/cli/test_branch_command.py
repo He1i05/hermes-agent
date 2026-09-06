@@ -40,6 +40,7 @@ def cli_instance(tmp_path, session_db):
     cli.model = "anthropic/claude-sonnet-4.6"
     cli.max_turns = 90
     cli.reasoning_config = {"enabled": True, "effort": "medium"}
+    cli._resolve_model_default = lambda: "z-ai/glm-5.3-flash"
     cli.session_start = datetime.now()
     cli._pending_title = None
     cli._resumed = False
