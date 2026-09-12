@@ -24,6 +24,7 @@ from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_capability as capability
+from hermes_cli import kanban_design as design
 from hermes_cli import kanban_discovery as discovery
 from hermes_cli import kanban_m2 as m2
 from hermes_cli import kanban_streams as streams
@@ -74,6 +75,8 @@ Output a single JSON object with this exact shape:
         "covers": ["<stream tag this card OWNS>", ...],
         "fold_in": {"<stream tag this card ABSORBS>": "<why>"},
         "deliverable": true,
+        "card_type": "<optional: 'design' for a DESIGN child, else omit>",
+        "design": {"<optional: the structured D1-D6 payload, see DESIGN CARDS>"},
         "parents": [<int>, ...]
       },
       ...
@@ -224,6 +227,13 @@ _SYSTEM_PROMPT += streams.coverage_prompt_block()
 # MARK the deliverable explicitly so the recipient is chosen on purpose.
 _SYSTEM_PROMPT += streams.deliverable_prompt_block()
 
+# T3 D1–D6 design-card contract (t_c5f32661): the decomposer assigns the
+# `system-design` phase itself, so it must instantiate the same contract the
+# specifier does — otherwise a design child is dispatched with zero D-sections
+# and is guaranteed rework. Rendered from kanban_design, the single source of
+# truth shared with the specifier prompt.
+_SYSTEM_PROMPT += design.design_prompt_block()
+
 
 _USER_TEMPLATE = """Task id: {task_id}
 Title: {title}
@@ -254,6 +264,9 @@ class DecomposeOutcome:
     fanout: bool = False
     child_ids: list[str] | None = None
     new_title: Optional[str] = None
+    #: True when the ``fanout=false`` promotion was written under the D1–D6
+    #: design contract (T3, t_c5f32661).
+    design_card: bool = False
 
 
 def _profile_author() -> str:
@@ -398,6 +411,20 @@ def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -
     # T4 C4.1: the single-task path reuses the specify body shape, so it gets
     # the research M2 block by the same rule as specify_task.
     body_val = _with_m2_block(title_val, body_val)
+    # T3 D1–D6: this path is the decomposer's own spec promotion, and it can
+    # classify a single card as `system-design` just as the fan-out path can
+    # (t_c5f32661). Same contract, same fold order (after M2), same module.
+    if design.is_design_card(
+        card_type=parsed.get("card_type"), phase=phase,
+        title=title_val or parsed.get("title"), body=body_val,
+        title_heuristic=False,
+    ):
+        design_card = True
+        body_val = design.ensure_design_contract(
+            body_val, parsed.get("design"), phase=phase,
+        )
+    else:
+        design_card = False
     with kbc.connect_closing() as conn:
         ok = kb.specify_triage_task(
             conn, task.id, title=title_val, body=body_val, assignee=assignee_val,
@@ -405,7 +432,10 @@ def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -
         )
     if not ok:
         return DecomposeOutcome(task.id, False, "task moved out of triage before promotion")
-    return DecomposeOutcome(task.id, True, "single task (no fanout)", fanout=False, new_title=title_val)
+    return DecomposeOutcome(
+        task.id, True, "single task (no fanout)", fanout=False, new_title=title_val,
+        design_card=design_card,
+    )
 
 
 def _declares_deliverable(entry: dict) -> bool:
@@ -469,6 +499,11 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
             "body": body.strip() if isinstance(body, str) else "",
             "assignee": chosen,
             "phase": phase,
+            # T3: the LLM's explicit design signals for this child. Kept on the
+            # child dict (like ``capability_tag``) so the fold below classifies
+            # on exactly what the model declared, not on a re-parse of prose.
+            "card_type": entry.get("card_type"),
+            "design": entry.get("design"),
             # Drop non-int, out-of-range and self parent indices.
             "parents": [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx],
             # W-8 declared stream coverage, carried straight from the reply.
@@ -531,6 +566,31 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
             task_id, len(emitted), emitted,
         )
     capability.append_bucket_headings(children)
+    # T3 D1–D6 contract (t_c5f32661): the decomposer assigns the `system-design`
+    # phase itself, so a design child must leave here WITH the contract — the
+    # specifier is not the only path that produces design cards. This is the
+    # LAST fold, deliberately:
+    #   * after the M2 classification, so the D-sections' own vocabulary
+    #     ("evaluate", "compare", "scout") cannot flip a design child into
+    #     research and staple a spurious M2 block onto it;
+    #   * after the bucket headings, because ``ensure_design_contract`` writes
+    #     the six blocks at the END of the body — the routing boilerplate stays
+    #     ABOVE D1, so the ordered D6 work list is never contaminated by a
+    #     trailing "Adoption: none" line folded into its last item.
+    # Ordinary (non-design) children pass through byte-identically.
+    for child in children:
+        if not design.is_design_card(
+            card_type=child.get("card_type"), phase=child.get("phase"),
+            title=child.get("title"), body=child.get("body"),
+            title_heuristic=False,
+        ):
+            continue
+        child["design_card"] = True
+        child["body"] = design.ensure_design_contract(
+            child.get("body"), child.get("design"), phase=child.get("phase"),
+        )
+        payload = child.get("design")
+        child["design_metadata"] = design.validate_design_payload(payload).as_metadata()
     return children, ""
 
 

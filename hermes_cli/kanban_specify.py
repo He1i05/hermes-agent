@@ -43,51 +43,14 @@ logger = logging.getLogger(__name__)
 
 def _design_contract_block() -> str:
     """The D1–D6 contract rendered from ``kanban_design`` (single source of
-    truth) for the specifier prompt: headings, purpose, requirement."""
-    lines = [
-        "",
-        "DESIGN CARDS (card_type: design) — the D1–D6 content contract",
-        "  When the idea is a system design / architecture decision (\"decide how",
-        "  to build X\", \"design the Y pipeline\"), it is a DESIGN CARD. Emit",
-        "  \"card_type\": \"design\" and put the design in a structured \"design\"",
-        "  object. The body MUST then carry ALL SIX of these sections, with their",
-        "  exact headings, AFTER the four standard sections above:",
-        "",
-    ]
-    for code in design.DESIGN_SECTION_ORDER:
-        section = design.DESIGN_SECTIONS[code]
-        lines.append(f"  **{section.heading}** — {section.purpose}")
-        lines.append(f"      ({section.requirement})")
-    lines += [
-        "",
-        "  Rules for a design card:",
-        "    - Always emit all six headings, in D1..D6 order, even when a section",
-        "      genuinely does not apply — write its placeholder \"none\" then.",
-        "    - Give the same content TWICE: once structured (the \"design\" object)",
-        "      and once inside \"body\" as the six sections. The body wins; the",
-        "      structured object is the machine-readable copy.",
-        "    - D5 must offer >=2 GENUINE alternatives (not a straw man), each with",
-        "      trade-offs, and end with a line naming the recommendation, e.g.",
-        "      \"RECOMMENDATION: Option A ...\". The recommendation MUST name one of",
-        "      the option labels.",
-        "    - D6 is an ORDERED work list (numbered) the engineering-planning card",
-        "      consumes directly — no prose.",
-        "    - A design card that does not apply to this idea (an ordinary task)",
-        "      must NOT be labelled design and must NOT carry D1–D6.",
-        "",
-        "  Structured shape for the \"design\" object (all six keys):",
-        "",
-        '    "design": {',
-        '      "D1": [{"name": "<concept>", "definition": "<one line>"}],',
-        '      "D2": [{"invariant": "<property that must hold>"}],',
-        '      "D3": [{"failure": "<risk>", "mitigation": "<how it is handled>"}],',
-        '      "D4": [{"surface": "<exact file/column/config key>", "change": "<what changes>"}],',
-        '      "D5": {"options": [{"label": "A", "name": "<alt>", "pros": "<pro>", "cons": "<con>"}]},',
-        '      "recommendation": "Option A — <why>",',
-        '      "D6": [{"step": "<ordered step>"}]',
-        '    }',
-    ]
-    return "\n".join(lines)
+    truth) for the specifier prompt: headings, purpose, requirement.
+
+    Delegates to ``kanban_design.design_prompt_block`` so the T3 text has ONE
+    definition shared with the decomposer prompt (which previously went
+    without it entirely — that gap is t_c5f32661). The specifier's bytes are
+    unchanged by the move.
+    """
+    return design.design_prompt_block()
 
 
 _DESIGN_PROMPT_BLOCK = _design_contract_block()
