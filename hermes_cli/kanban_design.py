@@ -161,10 +161,23 @@ def body_card_type(body: Any) -> Optional[str]:
 # Deliberately conservative: a title like "design a migration plan" (an
 # engineering-planning card) must NOT match, and neither must a card ABOUT the
 # template ("implement the design-card template").
+#
+# The bare ``system-design`` alternative carries a negative lookahead: a title
+# that merely names the PHASE — "… (system-design children get no design
+# contract)", "fix the system-design phase cascade" — is an implementation or
+# ops card, not a design. Only when the phrase stands as the design subject
+# ("System design for the kanban decomposer") does it count. Without the
+# lookahead the phase vocabulary leaks into the heuristic, which is the same
+# false-positive class as "implement the design-card template".
 _DESIGN_NOUNS = r"(?:pipeline|contract|schema|api|system|architecture|engine|protocol|interface|component|service)"
+_PHASE_MENTION_TAIL = (
+    r"(?!\s*(?:children|child|card|cards|phase|phases|cascade|step|steps|"
+    r"tag|tags|key|keys|column|columns|field|fields)\b)"
+)
 _DESIGN_INTENT_RE = re.compile(
     rf"(?i)\b(?:"
-    rf"system[- ]design|design[- ]doc(?:ument)?|architecture\s+(?:design|doc(?:ument)?)|"
+    rf"system[- ]design{_PHASE_MENTION_TAIL}|"
+    rf"design[- ]doc(?:ument)?|architecture\s+(?:design|doc(?:ument)?)|"
     rf"design\s+card\b(?![\s-]*template)|"
     rf"decide\s+how\s+to\s+build|"
     rf"design\s+(?:the|a|an|this)\s+(?:\w+\s+){{0,3}}?{_DESIGN_NOUNS}\b"
@@ -174,6 +187,7 @@ _DESIGN_INTENT_RE = re.compile(
 
 def is_design_card(
     *, card_type: Any = None, phase: Any = None, title: Any = "", body: Any = "",
+    title_heuristic: bool = True,
 ) -> bool:
     """True when a triage idea is a DESIGN card (gets the D1–D6 contract).
 
@@ -182,6 +196,14 @@ def is_design_card(
     frontmatter), a body already carrying >=2 D-sections, and finally a
     conservative design-intent phrase in the title. A plain card never
     matches by accident.
+
+    ``title_heuristic=False`` drops that last signal, leaving only the EXPLICIT
+    ones. The specifier needs the title fallback (the model may classify by
+    prose alone); the decomposer does not — it assigns ``phase`` itself, so it
+    must never pull an ordinary child into the contract off a title that merely
+    mentions design (e.g. "Fix the system-design phase cascade"). Callers on
+    the decomposer path pass ``title_heuristic=False`` so non-design children
+    stay byte-identical.
     """
     if isinstance(card_type, str):
         token = card_type.strip().lower()
@@ -198,6 +220,8 @@ def is_design_card(
     present = [code for code, lines in split_sections(body).items() if lines]
     if len(present) >= 2:
         return True
+    if not title_heuristic:
+        return False
     return bool(_DESIGN_INTENT_RE.search(str(title or "")))
 
 
@@ -530,9 +554,10 @@ def render_design_skeleton() -> str:
     return render_design_sections({})
 
 
-def merge_design_sections(body: Any, block: str) -> str:
-    """Return ``body`` with any existing D-section regions replaced by
-    ``block`` (idempotent: merging the same block twice yields one copy)."""
+def _strip_design_regions(body: Any) -> str:
+    """``body`` with every D-section region (heading + its lines) removed, the
+    non-contract text preserved. Shared by ``merge_design_sections`` and
+    ``ensure_design_contract`` so the two folds agree on what a region is."""
     text = body if isinstance(body, str) else ""
     lines = text.splitlines()
     kept: list[str] = []
@@ -545,10 +570,95 @@ def merge_design_sections(body: Any, block: str) -> str:
             continue
         kept.append(lines[idx])
         idx += 1
-    head = "\n".join(kept).strip()
+    return "\n".join(kept).strip()
+
+
+def merge_design_sections(body: Any, block: str) -> str:
+    """Return ``body`` with any existing D-section regions replaced by
+    ``block`` (idempotent: merging the same block twice yields one copy)."""
+    head = _strip_design_regions(body)
     if not head:
         return block.strip()
     return f"{head}\n\n{block.strip()}"
+
+
+def _existing_section_lines(items: Sequence[_Item]) -> list[str]:
+    """Body items re-emitted faithfully: an ordered item keeps its numbering
+    (D6's whole point is the order), a bulleted one is re-bulleted, and a
+    marker-less one stays marker-less — so ``ensure_design_contract`` is
+    idempotent on a body it already folded.
+
+    A structural line (the D5 ``RECOMMENDATION:`` line) is re-emitted with the
+    blank line ``_render_d5`` puts before it, which is what keeps it from being
+    folded into the last option as a wrapped continuation on the next parse.
+    """
+    out: list[str] = []
+    for item in items:
+        text = _item_text(item)
+        if not text:
+            continue
+        if item.numbered:
+            out.append(text)
+        elif item.bulleted:
+            out.append(f"- {text}")
+        else:
+            if out and _STRUCTURAL_LINE_RE.match(text):
+                out.append("")
+            out.append(text)
+    return out
+
+
+def _with_design_marker(body: str, phase: Any = None) -> str:
+    """``body`` whose first line is the ``card_type: design`` marker (written
+    once, never duplicated) and which carries a ``phase: <name>`` frontmatter
+    line when ``phase`` is given and the body has none."""
+    text = body or ""
+    lines = text.splitlines()
+    header: list[str] = []
+    if not any(body_card_type(line) for line in lines[:3]):
+        header.append(DESIGN_CARD_TYPE_LINE)
+    canonical = normalize_phase(phase)
+    if canonical and body_phase(text) is None:
+        header.append(f"phase: {canonical}")
+    if not header:
+        return text.strip()
+    return "\n".join([*header, "", text.strip()]) if text.strip() else "\n".join(header)
+
+
+def ensure_design_contract(body: Any, payload: Any = None, *, phase: Any = None) -> str:
+    """``body`` guaranteed to carry ALL SIX D-sections, in D1..D6 order.
+
+    The idempotent, LOSSLESS fold: used wherever no structured ``design``
+    payload is guaranteed (decomposer children, backfill of a card produced
+    before the contract existed). Distinct from the specifier's
+    ``merge_design_sections`` path, which renders purely from the payload:
+
+      * a section the body already carries keeps its item text VERBATIM (only
+        re-emitted, so the numbering of an ordered list survives);
+      * a section the body lacks is rendered from ``payload`` when the caller
+        has one, else the explicit ``none`` placeholder — the heading is always
+        present, so ``validate_design_card`` reports the gap by section instead
+        of a silent prose dump;
+      * the ``card_type: design`` marker is written as the FIRST body line (the
+        invariant the T3 tests and the M2 seam both pin);
+      * ``phase`` is written as a frontmatter line when the body carries none.
+
+    Running it twice yields the same body: the D-regions are re-derived from
+    what is already there.
+    """
+    text = body if isinstance(body, str) else ""
+    raw = split_sections(text)
+    items: Mapping[str, Any] = payload if isinstance(payload, Mapping) else {}
+    recommendation = items.get("recommendation") if isinstance(items, Mapping) else None
+    blocks: list[str] = []
+    for code in DESIGN_SECTION_ORDER:
+        lines = _existing_section_lines(raw.get(code) or [])
+        if not lines:
+            lines = render_section(code, items, recommendation)
+        blocks.append(f"**{DESIGN_SECTIONS[code].heading}**\n" + "\n".join(lines))
+    head = _strip_design_regions(text)
+    merged = "\n\n".join([head, *blocks]) if head else "\n\n".join(blocks)
+    return _with_design_marker(merged, phase=phase)
 
 
 # ---------------------------------------------------------------------------
@@ -804,3 +914,62 @@ def design_review_metadata(body: Any, *, is_design: Optional[bool] = None) -> di
     """Convenience wrapper for the review lane's ``kanban_request_review``
     metadata (BA-P3.1: D1–D6 verified item-by-item)."""
     return validate_design_card(body, is_design=is_design).review_metadata()
+
+
+# ---------------------------------------------------------------------------
+# Prompt block (single source of truth for BOTH card templates)
+# ---------------------------------------------------------------------------
+
+
+def design_prompt_block() -> str:
+    """The D1–D6 contract as the card templates' prompt block.
+
+    Rendered from ``DESIGN_SECTIONS`` so the specifier prompt, the decomposer
+    prompt and the review checklist cannot drift apart. Both templates append
+    this verbatim — the specifier's copy is byte-identical to the block that
+    preceded this module owning it (pinned by the T3 contract tests).
+    """
+    lines = [
+        "",
+        "DESIGN CARDS (card_type: design) — the D1–D6 content contract",
+        "  When the idea is a system design / architecture decision (\"decide how",
+        "  to build X\", \"design the Y pipeline\"), it is a DESIGN CARD. Emit",
+        "  \"card_type\": \"design\" and put the design in a structured \"design\"",
+        "  object. The body MUST then carry ALL SIX of these sections, with their",
+        "  exact headings, AFTER the four standard sections above:",
+        "",
+    ]
+    for code in DESIGN_SECTION_ORDER:
+        section = DESIGN_SECTIONS[code]
+        lines.append(f"  **{section.heading}** — {section.purpose}")
+        lines.append(f"      ({section.requirement})")
+    lines += [
+        "",
+        "  Rules for a design card:",
+        "    - Always emit all six headings, in D1..D6 order, even when a section",
+        "      genuinely does not apply — write its placeholder \"none\" then.",
+        "    - Give the same content TWICE: once structured (the \"design\" object)",
+        "      and once inside \"body\" as the six sections. The body wins; the",
+        "      structured object is the machine-readable copy.",
+        "    - D5 must offer >=2 GENUINE alternatives (not a straw man), each with",
+        "      trade-offs, and end with a line naming the recommendation, e.g.",
+        "      \"RECOMMENDATION: Option A ...\". The recommendation MUST name one of",
+        "      the option labels.",
+        "    - D6 is an ORDERED work list (numbered) the engineering-planning card",
+        "      consumes directly — no prose.",
+        "    - A design card that does not apply to this idea (an ordinary task)",
+        "      must NOT be labelled design and must NOT carry D1–D6.",
+        "",
+        "  Structured shape for the \"design\" object (all six keys):",
+        "",
+        '    "design": {',
+        '      "D1": [{"name": "<concept>", "definition": "<one line>"}],',
+        '      "D2": [{"invariant": "<property that must hold>"}],',
+        '      "D3": [{"failure": "<risk>", "mitigation": "<how it is handled>"}],',
+        '      "D4": [{"surface": "<exact file/column/config key>", "change": "<what changes>"}],',
+        '      "D5": {"options": [{"label": "A", "name": "<alt>", "pros": "<pro>", "cons": "<con>"}]},',
+        '      "recommendation": "Option A — <why>",',
+        '      "D6": [{"step": "<ordered step>"}]',
+        '    }',
+    ]
+    return "\n".join(lines)
