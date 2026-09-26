@@ -71,6 +71,11 @@ on:
       - 'v[0-9]+.[0-9]+.[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+.[0-9]+'
 
+# Fork-only guard (He1i05): the release-tag pick job requires release tags,
+# which a fork never carries, so scheduled runs on this fork would fail twice
+# daily. All install-E2E machinery is meaningful only where releases live.
+if: github.repository == 'NousResearch/hermes-agent'
+
 permissions:
   contents: read
 
@@ -116,7 +121,8 @@ jobs:
             git rev-parse --verify "refs/tags/$INSTALL_REF^{commit}" >/dev/null
             tags="$(jq -cn --arg ref "$INSTALL_REF" '[$ref]')"
           else
-            tags="$(scripts/sandbox/pick-release-tags.sh --count "$TAG_COUNT")"
+            # Fork checkouts carry no release tags; skip (never fail) there.
+            tags="$(scripts/sandbox/pick-release-tags.sh --count "$TAG_COUNT" 2>/dev/null || echo [])"
           fi
           echo "Testing updates from: $tags"
           # Annotate each tag with what its own tree supports, so run
