@@ -600,8 +600,19 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
 
 def _cmd_reclaim(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
-        ok = kb.reclaim_task(conn, args.task_id, reason=getattr(args, "reason", None))
-    return _ok_or_err(ok, f"cannot reclaim {args.task_id} (not running or unknown id)",
+        # No worker pin here (plain CLI, I3), so the operator recovery lane admits
+        # this and AUDITS it when it displaces a live unowned run
+        # (``reclaim_displaced_not_owner`` — NOT ``reclaim_forced_not_owner``, which
+        # this round-3 rename applies to a worker-pinned caller that passes
+        # ``--force``). ``--force`` is the exit for a caller that does carry a
+        # worker pin; from this pin-less shell it is INERT.
+        # t_6c8342e0 Finding 2 / round-2 Finding 1 / round-3 Finding 1.
+        ok = kb.reclaim_task(
+            conn, args.task_id, reason=getattr(args, "reason", None),
+            force=bool(getattr(args, "force", False)),
+        )
+    return _ok_or_err(ok, f"cannot reclaim {args.task_id} (not running, unknown id, "
+                          f"or its live run belongs to another process)",
                       f"Reclaimed {args.task_id}")
 
 
@@ -609,7 +620,16 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
     profile = _none_profile(args.profile)
     reclaim = bool(getattr(args, "reclaim", False))
     with kbc.connect_closing() as conn:
-        ok = kb.reassign_task(conn, args.task_id, profile, reclaim_first=reclaim, reason=getattr(args, "reason", None))
+        # ``--reclaim`` IS the operator's explicit decision to take the card from
+        # whoever holds it, so it carries the same authority as ``--force``: the
+        # release is audited (``reclaim_displaced_not_owner`` for this pin-less
+        # CLI — the pin-less recovery lane already lands, so ``force`` is inert
+        # here) instead of being refused and dead-ending the documented recovery
+        # path (round-2 Finding 1 / round-3 Finding 1).
+        ok = kb.reassign_task(
+            conn, args.task_id, profile, reclaim_first=reclaim,
+            reason=getattr(args, "reason", None), force=reclaim,
+        )
     return _ok_or_err(
         ok,
         f"cannot reassign {args.task_id} (unknown id, or still running — pass --reclaim to release first)",
@@ -917,7 +937,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             if gate_err:
                 fail_msg[tid] = gate_err
                 return False
-            fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
+            fail_msg[tid] = (
+                kb.completion_refusal_detail(conn, tid, _worker_run_id_for(tid))
+                or f"cannot complete {tid} (unknown id or terminal state)"
+            )
             try:
                 done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
                                         expected_run_id=_worker_run_id_for(tid),
@@ -980,8 +1003,19 @@ def _commented(conn, reason: Optional[str], author, prefix: str, op):
 
 
 def _cmd_block(args: argparse.Namespace) -> int:
-    reason = _joined_words(args.reason)
+    words = list(args.reason or [])
+    # The T5 graceful-stop runbook (§3 step 3) documents the park as
+    # ``hermes kanban block <id> dependency "<reason>"`` — the kind POSITIONAL,
+    # which argparse folds into ``reason`` and leaves ``--kind`` unset. Measured
+    # on the untouched round-2 tip: that literal command yielded ``kind=None``,
+    # so the "typed park" routed to the human ``blocked`` lane instead of the
+    # ``todo``/``dependency_wait`` lane the runbook promises. Accept the
+    # documented form by hoisting a leading kind word, so a binding runbook step
+    # does not depend on the operator remembering the flag.
     kind = getattr(args, "kind", None)
+    if kind is None and words and words[0] in kb.VALID_BLOCK_KINDS:
+        kind = words.pop(0)
+    reason = _joined_words(words)
     author = _profile_author()
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
@@ -1002,7 +1036,8 @@ def _cmd_block(args: argparse.Namespace) -> int:
             return f"Blocked {tid}{suffix}"
 
         op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
-            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
+            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid),
+            force=bool(getattr(args, "force", False))))
         return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
 
 
@@ -1013,7 +1048,8 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
         op = _commented(conn, reason, author, "SCHEDULED", lambda tid: kb.schedule_task(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid)))
+            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid),
+            force=bool(getattr(args, "force", False))))
         return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}", lambda tid: f"cannot schedule {tid}")
 
 
@@ -1060,7 +1096,10 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
     reason = " ".join(args.reason).strip()
     with kbc.connect_closing() as conn:
-        ok, detail = kb.request_changes(conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid))
+        ok, detail = kb.request_changes(
+            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid),
+            force=bool(getattr(args, "force", False)),
+        )
         if not ok:
             return _err(f"cannot request changes for {tid}: {detail or 'invalid review state'}")
         print(f"Requested changes for {tid}" + (f"; routed to {detail}" if detail else ""))
@@ -1130,8 +1169,23 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         if purge_ids:
             return _bulk_apply(purge_ids, lambda tid: kb.delete_archived_task(conn, tid), lambda tid: f"Deleted {tid}",
                                lambda tid: f"cannot delete {tid} (must already be archived)")
-        return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid),
-                           lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
+        # ``_worker_run_id_for`` (not a bare call): the review's Finding 2 named
+        # this verb as structurally unable to pin the run, "lands with pins present
+        # AND absent"; it is an open CLI verb carrying no orchestrator guard. The
+        # run id is what lets a worker-spawned shell prove ownership of the run it
+        # is archiving. A pin-less operator archives a live unowned run through the
+        # audited operator lane (``archive_displaced_not_owner`` — NOT
+        # ``archive_forced_not_owner``, which the round-3 rename reserves for a
+        # worker-pinned caller that passes ``--force``); from this pin-less shell
+        # ``--force`` is INERT. Round-2 Finding 1 / round-3 Finding 1.
+        return _bulk_apply(
+            ids,
+            lambda tid: kb.archive_task(
+                conn, tid, expected_run_id=_worker_run_id_for(tid),
+                force=bool(getattr(args, "force", False))),
+            lambda tid: f"Archived {tid}",
+            lambda tid: f"cannot archive {tid} (its live run belongs to another process)",
+        )
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:

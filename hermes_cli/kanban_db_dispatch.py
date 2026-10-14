@@ -2246,7 +2246,7 @@ def _tick_spawn_budget(
     """
     # Count already-running tasks so max_spawn enforces concurrency, not a
     # per-tick budget: "running" tasks stay running until the worker makes a terminal
-    # board call (kanban_complete/kanban_block/kanban_request_review) or the TTL reclaims them.
+    # board call (kanban_complete/kanban_request_review/kanban_block) or the TTL reclaims them.
     running_count = 0
     spawn_budget: Optional[int] = None
     if max_spawn is not None or max_in_progress is not None:

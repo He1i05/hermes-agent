@@ -2282,11 +2282,44 @@ def remove_job(job_id: str) -> bool:
             clear_notepad(canonical_id)
         except Exception:
             logger.debug("Failed to clear notepad for removed job %s", canonical_id, exc_info=True)
+        # Clear the failure-incident ledger too: a deleted job can never recover, so its open
+        # incident would otherwise linger as a permanently-open orphan (t_4e6cff2a). Deleting the
+        # rows is the deliberate choice over resolving them — see cron.incidents.
+        try:
+            from cron.incidents import delete_incidents_for_job
+            delete_incidents_for_job(canonical_id)
+        except Exception:
+            logger.debug("Failed to clear incidents for removed job %s", canonical_id, exc_info=True)
         # Prune the fire-fence lock entry so the registry doesn't grow monotonically.
         _fence_key = f"{_current_cron_store().cron_dir.resolve()}::{canonical_id}"
         with _fire_fence_locks_guard:
             _fire_fence_locks.pop(_fence_key, None)
         return True
+
+
+def _clear_incidents_for_removed_jobs(removed_ids: Optional[Collection[str]]) -> None:
+    """Delete the incident rows for jobs a removal path just dropped from the store.
+
+    ``remove_job`` clears the ledger directly; the OTHER paths that shrink ``cron/jobs.json``
+    (``claim_dispatch``'s wedged one-shot, ``_DueScan.retire`` from the one-shot grace / dispatch
+    guards, and ``_sweep_completed_oneshots``) write via ``save_jobs(..., removed_ids=...)`` and
+    never touched ``cron_incidents`` — so their rows lingered as permanently-open orphans the
+    operator could never clear (t_4e6cff2a's class, closed for ``remove_job`` only). Call this right
+    AFTER the store write commits the removal. **Delete, not resolve, is the deliberate choice**
+    (same rationale as ``remove_job``): a resolved row re-opens on the same signature and keeps
+    occupying ``hermes cron incidents`` for a job that can never run again.
+
+    Best-effort: a ledger hiccup must never abort the store save it follows (``prune_orphan_incidents``
+    remains the operator backstop for residue).
+    """
+    ids = [str(i) for i in (removed_ids or ()) if i]
+    if not ids:
+        return
+    try:
+        from cron.incidents import delete_incidents_for_job_ids
+        delete_incidents_for_job_ids(ids)
+    except Exception:
+        logger.debug("Failed to clear incidents for removed jobs %s", ids, exc_info=True)
 
 
 def _set_alert_flag(job_id: str, field: str, value: bool) -> bool:
@@ -2596,8 +2629,10 @@ def claim_dispatch(job_id: str) -> bool:
             # A prior tick claimed the dispatch then died — a genuinely wedged claim. Remove it so
             # it stops appearing due, leaving an operator-visible diagnostic.
             jobs.pop(i)
-            # See #73973.
+            # See #73973. Clear the ledger for the removed job too (t_4e6cff2a orphan class):
+            # claim_dispatch is a removal path remove_job's cleanup does not cover.
             save_jobs(jobs, removed_ids={job_id})
+            _clear_incidents_for_removed_jobs({job_id})
             _write_wedged_oneshot_diagnostic(job)
             logger.info(
                 "Job '%s': dispatch limit reached (%d/%d) — removing", label, completed, times)
@@ -3334,6 +3369,10 @@ def _get_due_jobs_locked() -> list[dict[str, Any]]:
     if scan.needs_save:
         try:
             save_jobs(raw_jobs, removed_ids=scan.removed or None)
+            # A retire()d one-shot or a swept completed record can no longer recover, so clear its
+            # incident rows — the due-scan removal paths must not leave the ledger holding orphans
+            # (t_4e6cff2a class; remove_job covers only 'hermes cron delete').
+            _clear_incidents_for_removed_jobs(scan.removed)
         except OSError as exc:  # repairs live in memory; the next tick retries the persist
             store_health.note_unwritable(exc, "due-scan repairs not persisted", "scan")
             return due

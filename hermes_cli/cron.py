@@ -363,6 +363,17 @@ def cron_incidents(args) -> int:
     """
     from cron.incidents import ack_incident, list_incidents
     action = getattr(args, "incident_action", "list")
+    if action == "prune":
+        from cron.incidents import prune_orphan_incidents
+        orphans = prune_orphan_incidents()
+        if not orphans:
+            print(color("✓ No orphaned incidents (every incident's job_id is in cron/jobs.json).",
+                        Colors.GREEN))
+            return 0
+        jobs = sorted({str(row.get("job_id")) for row in orphans})
+        print(color(f"✓ Pruned {len(orphans)} orphaned incident(s) for "
+                    f"{len(jobs)} deleted job(s): {', '.join(jobs)}", Colors.GREEN))
+        return 0
     if action == "ack":
         incident_id = getattr(args, "incident_id", None)
         if not incident_id:

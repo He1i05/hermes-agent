@@ -183,8 +183,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_incidents.add_argument("--state", choices=["detected", "alerted", "resolved", "closed"],
         help="Filter incidents by lifecycle state")
     cron_incidents.add_argument(
-        "incident_action", nargs="?", default="list", choices=["list", "ack"],
-        help="Action (default: list)")
+        "incident_action", nargs="?", default="list", choices=["list", "ack", "prune"],
+        help="Action (default: list). 'prune' deletes incidents for jobs no longer in cron/jobs.json")
     cron_incidents.add_argument("incident_id", nargs="?", help="Incident ID to acknowledge (ack)")
 
     # notepad: per-job durable KV, injected into the job prompt each run.

@@ -31,6 +31,13 @@ logger = logging.getLogger(__name__)
 KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
 
+# ``kanban_show`` tail-caps the comment thread (matching build_worker_context's
+# ``_CTX_MAX_COMMENTS``): a six-round review thread grew to ~109 KB and pushed the
+# whole payload past the spillover threshold, so the findings stopped arriving at
+# all (t_9642c749). ``comments_total`` reports the true count and the CLI
+# (``hermes kanban show``) still renders the full thread.
+_SHOW_MAX_COMMENTS = 30
+
 
 # --- Gating ---
 
@@ -305,7 +312,8 @@ def _require_orchestrator_tool(tool_name: str) -> None:
         raise _Reject(
             f"{tool_name} is orchestrator-only; dispatcher-spawned workers must use "
             "kanban_complete, kanban_request_review, kanban_request_changes, kanban_block, "
-            "kanban_heartbeat, or kanban_comment for their assigned task.")
+            "kanban_heartbeat, or kanban_comment for their "
+            "assigned task.")
 
 
 @contextmanager
@@ -676,7 +684,18 @@ def _handle_show(args: dict, **kw) -> str:
         })
     with _board(args.get("board")) as (kb, conn):
         task = _existing_task(kb, conn, tid)
+        directive = kb.latest_review_directive(conn, tid)
+        comments = [
+            c for c in kb.list_comments(conn, tid)
+        ][-_SHOW_MAX_COMMENTS:]
         return json.dumps({
+            "review_directive": (
+                kb.review_directive_block(
+                    directive, limit=kb._SHOW_REVIEW_VERDICT_CHARS,
+                    escaped_limit=kb._SHOW_REVIEW_VERDICT_ESCAPED_CHARS,
+                ) if directive else None
+            ),
+            "review_convergence": kb.review_convergence_state(conn, tid),
             "task": _fields(task, _TASK_FIELDS),
             "parents": kb.parent_ids(conn, tid),
             # Non-terminal parents; on a running card this means the dependency
@@ -684,7 +703,8 @@ def _handle_show(args: dict, **kw) -> str:
             "unsatisfied_parents": [
                 {"id": pid, "status": status} for pid, status in kb.unsatisfied_parents(conn, tid)],
             "children": kb.child_ids(conn, tid),
-            "comments": [_fields(c, _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)],
+            "comments": [_fields(c, _COMMENT_FIELDS) for c in comments],
+            "comments_total": len(kb.list_comments(conn, tid)),
             # Capped; full log via CLI.
             "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
             "runs": [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)],
@@ -795,7 +815,11 @@ def _handle_complete(args: dict, **kw) -> str:
                 raise _Reject(
                     f"could not complete {tid}: unsatisfied parent dependencies: "
                     f"{detail}; complete the parents first (done or archived)")
+            # Hand-merge at the pin: upstream owns the parents branch above; ours adds
+            # completion_refusal_detail so a LIVE-RUN refusal names its cause and both
+            # legitimate exits instead of "unknown id, stale run, or already terminal".
             _check(False, (task.last_failure_error if task else None) or
+                   kb.completion_refusal_detail(conn, tid, _worker_run_id(tid)) or
                    f"could not complete {tid} (unknown id, stale run, or already terminal)")
         run = kb.latest_run(conn, tid)
         # Artifact staging is atomic with the completion write, so a worker that
@@ -835,7 +859,13 @@ def _handle_block(args: dict, **kw) -> str:
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
         ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
-        _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
+        _check(ok, f"could not block {tid} (unknown id, not in running/ready, or its "
+                   f"live run belongs to another process — kanban_block may only park "
+                   f"a run this worker owns)")
+        # Hand-merge at the pin: upstream improved the refusal message above; ours
+        # reports the kind the block actually LANDED with (block_task may re-kind a
+        # parentless dependency wait to needs_input), which is the more informative
+        # payload. Both kept.
         landed_kind = kb.get_task(conn, tid).block_kind
         extra: dict = {"block_kind": landed_kind}
         if kind == "dependency" and landed_kind != kind:
@@ -873,6 +903,10 @@ def _handle_schedule(args: dict, **kw) -> str:
 @_kanban_handler("kanban_request_review")
 def _handle_request_review(args: dict, **kw) -> str:
     """Move implementation into the first-class review phase."""
+    # Reserved human-review-lane assignee literal (SPEC §2.5 B1), defined
+    # next to the handler. A non-profile reviewer would otherwise park the
+    # card on an assignee the dispatcher can never spawn.
+    _USER_GATE_ASSIGNEE = "user"
     tid = _worker_guard("kanban_request_review", args)
     summary = _redact(_require_text(
         args, "summary", "summary is required — describe what was implemented and how it "
@@ -891,11 +925,17 @@ def _handle_request_review(args: dict, **kw) -> str:
     if reviewer:
         from hermes_cli.profiles import list_profile_names, profile_exists
 
-        # A non-profile reviewer would park the card in `review` on an assignee
-        # the dispatcher can never spawn (#106163).
-        _check(profile_exists(reviewer),
-               f"reviewer profile {reviewer!r} is not installed. "
-               f"Installed profiles: {', '.join(list_profile_names())}")
+        # The reserved literal `user` is the human review lane (SPEC §2.5 B1).
+        # It is NOT a profile, but it is safe here: the dispatcher parks a
+        # review card on a non-profile assignee in `skipped_nonspawnable`
+        # (kanban_db_dispatch.py) — never spawned — and
+        # kanban-user-gate-notifier.py keys its query on
+        # `status='review' AND assignee='user'`. Any OTHER non-profile
+        # reviewer would strand the card on an un-spawnable assignee (#106163).
+        if reviewer != _USER_GATE_ASSIGNEE:
+            _check(profile_exists(reviewer),
+                   f"reviewer profile {reviewer!r} is not installed. "
+                   f"Installed profiles: {', '.join(list_profile_names())}")
     with _board(args.get("board")) as (kb, conn):
         _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
         try:

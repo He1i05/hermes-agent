@@ -592,10 +592,25 @@ def _drag_to(conn, task_id: str, s: str) -> bool:
 # payload) -> ok. ``review`` uses request_review (never a block, so it can't trip unblock-loop
 # detection) and ``done`` pass ``force=True``: a dashboard action is a human override of a live worker claim.
 _STATUS_HANDLERS: dict[str, Any] = {
+    # ``force=True``: a dashboard drag is a HUMAN action, and the alternative to
+    # an explicit override is the operator reaching for `HERMES_KANBAN_GUARD_BYPASS`
+    # or raw SQL — the exact pressure that produced the t_c5018dd9 force-close.
+    # A forced close is audited as ``completion_forced_not_owner`` (t_6c8342e0).
+    # Hand-merge at the pin: upstream added no code here, only this rationale.
     "done": lambda conn, tid, p: kanban_db.complete_task(
         conn, tid, result=p.result, summary=p.summary, metadata=p.metadata, force=True),
-    "blocked": lambda conn, tid, p: kanban_db.block_task(conn, tid, reason=getattr(p, "block_reason", None)),
-    "scheduled": lambda conn, tid, p: kanban_db.schedule_task(conn, tid, reason=getattr(p, "block_reason", None)),
+    # ``force=True`` below is LOAD-BEARING, not decorative (t_6c8342e0 round-2
+    # Finding 2 corrected an earlier comment here that claimed the opposite).
+    # The dashboard server is pin-less, so before the operator lane was narrowed
+    # ``_run_end_allowed`` admitted it and ``force`` was inert. Now a pin-less end
+    # of a live run it does not own is refused for these two verbs, so `force` is
+    # what lets the human drag land — and it makes the ``*_forced_not_owner``
+    # branch below genuinely reachable, i.e. the drag is recorded as a
+    # displacement rather than passing as an ordinary handoff.
+    "blocked": lambda conn, tid, p: kanban_db.block_task(
+        conn, tid, reason=getattr(p, "block_reason", None), force=True),
+    "scheduled": lambda conn, tid, p: kanban_db.schedule_task(
+        conn, tid, reason=getattr(p, "block_reason", None), force=True),
     "review": lambda conn, tid, p: kanban_db.request_review(
         conn, tid, summary=p.summary, metadata=p.metadata, reviewer=(p.assignee or None), force=True),
     "ready": lambda conn, tid, p: _drag_to(conn, tid, "ready"),
@@ -640,7 +655,13 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     (naming the blocking parent(s) for ``ready``/``done``/``review`` so the UI renders an actionable toast)."""
     s = payload.status
     if s == "archived":
-        ok = kanban_db.archive_task(conn, task_id)
+        # Archive is in the OPERATOR RECOVERY lane (`_OPERATOR_AUDITED_VERBS`), so
+        # a pin-less dashboard server is admitted WITHOUT `force` — the flag is
+        # therefore informational here, not load-bearing (unlike `blocked` /
+        # `scheduled` above). What keeps the drag non-silent is the seam's own
+        # audit: a live run this caller cannot prove it owns is recorded as
+        # ``archive_displaced_not_owner`` (t_6c8342e0 round-2 Finding 1/2).
+        ok = kanban_db.archive_task(conn, task_id, force=True)
     else:
         with _map_errors(400, _StatusRejected, ValueError):
             ok = _apply_status(conn, task_id, s, payload, f"unknown status: {s}")
@@ -770,6 +791,17 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             (effective_status,) * 4 + (task_id,))
         if cur.rowcount != 1:
             return False
+        # Close any sticky-block episode still open on this row (t_81a1f095).
+        #
+        # Unconditional, NOT gated on ``prev["status"] == "blocked"``: a residual
+        # row (a ``blocked`` event left as the newest of the pair by an exit that
+        # predates this fix) can be sitting in ``done``/``archived`` while its
+        # episode is still open, so a "leaving blocked" predicate never fires for
+        # it and the episode survives a drag into a dispatchable lane. The helper
+        # self-guards — it emits iff an episode is open — so this is a no-op on
+        # every ordinary move, and it closes exactly the residual state.
+        # Emitted AFTER the CAS so the payload's ``status`` reads the new lane.
+        kanban_db._supersede_sticky_block(conn, task_id, origin="dashboard_direct")
         run_id = None
         if was_running and effective_status != "running" and prev["current_run_id"]:
             run_id = kanban_db._end_run(
@@ -830,7 +862,7 @@ def delete_link(parent_id: str = Query(...), child_id: str = Query(...), board: 
 def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str], entry: dict) -> None:
     """Apply the bulk patch to one task, recording refusals in ``entry`` without aborting the
     remaining ops — except a rejected status verb (``_StatusRejected`` propagates)."""
-    if payload.archive and not kanban_db.archive_task(conn, tid):
+    if payload.archive and not kanban_db.archive_task(conn, tid, force=True):
         entry.update(ok=False, error="archive refused")
     if payload.status is not None and not payload.archive:
         s = payload.status
@@ -838,7 +870,7 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
             entry.update(ok=False, error=_open_parent_refusal(conn, tid, s) or f"transition to {s!r} refused")
     if payload.assignee is not None:
         try:
-            ok = (kanban_db.reassign_task(conn, tid, payload.assignee or None, reclaim_first=True) if payload.reclaim_first
+            ok = (kanban_db.reassign_task(conn, tid, payload.assignee or None, reclaim_first=True, force=True) if payload.reclaim_first
                   else kanban_db.assign_task(conn, tid, payload.assignee or None))
             if not ok:
                 entry.update(ok=False, error="assign refused")
@@ -994,6 +1026,12 @@ def terminate_run_endpoint(run_id: int, payload: TerminateRunBody, board: Option
         r = _require_run(conn, run_id)
         if r.ended_at is not None:
             raise _conflict(f"run {run_id} already ended")
+        # Operator recovery: the run-end seam admits this pin-less caller and
+        # AUDITS the displacement as ``reclaim_displaced_not_owner`` when the run
+        # belongs to another process (t_6c8342e0 round-2 Finding 1) — the
+        # termination itself is this endpoint's documented job. Not
+        # ``reclaim_forced_not_owner``: this server passes no ``force``, and the
+        # recovery lane lands without it (round-3 Finding 1).
         if not kanban_db.reclaim_task(conn, r.task_id, reason=payload.reason):
             raise _conflict(f"cannot terminate run {run_id}: task {r.task_id} is no longer in a reclaimable state")
         return {"ok": True, "run_id": run_id, "task_id": r.task_id}
@@ -1041,8 +1079,17 @@ def reassign_task_endpoint(task_id: str, payload: ReassignBody, board: Optional[
     """Reassign to another profile, optionally reclaiming first
     (``hermes kanban reassign <task_id> <profile> [--reclaim]``)."""
     with _board_conn(board) as (board, conn):
+        # ``force=reclaim_first``: a dashboard reassign that explicitly asks to
+        # release the live claim first is a HUMAN decision to take the card from
+        # whoever holds it, and it is recorded as
+        # ``reclaim_displaced_not_owner`` (t_6c8342e0 round-2 Finding 1) instead of
+        # dead-ending the recovery path with advice the caller already followed.
+        # The pin-less server is admitted by the recovery lane either way, so
+        # ``force`` is not what produces the event here (round-3 Finding 1).
         ok = kanban_db.reassign_task(
-            conn, task_id, payload.profile or None, reclaim_first=bool(payload.reclaim_first), reason=payload.reason)
+            conn, task_id, payload.profile or None,
+            reclaim_first=bool(payload.reclaim_first), reason=payload.reason,
+            force=bool(payload.reclaim_first))
         if not ok:
             raise _conflict(
                 f"cannot reassign {task_id}: unknown id, or still "

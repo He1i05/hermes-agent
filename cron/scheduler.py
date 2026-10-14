@@ -1768,6 +1768,24 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
     from hermes_cli.auth import AuthError
 
     model = jc.model
+    # Per-job request_overrides (top-level keys = API kwargs, e.g. service_tier) mirror
+    # delegation.request_overrides semantics and are merged into the resolved runtime so
+    # they reach AIAgent via _construct_cron_agent. Explicit job values win over any
+    # provider-resolved overrides; absent/ non-dict job key is a None-safe no-op.
+    job_overrides = job.get("request_overrides")
+    if not isinstance(job_overrides, dict):
+        job_overrides = None
+
+    def _merge_overrides(runtime: dict) -> dict:
+        if not job_overrides:
+            return runtime
+        merged = dict(runtime)
+        merged["request_overrides"] = {
+            **(runtime.get("request_overrides") or {}),
+            **job_overrides,
+        }
+        return merged
+
     requested = job.get("provider") or jc.cron_default_provider or None
     try:
         # Do NOT pass HERMES_INFERENCE_PROVIDER as `requested`: it would override persisted config
@@ -1779,7 +1797,7 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
         }
         if job.get("base_url"):
             runtime_kwargs["explicit_base_url"] = job.get("base_url")
-        return resolve_runtime_provider(**runtime_kwargs), model
+        return _merge_overrides(resolve_runtime_provider(**runtime_kwargs)), model
     except Exception as resolve_exc:
         # Walk the fallback chain on AuthError AND transient network/DNS failures (e.g. during
         # OAuth refresh); anything else re-raises.
@@ -1823,7 +1841,10 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
                 runtime["_fallback_notice"] = pre_agent_fallback_notice(
                     requested or (jc.model_cfg.get("provider") if isinstance(jc.model_cfg, dict) else ""),
                     model, runtime.get("provider"), fb_model)
-                return runtime, fb_model
+                # Hand-merge at the pin: upstream added the _fallback_notice stamp on this return
+                # path; ours wraps the return in _merge_overrides. Both are required — merge the
+                # dict AFTER the notice is stamped so nothing is lost.
+                return _merge_overrides(runtime), fb_model
             except Exception as fb_exc:
                 logger.debug("Job '%s': fallback %s failed: %s", job_id, fb_provider, fb_exc)
         raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
@@ -2957,7 +2978,16 @@ def _compose_run_delivery(
         deliver_content = blocked_config_notice(job.get("name") or job["id"], _pf_text)
     elif success:
         deliver_content = final_response
-        _resolve_incidents_for_recovered_job(job)
+        # Auto-resolve ONLY after a real successful run. Silent successes — a script's
+        # wakeAgent=false bail (e.g. backup-snapshot.sh skipping an unmounted target), empty
+        # stdout, a no-change monitor tick, an agent NO_REPLY — surface here as ``[SILENT]`` /
+        # blank final_response. A PC-off bail night (exit 0, no backup taken) used to count as
+        # "recovered" and auto-resolved the open incidents for the real failures, masking the
+        # outage (t_49fc646c, 5 nightly incidents closed acked_at=NULL on 2026-10-01/10-06).
+        # A skip neither proves the job works nor touches open incidents; an intentional agent
+        # silence is left to the operator to ack (conservative: never auto-resolve on silence).
+        if str(final_response or "").strip() and not _is_cron_silence_response(deliver_content):
+            _resolve_incidents_for_recovered_job(job)
     else:
         # Record the job+error signature once; withhold the per-run ping while the operator
         # already acked it (closed) or was already told (alerted, inside the reminder cooldown).
@@ -3738,6 +3768,21 @@ def _launch_external_cron_worker(job: dict) -> bool:
 
     with _running_lock:
         _restart_safe_waiter_job_ids.add(_inflight_key(job_id))
+        # Record the worker pid BEFORE the ack is read, so every exit from this function —
+        # acknowledged, unreadable, mismatched, or never-acked — leaves the job named as an
+        # external worker. ``process.pid`` IS the worker: a scoped launch execs
+        # `systemd-run --user --scope` in place (one transient unit, one pid) and a degraded
+        # launch Popens the worker directly; probed on this host, the Popen pid equals the
+        # worker's own getpid() under BOTH modes. Without this, the unreadable / mismatched /
+        # timeout branches return with `_running_worker_pids` unset, and
+        # `gateway/run_shutdown.py::_describe_active_work` derives
+        # `external=bool(worker_pid)` -> False with `pid=worker_pid or os.getpid()`, reporting
+        # a LIVE external worker as an in-process run of the gateway.
+        # The acknowledged branch below re-assigns the same pid from the ack.
+        # Keyed by the pin's `_inflight_key` tuple (t_bc0ad69f hand-merge note): the
+        # 6848-commit range between the base and the pin refactored in-flight state from
+        # bare job ids to (home key, job id) tuples.
+        _running_worker_pids[_inflight_key(job_id)] = process.pid
 
     # Same window the dead-owner recovery ledger grants a pending handoff: a cold
     # worker start (imports + secret hydration) measures ~10-12s in the field, and

@@ -32,7 +32,12 @@ def _make_minimal_agent(memory_manager, context_compressor, session_id="abc"):
 
 
 def test_commit_memory_session_notifies_context_engine():
-    """Both the memory manager AND the context engine receive on_session_end."""
+    """Both the memory manager AND the context engine receive on_session_end.
+
+    The manager call carries ``mid_session``: a plain commit is a real end of session
+    (False), while the compaction call site passes True so a provider retaining only a
+    completed session's durable output can skip a boundary mid-conversation.
+    """
     mm = MagicMock()
     ctx = MagicMock()
     agent = _make_minimal_agent(mm, ctx, session_id="sess-42")
@@ -40,8 +45,24 @@ def test_commit_memory_session_notifies_context_engine():
     msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]
     agent.commit_memory_session(msgs)
 
-    mm.on_session_end.assert_called_once_with(msgs)
+    mm.on_session_end.assert_called_once_with(msgs, mid_session=False)
     ctx.on_session_end.assert_called_once_with("sess-42", msgs)
+
+
+def test_commit_memory_session_propagates_mid_session():
+    """The compaction call site's ``mid_session=True`` reaches the memory manager.
+
+    Without it every provider sees a plain end-of-session at a transcript compaction,
+    which is what let a mid-run transcript tail ship as a session's "durable output".
+    """
+    mm = MagicMock()
+    ctx = MagicMock()
+    agent = _make_minimal_agent(mm, ctx, session_id="sess-42")
+
+    msgs = [{"role": "user", "content": "still working"}]
+    agent.commit_memory_session(msgs, mid_session=True)
+
+    mm.on_session_end.assert_called_once_with(msgs, mid_session=True)
 
 
 

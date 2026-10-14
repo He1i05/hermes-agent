@@ -114,6 +114,266 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     assert c1.assignee == "engineer"
 
 
+def test_decompose_fanout_persists_phase_to_current_step_key(kanban_home):
+    """The emitted phase chain survives into the DB on every child (T1)."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="multi-step quest", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "phase cascade",
+        "tasks": [
+            {"title": "research", "body": "phase: research", "assignee": "researcher",
+             "phase": "research", "parents": []},
+            {"title": "build", "body": "code it", "assignee": "engineer",
+             "phase": "implementation", "parents": [0]},
+            {"title": "verify", "body": "test it", "assignee": "engineer",
+             "phase": "testing", "parents": [1]},
+            {"title": "audit", "body": "support card, no phase", "assignee": "engineer",
+             "parents": []},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "researcher", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kbc.connect() as conn:
+        phases = [kb.get_task(conn, cid).current_step_key for cid in outcome.child_ids]
+    assert phases == ["research", "implementation", "testing", None]
+
+
+def test_decompose_phase_falls_back_to_body_frontmatter(kanban_home):
+    """A child that tags only `phase:` in its body still persists the phase."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="quest", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "frontmatter only",
+        "tasks": [
+            {"title": "design it", "body": "phase: System Design\n\n**Goal**\nx",
+             "assignee": "engineer", "parents": []},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kbc.connect() as conn:
+        child = kb.get_task(conn, outcome.child_ids[0])
+    assert child.current_step_key == "system-design"
+
+
+def test_decompose_drops_unknown_phase_without_failing_the_graph(kanban_home):
+    """An out-of-enum phase is advisory-only: dropped, never a fan-out failure."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="quest", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "bad phase",
+        "tasks": [
+            {"title": "deploy it", "body": "ship", "assignee": "engineer",
+             "phase": "deployment", "parents": []},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kbc.connect() as conn:
+        child = kb.get_task(conn, outcome.child_ids[0])
+    assert child.current_step_key is None
+
+
+def test_decompose_user_prompt_carries_root_phase_and_chain(kanban_home):
+    """Prompt plumbing: root phase + canonical chain are rendered into the user turn."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="quest", body="phase: system-design\n\n**Goal**\ndecide", triage=True,
+        )
+
+    captured: dict = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return _fake_aux_response(jsonlib.dumps({
+            "fanout": True, "rationale": "r",
+            "tasks": [{"title": "t", "body": "b", "assignee": "engineer", "parents": []}],
+        }))
+
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with patch("agent.auxiliary_client.call_llm", side_effect=_capture):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    user = captured["messages"][1]["content"]
+    assert "Root phase" in user and "system-design" in user
+    assert "grounding -> review -> research" in user
+
+
+def test_decompose_user_prompt_reports_untagged_root(kanban_home):
+    """An untagged root tells the model to start the chain at grounding."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="plain quest", body="no phase here", triage=True)
+
+    captured: dict = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return _fake_aux_response(jsonlib.dumps({
+            "fanout": True, "rationale": "r",
+            "tasks": [{"title": "t", "body": "b", "assignee": "engineer", "parents": []}],
+        }))
+
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with patch("agent.auxiliary_client.call_llm", side_effect=_capture):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    user = captured["messages"][1]["content"]
+    assert "untagged" in user and "grounding" in user
+
+
+def test_decompose_root_phase_prefers_persisted_step_key(kanban_home):
+    """current_step_key (specifier-tagged) outranks the body frontmatter line."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="quest", body="phase: research\n\nx", triage=True,
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET current_step_key = 'system-design' WHERE id = ?", (tid,),
+            )
+
+    captured: dict = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return _fake_aux_response(jsonlib.dumps({
+            "fanout": True, "rationale": "r",
+            "tasks": [{"title": "t", "body": "b", "assignee": "engineer", "parents": []}],
+        }))
+
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with patch("agent.auxiliary_client.call_llm", side_effect=_capture):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    user = captured["messages"][1]["content"]
+    assert "Root phase (tagged by the triage specifier, when known): system-design" in user
+
+
+def test_decompose_unknown_root_step_key_falls_back_to_body(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="quest", body="phase: testing\n\nx", triage=True)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET current_step_key = 'legacy-step-7' WHERE id = ?", (tid,))
+
+    captured: dict = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return _fake_aux_response(jsonlib.dumps({
+            "fanout": True, "rationale": "r",
+            "tasks": [{"title": "t", "body": "b", "assignee": "engineer", "parents": []}],
+        }))
+
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with patch("agent.auxiliary_client.call_llm", side_effect=_capture):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    user = captured["messages"][1]["content"]
+    assert "when known): testing" in user
+
+
+def test_decompose_single_task_persists_root_phase(kanban_home):
+    """fanout=false: the root card keeps the phase the decomposer classified."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="one thing", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single unit",
+        "title": "Tightened",
+        "body": "**Goal**\nDo it.",
+        "phase": "implementation",
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.current_step_key == "implementation"
+
+
+def test_decompose_system_prompt_documents_the_cascade():
+    """The prompt itself is the contract: chain, skip rule, phase field."""
+    prompt = decomp._SYSTEM_PROMPT
+    assert "grounding -> review -> research -> system-design -> engineering-planning -> implementation -> testing" in prompt
+    assert "SKIP phases that do not apply" in prompt
+    assert '"phase"' in prompt
+    assert "phase: <name>" in prompt
+
+
 def test_decompose_fanout_children_inherit_root_assignee_when_unrouted(kanban_home):
     """Unrouted children fall back to the ROOT task's assignee, not
     the decomposer's active profile (#114294). The active profile here is ``private``
@@ -195,7 +455,6 @@ def test_decompose_explicit_default_assignee_wins_over_root_assignee(kanban_home
     assert c0.assignee == "docs"
     assert c1.assignee == "docs"
 
-
 def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="route me safely", triage=True)
@@ -254,5 +513,6 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
         for p in patches:
             p.stop()
     assert outcome.ok is False
+    assert "not in triage" in outcome.reason
 
 

@@ -324,6 +324,159 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
     return _env_int("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS)
 
 
+# build_worker_context() caps, sized for a ~100k-char prompt with headroom.
+_CTX_MAX_PRIOR_ATTEMPTS = 10      # most recent N prior runs shown in full
+_CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
+_CTX_MAX_FIELD_BYTES    = 4 * 1024   # per summary/error/metadata/result
+_CTX_MAX_BODY_BYTES     = 8 * 1024   # per task.body (opening post)
+_CTX_MAX_COMMENT_BYTES  = 2 * 1024   # per comment
+# The latest request-changes verdict is the ONE thing a rework run must never
+# miss, so it gets a far larger allowance than a comment and a stable on-disk
+# receipt beside it (t_9642c749: a ~109 KB thread spilled the whole kanban_show
+# payload to a file pointer and three consecutive implementer runs never read it,
+# re-reporting earlier rounds' work as their own).
+_CTX_MAX_REVIEW_DIRECTIVE_BYTES = 8 * 1024
+# Bounds for the copy that rides the HEAD of kanban_show's JSON: the spillover
+# preview keeps only the first ``DEFAULT_PREVIEW_SIZE_CHARS`` (1.5 KB) of the
+# RAW JSON payload, so the verdict must fit there or the pointer-only payload
+# loses it again. Two bounds, because they are not the same budget: the char
+# bound is what a reader sees, the ESCAPED bound is what the preview actually
+# slices. ``json.dumps`` escapes non-ASCII to ``\uXXXX`` (6 chars per character
+# for CJK, ~1.8 for emoji), so a char-only bound let a CJK verdict escape to
+# ~4.4x the budget and pushed the receipt pointer — the one pointer to the
+# untruncated text — past the end of the preview (t_9642c749 review F3).
+_SHOW_REVIEW_VERDICT_CHARS = 1_200
+# Escaped-chars budget for the same value (``json.dumps(value)[1:-1]``), which is
+# what the preview actually slices. Both bounds are applied together, and the
+# emitted block is placed directly after ``{"review_directive": "`` — so the
+# ~22 chars of scaffolding plus this budget sit well inside the 1.5 KB preview,
+# leaving room for an ASCII-heavy verdict plus the pointer line. Handed to
+# ``review_directive_block`` by the ``kanban_show`` caller that owns that
+# placement (``tools/kanban_tools.py:_handle_show``).
+_SHOW_REVIEW_VERDICT_ESCAPED_CHARS = 1_200
+# Consecutive request-changes rounds whose rework handoff declared no new
+# revision before the card escalates to a human instead of being re-dispatched.
+_REVIEW_NON_CONVERGENCE_LIMIT = 2
+# Handoff metadata keys that mean "this round produced a new revision of the
+# deliverable". Absence of ALL of them on a rework round is the DB-visible
+# proxy for "the tree did not move" — the only such proxy available, since the
+# board cannot see the working tree.
+#
+# A KEY IS ONLY HALF THE SIGNAL: the VALUE's shape decides, and workers write
+# this field in whatever shape fits the round — a str sha, a list of shas, a
+# per-artifact mapping (``{"fix": "abc1", "doc_note": "abc2"}``), a structured
+# sha (``{"sha": "abc1"}``), a numeric ``head``. See
+# :func:`_revision_value_declares` — reading only the string/list shapes made
+# the escalation fire on a card that declared a real commit every round
+# (t_9642c749 review F2: this card's own round-2 handoff used the dict shape).
+_REVIEW_REVISION_KEYS = (
+    "commit", "commits", "head", "sha", "merge_commit", "published_pr", "merged",
+)
+# Nesting depth at which a revision value stops being inspected. JSON cannot be
+# cyclic, but a hand-built structure can be, and the board's metadata column is
+# decoded from JSON text that a test can hand the predicate directly.
+_REVISION_VALUE_MAX_DEPTH = 4
+
+
+def _review_non_convergence_limit() -> int:
+    """``kanban.review_non_convergence_rounds`` override, else the default.
+    Any error / non-positive value keeps the built-in (never disable-by-typo)."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get(
+            "review_non_convergence_rounds")
+        if raw is not None and int(raw) > 0:
+            return int(raw)
+    except Exception:
+        pass
+    return _REVIEW_NON_CONVERGENCE_LIMIT
+
+
+def _revision_value_declares(value: Any, depth: int = 0) -> bool:
+    """Does ONE revision-key value name a concrete revision?
+
+    Shape-tolerant on purpose (t_9642c749 review F2). The board cannot see the
+    working tree, so a rework handoff's metadata is the only durable record that
+    a round produced something new — and workers write it in whatever shape fits
+    the round. A per-artifact mapping (``{"fix": "abc1", "doc_note": "abc2"}``)
+    is the natural shape for a round that lands several revisions, and reading
+    it as "no new revision" makes the non-convergence escalation fire on a card
+    that IS progressing.
+
+    Accepts:
+
+    * a non-blank ``str`` — the sha / branch / PR reference itself;
+    * a truthy ``bool`` — ``merged: true``;
+    * a non-empty ``dict`` — any nested value declares (so ``{"sha": "abc1"}``,
+      ``{"fix": "abc1", "doc_note": "abc2"}`` and ``{"pr": 7}`` all count, while
+      ``{}`` does not);
+    * a non-empty list/tuple/set whose ANY element declares;
+    * a non-zero ``int`` / ``float`` — a numeric ``head`` / build id.
+
+    Rejects: ``None``, ``False``, ``0``, ``""``, ``[]``, ``{}``, and anything
+    nested past :data:`_REVISION_VALUE_MAX_DEPTH` (a self-referential structure
+    must not recurse forever).
+    """
+    if value is None or depth > _REVISION_VALUE_MAX_DEPTH:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, dict):
+        return any(
+            _revision_value_declares(item, depth + 1) for item in value.values()
+        )
+    if isinstance(value, (list, tuple, set)):
+        return any(_revision_value_declares(item, depth + 1) for item in value)
+    return False
+
+
+def _handoff_declares_revision(metadata: Any) -> bool:
+    """True when a ``review_requested`` handoff names a new revision of the
+    artifact (a commit sha/list, a PR, a merge). Metadata only — the worker's
+    handoff is the sole durable record of what the round produced."""
+    if not isinstance(metadata, dict):
+        return False
+    return any(
+        _revision_value_declares(metadata.get(key))
+        for key in _REVIEW_REVISION_KEYS
+    )
+
+
+def review_convergence_state(conn: sqlite3.Connection, task_id: str) -> dict:
+    """Rework-round convergence for one card: how many consecutive
+    ``review_requested`` handoffs declared NO new revision.
+
+    ``escalate`` is True only for a card that HAS landed at least one
+    revision-declaring round and has since gone ``limit`` rounds without one —
+    so a legitimately commit-less workflow (docs/analysis cards whose handoffs
+    never carry a commit) is never escalated on this signal alone.
+    """
+    limit = _review_non_convergence_limit()
+    runs = [r for r in list_runs(conn, task_id) if r.outcome == "review_requested"]
+    declared = [_handoff_declares_revision(r.metadata) for r in runs]
+    streak = 0
+    for flag in reversed(declared):
+        if flag:
+            break
+        streak += 1
+    rounds_row = conn.execute(
+        "SELECT COUNT(*) AS n FROM task_events WHERE task_id = ? AND kind = 'changes_requested'",
+        (task_id,),
+    ).fetchone()
+    return {
+        "round": int((rounds_row["n"] if rounds_row else 0) or 0),
+        "rework_rounds": len(runs),
+        "no_revision_streak": streak,
+        "ever_declared_revision": any(declared),
+        "limit": limit,
+        "escalate": bool(any(declared) and streak >= limit),
+    }
+
+
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
     """``just now`` / ``18h ago`` / ``3d ago``; "" for a missing/invalid ts. An LLM
     reads a bare absolute timestamp as current fact — the relative age is what
@@ -606,6 +759,199 @@ def worker_logs_dir(board: Optional[str] = None) -> Path:
     """Per-board worker log dir (logs follow the board so ``hermes kanban log``
     is unambiguous when two boards share a task id)."""
     return _board_path(None, board, ("kanban", "logs"), "logs")
+
+
+def review_receipts_dir(task_id: str, board: Optional[str] = None) -> Path:
+    """``<root>/kanban/review_receipts/<task_id>/`` — one file per request-changes
+    verdict. Lives outside ``cache/spillover`` on purpose: that directory is pruned
+    after 24h (``cleanup_spillover_cache``) and is not a durable channel, whereas a
+    reviewer's verdict must stay readable for as long as the card needs rework."""
+    return _board_path(
+        None, board, ("kanban", "review_receipts"), "review_receipts",
+    ) / task_id
+
+
+def review_receipt_path(task_id: str, round_no: int, board: Optional[str] = None) -> Path:
+    """Stable path of one verdict: ``.../<task_id>/round-<N>.md`` (may not exist)."""
+    return review_receipts_dir(task_id, board=board) / f"round-{int(round_no)}.md"
+
+
+def write_review_receipt(
+    task_id: str, round_no: int, *, reason: str, reviewer: Optional[str],
+    implementer: Optional[str], created_at: int, no_change: bool,
+    board: Optional[str] = None,
+) -> Optional[str]:
+    """Persist the FULL reviewer verdict so a worker can always read it, even when
+    the card's ``kanban_show`` payload is large enough to be spilled to a pointer
+    (t_9642c749: three consecutive implementer runs never read the spilled file)."""
+    try:
+        path = review_receipt_path(task_id, round_no, board=board)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"# Requested changes — {task_id}, round {int(round_no)}\n\n"
+            f"- reviewer: {reviewer or '(unknown)'}\n"
+            f"- implementer: {implementer or '(unknown)'}\n"
+            f"- issued: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(int(created_at)))}\n"
+            f"- reviewer measured zero change since the previous round: "
+            f"{'yes' if no_change else 'no'}\n\n"
+            "## Verdict\n\n" + (reason or "").strip() + "\n",
+            encoding="utf-8",
+        )
+        return str(path)
+    except OSError as exc:
+        # Advisory: a filesystem failure must never fail the review transition.
+        _log.warning("review receipt write failed for %s round %s: %s", task_id, round_no, exc)
+        return None
+
+
+def board_metadata_path(board: Optional[str] = None) -> Path:
+    """``board.json`` path — display metadata only; the directory slug is the identity."""
+    return board_dir(_slug_or_default(board)) / "board.json"
+
+
+def _default_board_display_name(slug: str) -> str:
+    """``atm10-server`` -> ``Atm10 Server``."""
+    return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-") if part) or slug
+
+
+def read_board_metadata(board: Optional[str] = None) -> dict:
+    """``board.json`` merged over defaults, plus ``slug`` and ``db_path``. Never
+    raises — a missing/malformed file yields the synthesized entry."""
+    slug = _slug_or_default(board)
+    meta: dict[str, Any] = {
+        "slug": slug,
+        "name": _default_board_display_name(slug),
+        "description": "",
+        "icon": "",
+        "color": "",
+        "default_workdir": None,
+        # Project scope: new tasks inherit it (deterministic worktree + branch).
+        "project_id": None,
+        "created_at": None,
+        "archived": False,
+    }
+    try:
+        p = board_metadata_path(slug)
+        if p.exists():
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                # Never let the metadata file claim a different slug than
+                # its directory — trust the filesystem.
+                raw["slug"] = slug
+                meta.update(raw)
+    except (OSError, json.JSONDecodeError):
+        pass
+    meta["db_path"] = str(kanban_db_path(slug))
+    return meta
+
+
+def write_board_metadata(
+    board: Optional[str], *, name: Optional[str] = None, description: Optional[str] = None,
+    icon: Optional[str] = None, color: Optional[str] = None, archived: Optional[bool] = None,
+    default_workdir: Optional[str] = None, project_id: Optional[str] = None,
+) -> dict:
+    """Create/update ``board.json``; unmentioned fields are preserved, ``created_at``
+    set on first write. ``project_id``/``default_workdir``: ``None`` = unchanged,
+    "" = clear (``project_id`` is not validated here)."""
+    _assert_not_delegated_child_mutation()
+    slug = _slug_or_default(board)
+    meta = read_board_metadata(slug)
+    # db_path is derived on every read; never persist it into board.json.
+    meta.pop("db_path", None)
+    if name is not None:
+        meta["name"] = str(name).strip() or _default_board_display_name(slug)
+    for key, value in (("description", description), ("icon", icon), ("color", color)):
+        if value is not None:
+            meta[key] = str(value)
+    if archived is not None:
+        meta["archived"] = bool(archived)
+    for key, value in (("default_workdir", default_workdir), ("project_id", project_id)):
+        if value is not None:
+            meta[key] = str(value) if value else None
+    if not meta.get("created_at"):
+        meta["created_at"] = int(time.time())
+    path = board_metadata_path(slug)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
+    )
+    meta["db_path"] = str(kanban_db_path(slug))
+    return meta
+
+
+def create_board(
+    slug: str, *, name: Optional[str] = None, description: Optional[str] = None,
+    icon: Optional[str] = None, color: Optional[str] = None, default_workdir: Optional[str] = None,
+    project_id: Optional[str] = None,
+) -> dict:
+    """Create board dir + DB + metadata (``mkdir -p`` semantics: existing board returns its metadata)."""
+    normed = _require_slug(slug)
+    meta = write_board_metadata(
+        normed, name=name, description=description, icon=icon, color=color,
+        default_workdir=default_workdir, project_id=project_id,
+    )
+    # Touch the DB so list_boards() sees it immediately.
+    init_db(board=normed)
+    return meta
+
+
+def list_boards(*, include_archived: bool = True) -> list[dict]:
+    """Metadata for every board: ``default`` first (always present), then
+    ``boards/<slug>/`` dirs holding a ``kanban.db`` or ``board.json``, sorted."""
+    entries = [read_board_metadata(DEFAULT_BOARD)]
+    seen = {DEFAULT_BOARD}
+    root = boards_root()
+    if root.is_dir():
+        for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+            if not child.is_dir():
+                continue
+            try:
+                normed = _normalize_board_slug(child.name)  # skip junk dirs, don't raise
+            except ValueError:
+                continue
+            if not normed or normed in seen or not _dir_holds_board(child):
+                continue
+            meta = read_board_metadata(normed)
+            if meta.get("archived") and not include_archived:
+                continue
+            entries.append(meta)
+            seen.add(normed)
+    return entries
+
+
+def remove_board(slug: str, *, archive: bool = True) -> dict:
+    """Archive (to ``boards/_archived/<slug>-<ts>/``) or delete a board;
+    ``default`` cannot be removed. Returns ``{"slug", "action", "new_path"}``."""
+    _assert_not_delegated_child_mutation()
+    normed = _require_slug(slug)
+    if normed == DEFAULT_BOARD:
+        raise ValueError("the 'default' board cannot be removed")
+    d = board_dir(normed)
+    if not d.exists():
+        raise ValueError(f"board {normed!r} does not exist")
+
+    # If the user removed the currently-active board, revert to default.
+    if get_current_board() == normed:
+        clear_current_board()
+
+    # A concurrent connect() after the rename recreates an empty DB file; drop
+    # the init cache first so the schema pass re-runs on it.
+    _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
+
+    if archive:
+        archive_root = boards_root() / "_archived"
+        archive_root.mkdir(parents=True, exist_ok=True)
+        ts = int(time.time())
+        target = archive_root / f"{normed}-{ts}"
+        suffix = 1
+        while target.exists():  # rapid double-archive
+            target = archive_root / f"{normed}-{ts}-{suffix}"
+            suffix += 1
+        d.rename(target)
+        return {"slug": normed, "action": "archived", "new_path": str(target)}
+    import shutil
+    shutil.rmtree(d)
+    return {"slug": normed, "action": "deleted", "new_path": ""}
 
 
 # --- Data classes ---
@@ -2005,6 +2351,23 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     (unified-budget) ``gave_up`` carries no marker and is judged by the counter,
     so raising ``failure_limit`` or ``assign_task`` to a fresh profile still
     releases it; a task with no such event at all (direct DB edit) auto-recovers.
+
+    This keys stickiness to the current blocked EPISODE, not to the card's whole
+    history: every route that moves a row out of ``status='blocked'`` closes the
+    episode by calling :func:`_supersede_sticky_block`, which writes the
+    ``unblocked`` marker ``unblock_task`` already wrote. Without that, a
+    ``blocked`` event left as the newest of the pair froze the card forever —
+    a later circuit-breaker trip could then never auto-recover (t_81a1f095).
+
+    Hand-merge at the pin: upstream added the ``gave_up``-``sticky`` clause above
+    (its own breaker-trip fence); ours adds the episode-closing
+    ``_supersede_sticky_block``. The two are complementary — the marker clause
+    keeps a sticky trip from being promoted back to ``ready``, the episode close
+    releases a card that left ``blocked`` by any route. Both are kept.
+
+    Returns ``False`` when there is no such event at all (e.g. the task was set to ``status='blocked'`` by
+    the circuit breaker or by direct DB manipulation) — preserves the pre-#28712 auto-recover semantics for
+    that path.
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
@@ -2020,6 +2383,96 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
         "ORDER BY id DESC LIMIT 1", (task_id, task_id),
     ).fetchone()
     return bool(trip) and bool(_json_dict(trip["payload"]).get("sticky"))
+
+
+def _supersede_sticky_block(
+    conn: sqlite3.Connection, task_id: str, *, origin: str,
+) -> bool:
+    """Close a sticky-block episode because the card's lane changed (t_81a1f095).
+
+    The invariant is two-sided, and every route that writes ``tasks.status``
+    honours it by calling this UNCONDITIONALLY after its CAS — the helper's own
+    guard makes that safe, so no caller needs a status predicate:
+
+    * **exit closes** — a row leaving ``status='blocked'`` (``complete_task``,
+      the swarm root's inline CAS, ``promote_task``, ``schedule_task``,
+      ``archive_task``, ``reclaim_task``, a dashboard drag) ends its episode.
+    * **re-entry closes** — a row that was moved back into play also ends any
+      episode still open on it. This is what neutralises historical residual
+      rows: those are already past every exit (their episode is open while the
+      row sits in ``done``/``archived``), so an exit-only fix never reaches them,
+      and the stale flag then freezes the card on its next circuit-breaker trip.
+      The choke point is the dispatch admission (``_claim_and_open_run``), which
+      every ``ready -> running`` transition funnels through; the dashboard's
+      direct-status write and the promotion/``unblock_task`` paths close it too,
+      so no route can carry an episode into a live run.
+
+    A status-based guard is deliberately NOT used: ``prev["status"] ==
+    "blocked"`` is false for a residual row already sitting outside the lane, so
+    it silently skips exactly the rows this exists to repair (t_81a1f095
+    round-1 review).
+
+    ``origin`` names the route so a reader can tell these apart from an operator
+    ``unblock_task``; it mirrors the ``origin`` ``create_task`` writes on its
+    create-time ``blocked`` event. Emitted origins: ``complete`` /
+    ``swarm_activate`` / ``recompute_promote`` / ``promote_manual`` /
+    ``schedule`` / ``archive`` / ``reclaim`` / ``dashboard_direct`` on the exits,
+    and ``claim`` on the dispatch admission (the re-entry choke point, which is
+    what closes the rows that are already past every exit).
+
+    The payload carries the card's current ``status`` plus the pre-exit
+    ``resume_status`` (``review`` when the newest lifecycle event says so), so a
+    later reader sees the same lane an ``unblock_task`` would have restored.
+
+    Emits iff the episode is currently open, so it is a no-op — no event, no
+    write — on the ordinary breaker-recovery path and on every ordinary status
+    move. Caller holds the txn; returns True when an ``unblocked`` event was
+    written.
+    """
+    if not _has_sticky_block(conn, task_id):
+        return False
+    _append_event(
+        conn, task_id, "unblocked",
+        {
+            "status": _task_status(conn, task_id),
+            "resume_status": _resume_status_from_events(conn, task_id),
+            "origin": origin,
+        },
+    )
+    return True
+
+
+def _graph_deferred_pending(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the newest 'scheduled' event for task_id carries
+    ``reactivate_on == 'children_done'`` AND no later
+    ``unblocked``/``promoted`` event supersedes it.
+
+    A later ``promoted`` (or ``unblocked``) event is read as the deferred
+    root having been released, so the gate reads ``False`` afterwards — which
+    is exactly why a spurious ``promoted`` event (from a scan-only
+    ``recompute_ready`` widening, pitfall 56) permanently disarms the release.
+
+    The comparison is by event ``id`` against the ``scheduled`` row, not
+    "does a ``promoted``/``unblocked`` row exist at all": ``schedule_task``
+    itself now closes a sticky-block episode with an ``unblocked`` written
+    BEFORE its ``scheduled`` event, and an existence-only test would read that
+    as the root having already been released — disarming the gate at creation
+    (t_81a1f095).
+    """
+    row = conn.execute(
+        "SELECT id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'scheduled' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    payload = _json_dict(_row_get(row, "payload"))
+    if payload.get("reactivate_on") != "children_done":
+        return False
+    superseded = conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = ? "
+        "AND kind IN ('unblocked', 'promoted') AND id > ? ORDER BY id DESC LIMIT 1",
+        (task_id, int(row["id"])),
+    ).fetchone()
+    return not (superseded and superseded["kind"] in ("unblocked", "promoted"))
 
 
 def _latest_event(
@@ -2070,13 +2523,18 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "FROM tasks WHERE status IN ('todo', 'blocked', 'scheduled')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Explicit human-intervention block; only ``unblock_task`` may exit it.
+                continue
+            # Graph-deferred roots (reactivate_on=children_done) release only
+            # once every child is done; a scheduled row that is NOT graph-
+            # deferred (human-deferred) stays parked forever. C3a.
+            if cur_status == "scheduled" and not _graph_deferred_pending(conn, task_id):
                 continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
@@ -2097,15 +2555,30 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
                     )
                     if failures >= effective_limit:
                         continue
-                    conn.execute(
+                    cur = conn.execute(
                         "UPDATE tasks SET status = ? "
                         "WHERE id = ? AND status = 'blocked'", (resume_status, task_id),
                     )
                 else:
-                    conn.execute(
-                        "UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'",
+                    # C3b: the write must accept the row the scan just widened
+                    # to. A 'scheduled' row matched by status='todo' changes
+                    # ZERO rows; gating the counter + event on rowcount==1
+                    # means a no-op emits NO 'promoted' event (pitfall 56).
+                    cur = conn.execute(
+                        "UPDATE tasks SET status = ? "
+                        "WHERE id = ? AND status IN ('todo', 'scheduled')",
                         (resume_status, task_id),
                     )
+                if cur.rowcount != 1:
+                    # No-op: nothing changed, so no 'promoted' event and no
+                    # counter increment — a fabricated event would permanently
+                    # disarm the reactivate_on release gate (_graph_deferred_pending).
+                    continue
+                # Defensive: a sticky row ``continue``d above, so this normally
+                # no-ops. Kept so the "leaving blocked closes the episode"
+                # invariant is single-sourced in this function rather than
+                # guaranteed by remote control flow (t_81a1f095).
+                _supersede_sticky_block(conn, task_id, origin="recompute_promote")
                 _append_event(
                     conn, task_id, "promoted",
                     {"status": resume_status} if resume_status != "ready" else None,
@@ -2161,6 +2634,16 @@ def _claim_and_open_run(
     )
     if cur.rowcount != 1:
         return None
+    # Close any sticky-block episode still open on this row (t_81a1f095).
+    #
+    # This is THE re-entry choke point: every dispatch admits a row to
+    # ``running`` through here, so a residual row (a ``blocked`` event left as
+    # the newest of the pair by an exit that predates this fix) cannot carry its
+    # stale episode into a live run and then freeze on the circuit breaker. The
+    # kernel-owned event carries ``origin`` so ``check_respawn_guard`` does not
+    # misread it as an operator re-queue; the helper self-guards, so this is a
+    # no-op (no event, no write) on the ordinary breaker-recovery path.
+    _supersede_sticky_block(conn, task_id, origin="claim")
     trow = conn.execute(
         "SELECT assignee, max_runtime_seconds, current_step_key "
         "FROM tasks WHERE id = ?", (task_id,),
@@ -2184,6 +2667,11 @@ def _claim_and_open_run(
         conn, task_id, "claimed",
         {"lock": lock, "expires": expires, "run_id": run_id, **(event_extra or {})}, run_id=run_id,
     )
+    # Remember that THIS process opened this run, so a locally-driven caller can
+    # later prove ownership of it (``_completion_ownership_guard``, t_6c8342e0).
+    # Harmless if the caller's txn then rolls back: run ids are unique and never
+    # reused, so a phantom entry can never match a later live run.
+    _record_opened_run(conn, task_id, int(run_id))
     return run_id
 
 
@@ -2489,9 +2977,57 @@ def _extend_live_stale_claim(conn: sqlite3.Connection, row: sqlite3.Row, now: in
 
 def reclaim_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None, signal_fn=None,
+    expected_run_id: Optional[int] = None, force: bool = False,
 ) -> bool:
     """Operator reclaim regardless of TTL: release the claim, restore the source
-    phase, reset the failure counter. False when not running."""
+    phase, reset the failure counter. False when not running.
+
+    ``expected_run_id``/``force`` are new (t_6c8342e0 Finding 2): the verb had no
+    run-id parameter, so any caller could terminate a live reviewer run — measured
+    pre-fix at the API layer, the reviewer's run ended ``outcome='reclaimed'``. A
+    caller that is worker-sponsored FOR THIS CARD (:func:`_worker_sponsored_for`)
+    may not reclaim a sibling's or a reviewer's run and is refused. The pin-less
+    OPERATOR path stays open — ``hermes kanban reclaim``, the dashboard's
+    reclaim/terminate endpoints, ``reassign_task(reclaim_first=True)`` — because
+    reclaim IS the operator's recovery verb and where worker termination lives
+    (``_terminate_reclaimed_worker``); forcing ``--force`` on it during an incident
+    would be the exact pressure that manufactured the ``HERMES_KANBAN_GUARD_BYPASS``
+    export. Instead, a pin-less end of a live run that another process owns is
+    AUDITED (``reclaim_displaced_not_owner``, see
+    :func:`_operator_displaced_live_run`) so it can never be mistaken for an
+    ordinary release — round-2 review Finding 1. The ``--force`` event
+    ``reclaim_forced_not_owner`` therefore belongs to the OTHER lane: a caller
+    that carries a worker pin, is refused without the flag, and passes it. For a
+    pin-less shell ``--force`` is inert — this recovery lane already lands and
+    records ``displaced`` (round-3 review Finding 1).
+    """
+    # Run-end invariant (t_6c8342e0 Finding 2): a worker-sponsored caller must own
+    # the run it is about to terminate and re-queue.
+    owner_ok, cas_run = _run_end_allowed(
+        conn, task_id, expected_run_id, verb="reclaim",
+    )
+    if not owner_ok and not force:
+        _audit_run_end_refusal(
+            conn, task_id, "reclaim", int(cas_run), expected_run_id, reason,
+        )
+        return False
+    if not owner_ok:
+        _audit_run_end_forced(
+            conn, task_id, "reclaim", int(cas_run), expected_run_id, reason,
+        )
+    # Operator recovery (CLI ``reclaim``, dashboard button, reassign) taking a live
+    # unowned run. The termination is this verb's documented job, so the write
+    # lands — but it is recorded as ``reclaim_displaced_not_owner``, not silent
+    # (round-2 review Finding 1). Only read when the caller DID own the run: the
+    # ``force`` branch above already emitted its own ``*_forced_not_owner``, and
+    # double-auditing one call would be a lie about how many runs were displaced.
+    # Resolved BEFORE the UPDATE (which clears the pointer we read) and emitted
+    # AFTER it commits, so a no-op reclaim never leaves a
+    # ``reclaim_displaced_not_owner`` event behind.
+    displaced = (
+        _operator_displaced_live_run(conn, task_id, expected_run_id, verb="reclaim")
+        if owner_ok else None
+    )
     row = conn.execute(
         "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
@@ -2513,10 +3049,22 @@ def reclaim_task(
         )
         if cur.rowcount != 1:
             return False
+        # The claim_lock CAS above IS this verb's run CAS: ``_claim_and_open_run``
+        # writes claim_lock and the run row in the same txn, so a matching lock
+        # proves the run that was inspected is still the card's live run. Pinned by
+        # ``test_reclaim_still_refused_when_a_claim_lands_between_reads``.
+        # from a sticky park: the card is being deliberately re-queued with a
+        # fresh retry budget, so the episode ends (t_81a1f095).
+        _supersede_sticky_block(conn, task_id, origin="reclaim")
         _record_reclaim(
             conn, task_id, termination,
             error=f"manual_reclaim: {reason}" if reason else f"manual_reclaim lock={prev_lock}",
             payload={"manual": True, "reason": reason, "prev_lock": prev_lock, "retry_status": retry_status},
+        )
+    if displaced is not None:
+        _audit_run_end_displaced(
+            conn, task_id, "reclaim", displaced[0], expected_run_id, reason,
+            via=displaced[1],
         )
     # Operator intervention = fresh retry budget (own txn, runs after commit).
     _clear_failure_counter(conn, task_id)
@@ -2525,13 +3073,28 @@ def reclaim_task(
 
 def reassign_task(
     conn: sqlite3.Connection, task_id: str, profile: Optional[str], *, reclaim_first: bool = False,
-    reason: Optional[str] = None,
+    reason: Optional[str] = None, force: bool = False,
 ) -> bool:
     """Reassign (None unassigns); a running task is refused unless
-    ``reclaim_first`` releases its claim — the "this profile's model is broken" path."""
+    ``reclaim_first`` releases its claim — the "this profile's model is broken" path.
+
+    ``force`` is forwarded to the internal :func:`reclaim_task` (t_6c8342e0
+    round-2 review Finding 1). ``reclaim_first=True`` is already an EXPLICIT
+    operator decision to take the card away from whoever holds it, and its
+    callers are all operator surfaces (``hermes kanban reassign --reclaim``, the
+    dashboard's reassign/bulk-reassign endpoints). Without the forward, the
+    narrowed operator lane would refuse the release, ``assign_task`` would then
+    raise on the still-running row, and the endpoint would 409 with "pass
+    reclaim_first=true" — advice the caller had already followed. For a pin-less
+    operator (the CLI's ``--reclaim`` and the dashboard endpoints — all pin-less
+    surfaces) the displacement is audited as ``reclaim_displaced_not_owner``,
+    never silently; ``force`` only matters for a caller that carries a worker pin,
+    where it is what turns a refusal into ``reclaim_forced_not_owner``
+    (round-3 review Finding 1 corrected this name).
+    """
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
-        reclaim_task(conn, task_id, reason=reason or "reassign")
+        reclaim_task(conn, task_id, reason=reason or "reassign", force=force)
     # assign_task handles its own txn + the still-running guard.
     try:
         return assign_task(conn, task_id, profile)
@@ -2652,6 +3215,42 @@ def _claim_is_live(trow) -> bool:
     )
 
 
+def completion_refusal_detail(
+    conn: sqlite3.Connection, task_id: str, expected_run_id: Optional[int],
+) -> Optional[str]:
+    """A human explanation for why ``complete_task`` would refuse, or ``None``.
+
+    Public sibling of :func:`_completion_ownership_guard` for the USER-FACING
+    call sites (``hermes kanban complete``, the ``kanban_complete`` tool). A bare
+    "unknown id or terminal state" for a live-run refusal is actively harmful
+    here: the incident operator, unable to tell why the sanctioned verb stopped
+    working, reached for ``HERMES_KANBAN_GUARD_BYPASS``. Naming the cause and the
+    two legitimate ways forward is the difference between a guard and an obstacle.
+
+    Read-only and never raises: this exists to improve a message, so it must not
+    be able to replace a clean refusal with an exception.
+
+    Hand-merge at the pin: upstream shipped its own live-run fence at this spot
+    (:class:`LiveClaimError` + :func:`_claim_is_live`, both kept above); this
+    helper is ours and is layered on top of the merged
+    :func:`_completion_ownership_guard` seam — the two fences now share one
+    decision function, so a refusal cannot be half-applied.
+    """
+    try:
+        ok, live_run_id = _completion_ownership_guard(conn, task_id, expected_run_id)
+    except Exception:
+        return None
+    if ok:
+        return None
+    return (
+        f"task {task_id} is running under a live run (run {live_run_id}) owned by "
+        f"another process, so it cannot be closed from here. Pass "
+        f"expected_run_id={live_run_id} as the run's owner, reclaim the run first "
+        f"(`hermes kanban reclaim {task_id}`), or complete it with --force to "
+        f"deliberately displace that run (recorded as completion_forced_not_owner)."
+    )
+
+
 def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
@@ -2674,11 +3273,35 @@ def complete_task(
     or ``summary``, or a stripped result already stored on the card. Empty or
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
     auditable event. Approving a card out of ``review`` stays exempt.
+
+    ``force=True`` is the explicit human override of the force-close invariant
+    (``hermes kanban complete --force``, and the dashboard's own ``done`` verb):
+    it closes a live run the caller does not own and records
+    ``completion_forced_not_owner`` so a later reader can tell a forced close
+    from an ordinary handoff. The displaced worker is NOT signalled — that stays
+    ``reclaim_task``'s job, keeping worker termination on one code path (and
+    inside the graceful-park contract's zero-hard-kills rule). Deliberately an
+    explicit opt-in rather than the default: the incident was precisely a
+    non-owner close that could not be told apart from an ordinary handoff.
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+    # The force-close invariant (t_6c8342e0): a LIVE run may only be closed by a
+    # caller that can prove it owns it. Runs before any staged artifact / event
+    # write, so a refusal leaves the card byte-identical. Re-checked inside the
+    # txn below, which is where the terminal UPDATE is what enforces it.
+    owner_ok, cas_run = _completion_ownership_guard(conn, task_id, expected_run_id)
+    if not owner_ok:
+        if not force:
+            _refuse_completion_not_owner(
+                conn, task_id, int(cas_run), expected_run_id, summary or result,
+            )
+            return False
+        _record_forced_completion(
+            conn, task_id, int(cas_run), expected_run_id, summary or result,
+        )
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
@@ -2701,9 +3324,15 @@ def complete_task(
             (task_id,),
         ).fetchone()
         prior_status = trow["status"] if trow else None
-        # Refuse to close a LIVE worker's run without proof of ownership
-        # (expected_run_id) or an explicit human override (force=True); see
-        # _claim_is_live for what "live" means.
+        # The pin's own fence (upstream 0959224313, shipped with
+        # tests/hermes_cli/test_kanban_complete_live_claim_guard.py): a LIVE claim
+        # may only be closed by a caller that proved ownership via
+        # ``expected_run_id`` or asked for the operator override. Restored
+        # deliberately — see HAND_MERGE_DECISIONS.md §F2: it is the same defect
+        # class our carried fa80f337b4 fixed, so the carried copy is SUPERSEDED
+        # here (the user's stated rule) rather than layered on top. Our audit
+        # vocabulary, the extra verbs' STRICT/SPONSORED split and the
+        # post-handoff re-admission are retained; only this predicate defers.
         if expected_run_id is None and not force and trow and _claim_is_live(trow):
             raise LiveClaimError(task_id)
         sql = """
@@ -2720,11 +3349,32 @@ def complete_task(
                    AND status IN ('running', 'ready', 'blocked', 'review')
                 """
         params: tuple = (result, now, task_id)
-        if expected_run_id is not None:
-            sql += " AND current_run_id = ?"
-            params = (*params, int(expected_run_id))
+        # The CAS is the enforcement point, and it is now ALWAYS armed. The
+        # pre-check above resolved ownership against the run it observed; this
+        # re-read closes the race where a claim lands between the two. The
+        # incident's hole was that `expected_run_id` being None appended NO
+        # clause, so the UPDATE matched on status alone and closed a live run
+        # (t_6c8342e0). `IS` (not `=`) so a NULL live run still pins NULL, which
+        # keeps the human-approval path (#54823) working.
+        #
+        # `force` pins whatever live run the row carries AT THIS POINT: the
+        # operator explicitly asked to displace it, and the override was audited
+        # before this txn. Every other caller must still prove ownership here,
+        # which is why this re-check cannot be dropped in favour of reusing the
+        # pre-check's answer.
+        cas_ok, cas_run = _completion_ownership_guard(conn, task_id, expected_run_id)
+        if not cas_ok and not force:
+            return False
+        sql += " AND current_run_id IS ?"
+        params = (*params, cas_run)
         if conn.execute(sql, params).rowcount != 1:
             return False
+        # The card LEFT ``blocked`` here, so the sticky episode ends with it —
+        # else the residual ``blocked`` event stays newest forever and a later
+        # circuit-breaker trip can never auto-recover (t_81a1f095). Emitted
+        # BEFORE the ``completed`` event so ``_resume_status_from_events`` still
+        # reads the blocked lane's payload for ``resume_status``.
+        _supersede_sticky_block(conn, task_id, origin="complete")
         if isinstance(metadata, dict):
             _stage_completion_artifacts(conn, task_id, metadata, now)
         run_id = _end_run(
@@ -2760,6 +3410,580 @@ def complete_task(
 
 
 _REVIEW_APPROVED_NOTE = "Review approved without additional evidence."
+
+
+def _record_opened_run(conn: sqlite3.Connection, task_id: str, run_id: int) -> None:
+    """Remember a run THIS process opened via the claim CAS (``_claim_and_open_run``).
+
+    Process-local by construction, which is exactly the discriminator the
+    force-close invariant needs (t_6c8342e0). The incident's caller was the
+    *implementer's* process: the dispatcher (a different pid) had opened run 894
+    for the reviewer, so the implementer's copy of this ledger was empty and it
+    matched nothing. A dispatcher-spawned worker is admitted by
+    ``tasks.worker_pid == os.getpid()`` instead, and a locally-driven caller
+    (``claim_task(claimer=...)`` / ``claim_review_task(...)``, as the test corpus
+    and the CLI do) is admitted here. A standalone probe inheriting the worker's
+    pins has a different pid and never ran a claim CAS, so it can never populate
+    this.
+
+    Keyed on ``(board path, task_id)``, not ``task_id`` alone: run ids are
+    per-DB autoincrement values, so a long-lived process that touches several
+    boards (a test session, an embedded CLI) would otherwise let a stale entry
+    for board A match an unrelated run on board B.
+
+    Matching ``claim_lock`` text was rejected as the third clause: it is a
+    ``host:pid`` string the *dispatcher* writes, so keying on the host prefix
+    would have admitted the very process that force-closed the card (its
+    ``claim_lock`` was its own ``visor:1977384``), and keying on
+    ``_claimer_id()`` equality wrongly refused in-process callers that pass an
+    explicit ``claimer``.
+    """
+    board = _board_identity(conn)
+    if board is None:
+        return  # cannot identify the board => record nothing (fail closed).
+    _OPENED_RUNS[(board, task_id)] = int(run_id)
+    while len(_OPENED_RUNS) > _OPENED_RUNS_MAX:
+        oldest = next(iter(_OPENED_RUNS))
+        _OPENED_RUNS.pop(oldest, None)
+
+
+def _board_identity(conn: sqlite3.Connection) -> Optional[str]:
+    """The resolved ``main`` DB path of *conn*, or ``None`` when unavailable.
+
+    Thin import of ``kanban_guard.conn_db_path`` (a ``PRAGMA database_list``
+    read) so the ledger's key and the guard's own path resolution can never
+    disagree about which board a connection points at.
+    """
+    try:
+        from hermes_cli.kanban_guard import conn_db_path
+
+        resolved = conn_db_path(conn)
+    except Exception:
+        return None
+    return None if resolved is None else str(resolved)
+
+
+#: ``{(board path, task_id): run_id}`` for claim CASes THIS process performed.
+#: See :func:`_record_opened_run` for why this and not ``claim_lock`` text.
+_OPENED_RUNS: dict[tuple[str, str], int] = {}
+
+#: Bound, mirroring ``kanban_guard._OWNED_WORKER_PINS_MAX``: a long-lived process
+#: (test session, embedded CLI) may claim many times; evict oldest.
+_OPENED_RUNS_MAX = 64
+
+
+def _opened_run_matches(
+    conn: sqlite3.Connection, task_id: str, live_run_id: int,
+) -> bool:
+    """True when THIS process's ledger entry names *live_run_id* for *task_id*.
+
+    The third ownership clause's read side, and the place stale entries die
+    (t_6c8342e0 review round 1). A ledger entry is honoured only when it names
+    the card's LIVE run **and** a ``task_runs`` row with that id still belongs to
+    this card. Two mutations are guarded:
+
+    * an entry whose recorded run is no longer the card's run — the run was
+      deleted out from under the ledger (legacy migration, direct-SQL surgery) or
+      the card was re-claimed by another process. Honouring it would admit a run
+      this process never opened, so it is DROPPED: a stale entry must not survive
+      to admit a later run that happens to reuse the id.
+    * an id that no longer resolves to this task — belt-and-braces against id
+      reuse (the schema is AUTOINCREMENT, so ids are never recycled, but a legacy
+      rebuilt table is not something this predicate should have to assume).
+    """
+    board = _board_identity(conn)
+    if board is None:
+        return False
+    key = (board, task_id)
+    recorded = _OPENED_RUNS.get(key)
+    if recorded is None:
+        return False
+    if int(recorded) != int(live_run_id):
+        _OPENED_RUNS.pop(key, None)  # stale: superseded or deleted run.
+        return False
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ?",
+            (int(live_run_id), task_id),
+        ).fetchone()
+    except Exception:
+        return False
+    if row is None:
+        _OPENED_RUNS.pop(key, None)
+        return False
+    return True
+
+
+def _live_run_ownership_guard(
+    conn: sqlite3.Connection, task_id: str, expected_run_id: Optional[int],
+) -> tuple[bool, Optional[int]]:
+    """``(ok, cas_run)`` — may THIS caller end *task_id*'s live run, and on which?
+
+    Single decision seam for the force-close invariant (t_6c8342e0): ``ok`` is
+    what the pre-check refuses on, ``cas_run`` is the run the terminal UPDATE
+    must still see (``current_run_id IS cas_run``). One call, one answer — so a
+    refusal cannot be half-applied, and the invariant has exactly one place to
+    be tested and one to be mutated.
+
+    **Every run-ending verb routes through here** (round-1 review Finding 2:
+    ``complete_task`` was the only safe verb while ``block_task`` /
+    ``request_changes`` / ``schedule_task`` / ``reclaim_task`` / ``archive_task``
+    each terminated a live run their caller did not own — the exact defect class
+    this card exists to close; measured pre-fix: all eight verbs refused, post-fix
+    only ``complete_task`` and ``request_review``. Enforcing the invariant in one
+    verb inverts the risk picture, so the seam is shared and each call site
+    supplies its own ``force`` sibling).
+
+    On 2026-09-15 review run 894 of card ``t_c5018dd9`` was still LIVE —
+    ``task_runs.ended_at`` NULL, worker pid 2035238 executing harnesses 19
+    minutes later — when the card was closed to ``done`` by the *implementer's*
+    process. That write went through ``complete_task``'s sanctioned path with
+    ``expected_run_id=None`` (the caller had unset its ``HERMES_KANBAN_TASK`` /
+    ``_RUN_ID`` pins), and the CAS clause was appended **only** when
+    ``expected_run_id is not None`` — so the terminal UPDATE matched on
+    ``status IN (..., 'running', ...)`` alone and closed a run its caller did
+    not own. Card status is deliberately NOT part of this check: the incident's
+    card read ``running`` (the review lane claims into ``running``), so a
+    ``review``-only rule would not have stopped it.
+
+    ``(True, None)`` when the card has NO live run: the #54823 shape — a card
+    parked in ``review``/``ready``/``blocked`` after its run closed — stays
+    completable by a human passing no run id, because there is nothing to take
+    from anyone. Pinned by
+    ``test_t1_human_approval_of_parked_review_card_still_works``.
+
+    Ownership is provable three ways, and each clause is needed:
+
+    * ``expected_run_id`` names the live run — the worker/reviewer path
+      (``kanban_tools`` pins it from ``HERMES_KANBAN_RUN_ID``, which the
+      dispatcher always exports at spawn).
+    * ``tasks.worker_pid == os.getpid()`` — this process IS the spawned worker
+      (``_set_worker_pid``).
+    * this process OPENED the run (``_OPENED_RUNS``, via
+      :func:`_opened_run_matches`) — the locally-driven path
+      (``claim_task(claimer=...)`` from the CLI/tests), which the dispatcher
+      never stamps a ``worker_pid`` for, and the legacy-backfill path, whose
+      synthesized run is registered by its opener.
+
+    The incident caller matched NONE of them: run 894's ``worker_pid`` was
+    2035238 (the reviewer), and the dispatcher — not that process — had opened
+    the run, so its ledger was empty.
+    """
+    row = conn.execute(
+        "SELECT current_run_id, worker_pid FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return True, None
+    live_run_id = row["current_run_id"]
+    if live_run_id is None:
+        return True, None
+    live_run_id = int(live_run_id)
+    if expected_run_id is not None:
+        # The caller named a run, so that IS the CAS value: the in-txn
+        # ``current_run_id IS ?`` must pin exactly what it asked for. A caller
+        # passing a SUPERSEDED run id must still lose the CAS (the pre-existing
+        # contract, pinned by
+        # ``test_goal_run_status_is_bound_to_original_run`` and
+        # ``test_request_review_expected_run_id_mismatch_is_noop``) — the
+        # always-armed CAS must not silently "upgrade" it to the live run, or a
+        # stale worker would regain the ability to end a successor's run.
+        try:
+            named = int(expected_run_id)
+        except (TypeError, ValueError):
+            named = None
+        if named == live_run_id:
+            return True, live_run_id
+        # Not the live run. Fall through to the other two ownership clauses only
+        # to decide whether to ALLOW the attempt; the CAS stays the named run, so
+        # a stale id cannot land.
+        if _owns_live_run_by_pid_or_ledger(conn, task_id, live_run_id, row):
+            return True, named
+        # Refusal reports the card's ACTUAL live run (never the stale id, and
+        # never None): the audit event's job is to name the run at risk.
+        return False, live_run_id
+    if _owns_live_run_by_pid_or_ledger(conn, task_id, live_run_id, row):
+        return True, live_run_id
+    return False, live_run_id
+
+
+def _owns_live_run_by_pid_or_ledger(
+    conn: sqlite3.Connection, task_id: str, live_run_id: int, row: Any,
+) -> bool:
+    """Clauses 2 and 3 of the run-ownership decision: spawned-here, or opened-here.
+
+    Split out of :func:`_live_run_ownership_guard` so the ``expected_run_id``
+    branch can consult them without duplicating the predicates (clause 1 is the
+    run-id match the caller either hit or missed).
+    """
+    worker_pid = _row_get(row, "worker_pid")
+    if worker_pid is not None and int(worker_pid) == os.getpid():
+        return True
+    return _opened_run_matches(conn, task_id, live_run_id)
+
+
+def _completion_ownership_guard(
+    conn: sqlite3.Connection, task_id: str, expected_run_id: Optional[int],
+) -> tuple[bool, Optional[int]]:
+    """Completion-side name for :func:`_live_run_ownership_guard`.
+
+    Kept as its own function (not a bare alias assignment) on purpose: it is the
+    monkeypatch seam
+    ``test_mutant_without_the_ownership_check_the_live_run_is_closed`` inerts to
+    prove the refuse-direction inverts, and ``verb_sweep.py`` /
+    ``test_incident_actor_shape_is_refused`` call it by name. ``complete_task``
+    binds this name, so the mutant stays a *completion* mutant while the other
+    verbs answer to the shared seam directly.
+    """
+    return _live_run_ownership_guard(conn, task_id, expected_run_id)
+
+
+#: Verbs that END a card's live run, mapped to their audit-event stem. One table
+#: because the round-1 review showed the invariant was enforced in exactly ONE of
+#: them (t_6c8342e0 Finding 2): with the reviewer's live run owned by another pid,
+#: ``block_task`` / ``request_changes`` / ``schedule_task`` / ``reclaim_task`` /
+#: ``archive_task`` each terminated it. Adding a verb means adding a row here and
+#: routing it through :func:`_run_end_allowed`.
+#:
+#: Keys are the canonical VERB names used at the call sites and in the audit
+#: payload's ``verb`` field; values are the event-name stem, which only diverges
+#: for ``request_changes``/``complete`` because their documented kinds are
+#: ``changes_*``/``completion_*`` (the incident's own contract).
+_RUN_END_VERBS: dict[str, str] = {
+    "complete": "completion",
+    "block": "block",
+    "request_changes": "changes",
+    "schedule": "schedule",
+    "reclaim": "reclaim",
+    "archive": "archive",
+}
+
+#: Verbs whose ONLY legitimate caller is the run's owner: terminal VERDICTS about
+#: the run's outcome (``done`` / ``changes_requested``). No operator path ends a
+#: run this way from another process, so these are strict — owner, or ``force``.
+#: ``complete_task`` must be strict because the incident's caller had SCRUBBED its
+#: ``HERMES_KANBAN_TASK`` pin, i.e. it was indistinguishable from an operator
+#: shell by env alone: only the run-ownership proof separated it.
+_STRICT_RUN_END_VERBS = frozenset({"complete", "request_changes"})
+
+#: The ONE verb+kind a NON-worker-sponsored (pin-less) caller may use to end a
+#: live run it cannot prove it owns.
+#:
+#: ``docs/runbooks/t5-graceful-stop-runbook.md`` §2/§3 step 3 is the only
+#: documented operator path that ends an IN-FLIGHT sibling's run from a shell
+#: carrying no worker pin: ``hermes kanban block <id> dependency "<reason>"``.
+#: The runbook names exactly this verb and this kind — nothing else. §3 is
+#: explicit that a *queued* card behind a parent gate needs no block at all
+#: ("queued cards … need NO block — comment them instead"), so a dependency park
+#: is the whole requirement.
+#:
+#: Round-2 review (t_6c8342e0 Finding 1) measured that admitting the entire
+#: pin-less lane — every verb, every block kind — left AC1's own caller shape
+#: (``HERMES_KANBAN_TASK`` unset, run owned by another process) able to displace a
+#: live REVIEW run through ``block`` / ``schedule`` / ``reclaim`` / ``archive``,
+#: SILENTLY (no ``*_refused_not_owner``, no ``*_forced_not_owner`` — the trail read
+#: as an ordinary operator park), and that ``reclaim`` / ``archive`` additionally
+#: SIGTERM'd the reviewer through ``_terminate_reclaimed_worker`` — which the T5
+#: contract forbids ("STOP is NEVER a dispatcher kill and never a hard SIGTERM").
+#: Scoping the admission to the runbook's own verb+kind closes all four.
+_OPERATOR_PARK_VERB = "block"
+_OPERATOR_PARK_KIND = "dependency"
+
+
+def _operator_park(verb: str, kind: Optional[str]) -> bool:
+    """True for the one pin-less run-end the binding T5 runbook actually needs."""
+    return verb == _OPERATOR_PARK_VERB and kind == _OPERATOR_PARK_KIND
+
+
+#: Recovery verbs a pin-less operator keeps UNCONDITIONALLY, but only with an
+#: audit event when the run it displaced was live and unowned.
+#:
+#: These two cannot be made strict without regressing their documented contract:
+#: ``reclaim``/``archive`` ARE the operator's recovery path for a card nobody can
+#: hand back, and both are DEFINED to terminate the worker
+#: (``_terminate_reclaimed_worker``) — the existing corpus pins that
+#: (``test_kanban_core_functionality.py::test_reclaim_task_resets_running_to_ready``
+#: asserts ``killed == [signal.SIGTERM]`` from a pin-less caller against a live
+#: run owned by another pid; ``test_kanban_db.py::
+#: test_archive_running_task_terminates_worker`` and the dashboard's
+#: ``/tasks/{id}/reclaim`` recovery button are the same shape). Refusing them
+#: would lock the operator out of recovery and manufacture the very
+#: ``HERMES_KANBAN_GUARD_BYPASS`` pressure the incident came from.
+#:
+#: So the disposition is AUDITED rather than hidden: a pin-less end of a live run
+#: the caller cannot prove it owns emits ``<stem>_displaced_not_owner`` — named
+#: for what it is ("the operator lane permitted the write and it displaced a live
+#: run"), NOT ``<stem>_forced_not_owner``, which would be a false claim: no
+#: ``force=True`` was passed. ``<stem>_forced_not_owner`` belongs to the OTHER
+#: lane — a caller that carries a worker pin, is refused without the flag, and
+#: passes it; for a pin-less shell ``--force`` is inert on these two verbs because
+#: this recovery lane already lands. Round 3 introduced this name for exactly that
+#: reason and left nine call sites still claiming ``forced`` (round-3 review
+#: Finding 1); the names are now pinned by the T8 group in
+#: ``tests/hermes_cli/test_kanban_run_end_audit_names.py``.
+#: Either way, that closes round-2 review Finding 1's "NO refused/forced audit
+#: event in any case — the trail reads as an ordinary operator park" without
+#: breaking recovery.
+_OPERATOR_AUDITED_VERBS = frozenset({"reclaim", "archive"})
+
+
+def _worker_sponsored_for(task_id: str) -> bool:
+    """True when THIS process claims to be the dispatched worker for *task_id*.
+
+    The single env pin the kanban write guard keys on (``WORKER_SPONSOR_PIN``),
+    read here for the same reason: its PRESENCE means "I am a worker for this
+    card", so it may not end a run it does not own. Its ABSENCE means the gateway
+    dispatcher / plain CLI / dashboard server — invariant I3, where the board is
+    being driven BY an operator and the operation is legitimate.
+
+    This is what keeps the T5 graceful-park contract working
+    (``docs/runbooks/t5-graceful-stop-runbook.md`` §3 step 3): the orchestrator
+    parks an in-flight SIBLING card with ``hermes kanban block <id> dependency``
+    from a shell that carries no worker pin, and that park MUST land. Requiring
+    ``--force`` on the documented STOP procedure would turn a binding runbook
+    step into a failure mode during an incident.
+    """
+    return (os.environ.get("HERMES_KANBAN_TASK") or "").strip() == task_id
+
+
+def _run_end_allowed(
+    conn: sqlite3.Connection, task_id: str, expected_run_id: Optional[int],
+    *, verb: str, kind: Optional[str] = None,
+) -> tuple[bool, Optional[int]]:
+    """``(ok, cas_run)`` for the run-end verb *verb* on *task_id*.
+
+    Three policies, and each boundary is deliberate:
+
+    * **strict** (:data:`_STRICT_RUN_END_VERBS` — ``complete``/``changes``): the
+      run's owner, or nothing. These are lifecycle verdicts; no cross-process
+      operator path issues them.
+    * **refused for a worker sponsor** (every other verb): a caller carrying
+      ``HERMES_KANBAN_TASK == task_id`` that cannot prove ownership is refused —
+      a worker may not end a sibling's or a reviewer's run.
+    * **admitted for the operator ONLY on the runbook's own verb+kind**
+      (:func:`_operator_park` — ``block`` + ``kind="dependency"``). A pin-less
+      caller is the operator driving the board (invariant I3), and the T5
+      graceful-park procedure (``docs/runbooks/t5-graceful-stop-runbook.md`` §3
+      step 3) parks an in-flight SIBLING from such a shell and must not require
+      ``--force`` mid-incident. That is the whole of the operator lane's
+      requirement — the runbook names exactly this verb and kind.
+
+    Admitting the *whole* pin-less lane instead (round 1's design) is what
+    round-2 review Finding 1 measured: the incident's own caller shape
+    (``HERMES_KANBAN_TASK`` unset, live run owned by another process) could still
+    displace a live review run via ``block`` (any kind) / ``schedule`` /
+    ``reclaim`` / ``archive`` — SILENTLY — and ``reclaim``/``archive`` additionally
+    SIGTERM'd the reviewer, which the T5 contract forbids. Every other pin-less
+    end of a live unowned run now falls through to the refusal, which audits
+    ``<stem>_refused_not_owner``; ``force=True`` remains the explicit, audited
+    override at the call site (``<stem>_forced_not_owner``).
+
+    Returns ``(ok, cas_run)``, and the caller decides which audit to emit from
+    ``ok`` + the ``force`` it was handed. A pin-less operator recovery verb
+    (:data:`_OPERATOR_AUDITED_VERBS`) is returned as ``(True, cas_run)`` — the
+    write lands, as its contract requires — but the call sites classify it via
+    :func:`_operator_displaced_live_run` and emit
+    ``<stem>_displaced_not_owner``, so a displaced run is never indistinguishable
+    from an ordinary park.
+
+    The two audit names split by CALLER LANE, and only one of them is about
+    ``force``:
+
+    * ``<stem>_displaced_not_owner`` — the pin-less OPERATOR lane above
+      (:func:`_operator_park` or :data:`_OPERATOR_AUDITED_VERBS`). No
+      ``force=True`` was passed, so claiming "forced" would overstate what the
+      operator did. ``--force`` is inert for this caller on the recovery verbs.
+    * ``<stem>_forced_not_owner`` — a caller that DOES carry a worker pin
+      (refused here) and passed ``force=True`` to override the refusal.
+    """
+    ok, cas_run = _live_run_ownership_guard(conn, task_id, expected_run_id)
+    if ok:
+        return True, cas_run
+    if verb in _STRICT_RUN_END_VERBS:
+        return False, cas_run
+    if _worker_sponsored_for(task_id):
+        return False, cas_run
+    if _operator_park(verb, kind) or verb in _OPERATOR_AUDITED_VERBS:
+        return True, cas_run
+    return False, cas_run
+
+
+def _operator_displaced_live_run(
+    conn: sqlite3.Connection, task_id: str, expected_run_id: Optional[int],
+    *, verb: str, kind: Optional[str] = None,
+) -> Optional[tuple[int, str]]:
+    """``(live_run_id, via)`` for a live run a pin-less operator is about to
+    displace, else ``None``.
+
+    Called at a run-end call site AFTER :func:`_run_end_allowed` returned
+    ``ok=True``. It answers the narrow question the round-2 review Finding 1
+    asked for: did this write take a LIVE run away from a caller that cannot
+    prove ownership of it?
+
+    * ``None`` when the caller OWNS the run (nothing is being taken) or when the
+      card has no live run.
+    * ``(run_id, "operator_park")`` for the T5 dependency park — the sanctioned
+      STOP, which the runbook requires to land.
+    * ``(run_id, "operator_recovery")`` for a pin-less ``reclaim``/``archive`` —
+      the operator's recovery path, where terminating the worker is the documented
+      behaviour.
+
+    Deliberately a second read of the same seam predicate rather than a third
+    return value: the verdict tuple is pinned by tests and by ``_run_end_allowed``
+    callers, and keeping the disposition a separate named decision means a call
+    site cannot silently skip the audit.
+    """
+    ok, cas_run = _live_run_ownership_guard(conn, task_id, expected_run_id)
+    if ok or cas_run is None:
+        return None
+    if _operator_park(verb, kind):
+        return int(cas_run), "operator_park"
+    if verb in _OPERATOR_AUDITED_VERBS:
+        return int(cas_run), "operator_recovery"
+    return None
+
+
+def _audit_run_end_refusal(
+    conn: sqlite3.Connection, task_id: str, verb: str, live_run_id: int,
+    expected_run_id: Optional[int], attempted: Optional[str],
+) -> None:
+    """Record ``<stem>_refused_not_owner`` so a refusal is auditable.
+
+    Own txn, and best-effort on failure: the verb is being REFUSED, so a guard
+    refusal or a lock error here must not turn a clean ``False`` into a raised
+    exception at the call site (mirrors ``_gate_created_cards``'s separate audit
+    write, but that path raises — this one must not).
+    """
+    stem = _RUN_END_VERBS.get(verb, verb)
+    try:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, f"{stem}_refused_not_owner",
+                {
+                    "verb": verb,
+                    "live_run_id": int(live_run_id),
+                    "expected_run_id": (
+                        int(expected_run_id) if expected_run_id is not None else None
+                    ),
+                    "caller_pid": os.getpid(),
+                    "reason": (
+                        "cannot end a task's live run from a process that does not "
+                        "own it; pass expected_run_id=<that run> (workers get it "
+                        "from HERMES_KANBAN_RUN_ID), reclaim the run first, or use "
+                        f"the explicit --force override (recorded as "
+                        f"{stem}_forced_not_owner)"
+                    ),
+                    "summary_preview": _first_line(attempted, 200) or None,
+                },
+            )
+    except Exception:
+        logger.debug("%s_refused_not_owner audit event not written", stem, exc_info=True)
+
+
+def _audit_run_end_forced(
+    conn: sqlite3.Connection, task_id: str, verb: str, live_run_id: int,
+    expected_run_id: Optional[int], attempted: Optional[str],
+) -> None:
+    """Audit a ``force=True`` end of a live run by a non-owner (t_6c8342e0).
+
+    The deliberate override sibling of :func:`_audit_run_end_refusal`: the write
+    lands, but the board records that it displaced a live run, so a later reviewer
+    can tell a forced end from an ordinary handoff. The displaced worker is NOT
+    killed here — ``reclaim_task`` owns worker termination (and the graceful-park
+    contract's zero-hard-kills rule), and a worker whose run is gone exits on its
+    own next board call.
+
+    Best-effort: a failure here must not abort an action the operator asked for.
+    """
+    stem = _RUN_END_VERBS.get(verb, verb)
+    try:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, f"{stem}_forced_not_owner",
+                {
+                    "verb": verb,
+                    "live_run_id": int(live_run_id),
+                    "expected_run_id": (
+                        int(expected_run_id) if expected_run_id is not None else None
+                    ),
+                    "caller_pid": os.getpid(),
+                    "summary_preview": _first_line(attempted, 200) or None,
+                },
+            )
+    except Exception:
+        logger.debug("%s_forced_not_owner audit event not written", stem, exc_info=True)
+
+
+def _audit_run_end_displaced(
+    conn: sqlite3.Connection, task_id: str, verb: str, live_run_id: int,
+    expected_run_id: Optional[int], attempted: Optional[str], *, via: str,
+) -> None:
+    """Audit a NON-forced operator lane end of a live run it does not own.
+
+    Deliberately a DIFFERENT event kind from ``<stem>_forced_not_owner``: no
+    ``force=True`` was passed, so inheriting the "forced" name would be its own
+    false claim about what happened. What happened is narrower and exactly what a
+    reader needs: the operator lane permitted the write and it displaced a live run
+    the caller could not prove it owned. Before this event existed, the
+    pin-less end of a live review run left NO trace at all — the trail read as
+    an ordinary park (round-2 review Finding 1).
+
+    ``via`` records which admission did it (:func:`_operator_park` — the T5
+    dependency park — or :data:`_OPERATOR_AUDITED_VERBS` — operator recovery), so
+    an auditor can tell the sanctioned STOP apart from a recovery termination.
+
+    Best-effort, own txn: an audit failure must not abort the operator's action.
+    """
+    stem = _RUN_END_VERBS.get(verb, verb)
+    try:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, f"{stem}_displaced_not_owner",
+                {
+                    "verb": verb,
+                    "live_run_id": int(live_run_id),
+                    "expected_run_id": (
+                        int(expected_run_id) if expected_run_id is not None else None
+                    ),
+                    "caller_pid": os.getpid(),
+                    "via": via,
+                    "worker_sponsored": _worker_sponsored_for(task_id),
+                    "reason": (
+                        "an operator-lane caller ended a live run it cannot prove "
+                        "it owns; the write was permitted by design (this is not a "
+                        "--force override and not a refusal)"
+                    ),
+                    "summary_preview": _first_line(attempted, 200) or None,
+                },
+            )
+    except Exception:
+        logger.debug("%s_displaced_not_owner audit event not written", stem, exc_info=True)
+
+
+def _refuse_completion_not_owner(
+    conn: sqlite3.Connection, task_id: str, live_run_id: int,
+    expected_run_id: Optional[int], attempted: Optional[str],
+) -> None:
+    """``completion_refused_not_owner`` — the completion verb's refusal audit.
+
+    Thin binding of :func:`_audit_run_end_refusal`, kept because the literal event
+    kind and this name are the incident's documented contract (the wiki landing
+    card ``t_c91b9b0b`` and the ``test_kanban_live_run_close_guard`` corpus both
+    name them).
+    """
+    _audit_run_end_refusal(
+        conn, task_id, "complete", live_run_id, expected_run_id, attempted,
+    )
+
+
+def _record_forced_completion(
+    conn: sqlite3.Connection, task_id: str, run_id: int,
+    expected_run_id: Optional[int], attempted: Optional[str],
+) -> None:
+    """``completion_forced_not_owner`` — the completion verb's override audit."""
+    _audit_run_end_forced(
+        conn, task_id, "complete", run_id, expected_run_id, attempted,
+    )
 
 
 def _gate_created_cards(
@@ -3140,6 +4364,7 @@ def edit_task(
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    force: bool = False,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
@@ -3154,9 +4379,56 @@ def block_task(
     audit event is appended, while status, failure evidence and the terminal
     runs stay exactly as the breaker left them. A typed block, a card with a
     live run, or a kind-less call on a blocked card are still refused.
+
+    ``force=True`` displaces a live run the caller does not own and audits
+    ``block_forced_not_owner`` (t_6c8342e0). Without it the call is refused when
+    the caller is worker-sponsored FOR THIS CARD and cannot prove ownership of the
+    live run — a worker may not park a sibling/cross-tenant run, which is the
+    force-close defect class. A pin-less caller gets the operator lane, but ONLY
+    for ``kind="dependency"``: that is the T5 STOP procedure
+    (``docs/runbooks/t5-graceful-stop-runbook.md`` §3 step 3), which parks an
+    in-flight sibling by design and must not require ``--force`` mid-incident.
+
+    Hand-merge at the pin: upstream's fence (``force``/``block_forced_not_owner``
+    + the sponsored-caller rule) and our dependency re-kind + untyped-in-place
+    classification both apply to this verb and are kept together.
+    Every other kind from a pin-less caller is REFUSED unless ``force=True``, and
+    the dependency park itself is audited as ``block_displaced_not_owner`` when it
+    displaces a live unowned run, so it can never read as an ordinary operator
+    park (round-2 review Finding 1).
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    # Run-end invariant (t_6c8342e0 Finding 2). Checked BEFORE the txn so a
+    # refusal leaves the card byte-identical; re-checked inside, where the CAS is
+    # what enforces it (a claim can land between the two reads).
+    #
+    # ``kind`` is passed because this is the ONLY verb whose pin-less operator
+    # lane is scoped on it: ``block`` + ``kind="dependency"`` is the T5 park
+    # (``_operator_park``). Any other kind ends the run on ownership alone.
+    owner_ok, cas_run = _run_end_allowed(
+        conn, task_id, expected_run_id, verb="block", kind=kind,
+    )
+    if not owner_ok and not force:
+        _audit_run_end_refusal(
+            conn, task_id, "block", int(cas_run), expected_run_id, reason,
+        )
+        return False
+    if not owner_ok:
+        _audit_run_end_forced(
+            conn, task_id, "block", int(cas_run), expected_run_id, reason,
+        )
+    # The T5 park: a pin-less operator ending a live run it cannot prove it owns.
+    # The write must land (the runbook requires it), but the trail must not read as
+    # an ordinary dependency park (round-2 review Finding 1). Resolved BEFORE the
+    # txn, while the run pointer still exists, and emitted only after the write
+    # commits — so a refused/no-op block leaves no "displaced" event behind.
+    displaced = (
+        _operator_displaced_live_run(
+            conn, task_id, expected_run_id, verb="block", kind=kind,
+        )
+        if owner_ok else None
+    )
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
@@ -3213,9 +4485,22 @@ def block_task(
                    AND status IN ('running', 'ready')
                 """
         params = (*params, task_id)
-        if expected_run_id is not None:
-            sql += " AND current_run_id = ?"
-            params = (*params, int(expected_run_id))
+        # The CAS is now ALWAYS armed, mirroring complete_task: `IS` so a NULL
+        # live run pins NULL (a ready/todo card has nothing to take from anyone).
+        # Hand-merge: re-check the lane on ``requested_kind`` — the kind the CALLER
+        # filed — not the post-re-kind value. Upstream's re-kind (42a778ab4b) is a
+        # storage classification of what the block BECOMES ("a parent-less
+        # dependency wait is really a needs_input park"); the operator lane is
+        # decided by what was ASKED FOR. Re-checking on the mutated kind dropped a
+        # pin-less operator out of _operator_park, so the binding T5 runbook park
+        # was refused mid-incident.
+        cas_ok, cas_run = _run_end_allowed(
+            conn, task_id, expected_run_id, verb="block", kind=requested_kind,
+        )
+        if not cas_ok and not force:
+            return False
+        sql += " AND current_run_id IS ?"
+        params = (*params, cas_run)
         if conn.execute(sql, params).rowcount != 1:
             return False
         run_id = _end_or_synthesize_run(
@@ -3226,8 +4511,20 @@ def block_task(
         if kind == "dependency":
             # Historical ordering: the dependency lane fires inside the txn.
             _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-            return True
-    _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
+            hook_fired = True
+        else:
+            hook_fired = False
+    if not hook_fired:
+        _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
+    if displaced is not None:
+        # Emitted OUTSIDE the txn on purpose: a nested ``write_txn`` would raise,
+        # and a "displaced" record for a write that then rolled back would be a
+        # lie. This is the only trace the T5 park leaves, so it must be attached
+        # to a write that actually landed.
+        _audit_run_end_displaced(
+            conn, task_id, "block", displaced[0], expected_run_id, reason,
+            via=displaced[1],
+        )
     return True
 
 
@@ -3331,7 +4628,18 @@ def request_review(
                     "override) instead of clearing the live run's claim",
                 )
             if reviewer is None:
-                reviewer = _prior_reviewer(conn, task_id)
+                # A new module (kanban_gate) may have stamped this card with a
+                # required user gate (gate_required event, un-discharged). When
+                # it did, default the reviewer to the reserved 'user' literal so
+                # the worker does not have to remember — the failure mode that
+                # produced a prose-only gate (SPEC §2.6). Lazy import avoids a
+                # module cycle.
+                try:
+                    from hermes_cli import kanban_gate as _kg
+                    _req = _kg.required_reviewer(conn, task_id)
+                except Exception:
+                    _req = None
+                reviewer = "user" if _req == "user" else _prior_reviewer(conn, task_id)
                 if reviewer is False:
                     return _ret(
                         False, "re-review has no durable reviewer provenance (the "
@@ -3426,14 +4734,65 @@ def _nonblank_str(value: Any) -> Optional[str]:
 
 def request_changes(
     conn: sqlite3.Connection, task_id: str, *, reason: str, expected_run_id: Optional[int] = None,
+    force: bool = False,
 ) -> tuple[bool, Optional[str]]:
     """Close an active reviewer run (claimed from ``review``) and hand the task
     back to the implementer from the latest ``review_requested`` event, parent
-    gating reapplied. Returns ``(ok, implementer | reason)``."""
+    gating reapplied. Returns ``(ok, implementer | reason)``.
+
+    The verdict is made size-independent (t_9642c749): it is stamped with its
+    round number and a durable on-disk receipt path, and both ride the event
+    payload that ``build_worker_context`` renders at the top of the next
+    implementer run — see :func:`latest_review_directive`. A card whose
+    consecutive rework handoffs declare no new revision leaves the dispatch loop
+    for the human lane (``blocked`` + ``needs_input``) instead of being
+    re-dispatched, which is the escalation the reviewer had to perform by hand on
+    the incident card.
+
+    ``force=True`` displaces a live run the caller does not own and audits
+    ``changes_forced_not_owner`` (t_6c8342e0). Without it this is STRICT: an
+    unowned live run is refused whether or not the caller carries a worker pin,
+    because the verdict is a lifecycle decision about the run's outcome and the
+    active-run check alone (``source_status == 'review'``) admits any caller whose
+    ``HERMES_KANBAN_RUN_ID`` is absent — the pin-unset condition that caused the
+    original force-close. Measured pre-fix at the API layer: this verb ended the
+    reviewer's live run with ``outcome='changes_requested'``.
+    """
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
 
+    # Run-end invariant (t_6c8342e0 Finding 2): the verdict may only be issued by
+    # the run's owner. Checked before the txn so a refusal leaves the card
+    # byte-identical; the in-txn CAS below is what enforces it.
+    owner_ok, cas_run = _run_end_allowed(
+        conn, task_id, expected_run_id, verb="request_changes",
+    )
+    if not owner_ok and not force:
+        _audit_run_end_refusal(
+            conn, task_id, "request_changes", int(cas_run), expected_run_id, reason,
+        )
+        return False, (
+            f"task {task_id} is running under a live run (run {cas_run}) owned by "
+            f"another process, so its verdict cannot be issued from here. Pass "
+            f"expected_run_id={cas_run} as the run's owner, reclaim the run first, "
+            f"or request changes with the explicit force override."
+        )
+    if not owner_ok:
+        _audit_run_end_forced(
+            conn, task_id, "request_changes", int(cas_run), expected_run_id, reason,
+        )
+
+    convergence = review_convergence_state(conn, task_id)
+    round_no = convergence["round"] + 1
+    # Escalate on a card that HAS converged before but has now stopped producing
+    # new revisions — a legitimate commit-less workflow never sets this.
+    escalate = convergence["escalate"]
+    # Deterministic from the round number, so the event can carry it while the
+    # file itself is written AFTER the txn commits: filesystem I/O must not run
+    # while holding the board's IMMEDIATE write lock, and a receipt on disk for a
+    # verdict that then rolled back would be an orphan.
+    receipt_path = str(review_receipt_path(task_id, round_no))
     with write_txn(conn):
         task_row = conn.execute(
             "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?", (task_id,),
@@ -3445,6 +4804,15 @@ def request_changes(
             return False, "task is not in an active review run"
         if expected_run_id is not None and int(current_run_id) != int(expected_run_id):
             return False, "run_id mismatch"
+        # Re-check ownership against the row read INSIDE this txn: the pre-check
+        # answered against an earlier read, and a dispatcher reclaim + respawn
+        # between the two would otherwise let a non-owner's verdict land on the
+        # new run (t_6c8342e0 Finding 2). One call, one answer.
+        cas_ok, _cas_run = _run_end_allowed(
+            conn, task_id, expected_run_id, verb="request_changes",
+        )
+        if not cas_ok and not force:
+            return False, "live run is owned by another process"
 
         claimed_event = _latest_event(conn, task_id, "claimed", current_run_id)
         claimed_payload = _json_dict(_row_get(claimed_event, "payload"))
@@ -3459,7 +4827,7 @@ def request_changes(
             return False, "review handoff has no valid implementer provenance"
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
 
-        new_status = _landing_status_after_parents(conn, task_id)
+        new_status = "blocked" if escalate else _landing_status_after_parents(conn, task_id)
         # consecutive_failures deliberately PRESERVED: a review transition is
         # not evidence the pathology cleared; only complete_task resets it.
         cur = conn.execute(
@@ -3470,6 +4838,15 @@ def request_changes(
                    claim_lock = NULL,
                    claim_expires = NULL,
                    worker_pid = NULL, worker_started_at = NULL
+            """
+            # ``block_kind`` is the board-visible label for why the card left the
+            # dispatch loop. ``block_recurrences`` is deliberately NOT touched:
+            # this is not a block loop, and the loop breaker must not be spent
+            # here (a card could otherwise never reach a genuine loop escalation).
+            # Hand-merge at the pin: upstream also clears ``worker_started_at`` in
+            # this UPDATE (kept above); ours appends the block_kind column.
+            + (", block_kind = 'needs_input'" if escalate else "")
+            + """
              WHERE id = ? AND status = 'running' AND current_run_id = ?
             """,
             (new_status, implementer, task_id, int(current_run_id)),
@@ -3488,9 +4865,87 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                "round": round_no,
+                "receipt_path": receipt_path,
+                "no_revision_streak": convergence["no_revision_streak"],
+                **({"escalated": True, "limit": convergence["limit"]} if escalate else {}),
             },
             run_id=run_id,
         )
+        if escalate:
+            # Emitted AFTER ``changes_requested`` (and carrying ``resume_status``)
+            # so the blocked episode is the newest lifecycle event: both
+            # ``_has_sticky_block`` and ``_resume_status_from_events`` read the
+            # newest row.
+            #
+            # ``resume_status`` is the IMPLEMENTER's lane (``ready``), NOT
+            # ``review`` (t_9642c749 review F1). ``request_changes`` set
+            # ``assignee`` to the implementer moments ago, and the dispatcher
+            # claims review-lane rows with ``row["assignee"]`` — so resuming to
+            # ``review`` spawned the implementer into a REVIEW-lane run, where it
+            # can ``kanban_complete`` (self-approve) or ``request_changes``
+            # itself. Routing the human's decision through the reviewer instead
+            # was measured to be a dead end: the reviewer can only re-issue
+            # ``request_changes``, which re-escalates, so the implementer still
+            # never runs. The decision reaches the implementer through the
+            # verdict (still the first thing in its next context) and the
+            # operator's own unblock comment (rendered in the same context).
+            #
+            # ``source_status`` is deliberately NOT ``review`` here: it is the
+            # legacy fallback key ``_resume_status_from_events`` reads, so a
+            # ``review`` value would silently override ``resume_status`` and
+            # restore the self-review lane on the next unblock.
+            _append_event(
+                conn, task_id, "blocked",
+                {
+                    "reason": reason,
+                    "kind": "needs_input",
+                    "resume_status": "ready",
+                    "blocked_from": "review",
+                    "origin": "review_not_converging",
+                    "summary": (
+                        f"Review cannot converge: {convergence['no_revision_streak']} "
+                        f"consecutive rework rounds carried no new revision "
+                        f"(limit {convergence['limit']}). Human routing decision needed."
+                    ),
+                },
+                run_id=run_id,
+            )
+            # Audit signal for the board: a card that keeps returning from rework
+            # with no new revision needs a human routing decision, and a further
+            # request_changes cannot converge.
+            _append_event(
+                conn, task_id, "review_not_converging",
+                {
+                    "round": round_no,
+                    "no_revision_streak": convergence["no_revision_streak"],
+                    "limit": convergence["limit"],
+                    "reviewer": reviewer,
+                    "implementer": implementer,
+                    "receipt_path": receipt_path,
+                },
+                run_id=run_id,
+            )
+    # Post-commit: the verdict is durable in the event either way, and the receipt
+    # is the untruncated fallback. A receipt write failure must leave the event's
+    # ``receipt_path`` truthful, so the two are reconciled here.
+    written = write_review_receipt(
+        task_id, round_no, reason=reason, reviewer=reviewer, implementer=implementer,
+        created_at=int(time.time()), no_change=escalate,
+    )
+    if written is None and receipt_path is not None:
+        with write_txn(conn):
+            row = _latest_event(conn, task_id, "changes_requested")
+            payload = _json_dict(_row_get(row, "payload"))
+            if payload.get("receipt_path") == receipt_path:
+                payload["receipt_path"] = None
+                conn.execute(
+                    "UPDATE task_events SET payload = ? WHERE task_id = ? "
+                    "AND kind = 'changes_requested' AND id = "
+                    "(SELECT MAX(id) FROM task_events WHERE task_id = ? "
+                    " AND kind = 'changes_requested')",
+                    (_json_or_null(payload), task_id, task_id),
+                )
     return True, implementer
 
 
@@ -3538,6 +4993,9 @@ def promote_task(
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
+        # ``promote_task`` accepts a ``blocked`` row, so it is an exit route for
+        # a sticky park; close the episode (t_81a1f095).
+        _supersede_sticky_block(conn, task_id, origin="promote_manual")
         _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason})
 
     return True, None
@@ -3573,9 +5031,50 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
+def _self_review_landing(conn: sqlite3.Connection, task_id: str, fallback: str) -> str:
+    """``fallback`` when landing in ``review`` would spawn the IMPLEMENTER as its
+    own reviewer; ``review`` otherwise.
+
+    The dispatcher claims review-lane rows with ``row["assignee"]`` and spawns
+    whatever profile that names, so a review-status row assigned to the profile
+    that authored the implementation is a self-review run: that worker holds a
+    reviewer-owned run on its own card and can ``kanban_complete`` it to ``done``
+    (self-approval) or ``request_changes`` itself.
+
+    A review path that NAMES a reviewer hands the card to that reviewer
+    (``request_review`` reassigns; ``block_task`` preserves the reviewer's
+    assignment), so this is a no-op there. It catches the paths that reach
+    ``review`` without a reviewer: a resume hint of ``review`` on a card whose
+    assignee is still the implementer (t_9642c749 review F1), and older rows
+    carrying that hint.
+
+    Measured exception this guard does NOT close (t_9642c749 review F4): the
+    first ``request_review`` on a card with no prior ``changes_requested``
+    provenance and no explicit ``reviewer`` argument resolves to no reviewer at
+    all, so the card lands in ``review`` still assigned to the implementer and
+    the dispatcher spawns THAT profile into a review-lane run, which can
+    self-approve. Pre-existing, wider scope than this defect, tracked
+    separately; recorded here because an unqualified "every ordinary review path
+    assigns the card to the reviewer" was measurably false (two live cards whose
+    newest ``review_requested`` names no reviewer: ``t_10eb0f6a`` done,
+    ``t_b5a1db19`` blocked).
+
+    Unprovable provenance (no ``review_requested`` implementer on record) keeps
+    the legacy landing — the guard never invents a reassignment it cannot justify.
+    """
+    event = _latest_event(conn, task_id, "review_requested")
+    implementer = _nonblank_str(_json_dict(_row_get(event, "payload")).get("implementer"))
+    if implementer is None:
+        return "review"
+    row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    assignee = _canonical_assignee(_nonblank_str(_row_get(row, "assignee")))
+    return fallback if assignee == _canonical_assignee(implementer) else "review"
+
+
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+    when that is where it left off AND a reviewer — not the implementer — holds
+    the card), closing any leaked run first."""
     now = int(time.time())
     with write_txn(conn):
         resume_status = (
@@ -3590,7 +5089,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # Re-gate on parent completion before restoring the source phase.
         landing_status = _landing_status_after_parents(conn, task_id)
         new_status = (
-            "review"
+            _self_review_landing(conn, task_id, landing_status)
             if landing_status == "ready" and resume_status == "review"
             else landing_status
         )
@@ -3751,17 +5250,22 @@ def invalidate_descendants_for_parent_reopen(
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
+    current_step_key: Optional[str] = None,
 ) -> bool:
     """Update title/body/assignee (when given) and move ``triage -> todo`` in one
     txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
     gating still applies; the audit comment is written only when a field changed.
+
+    ``current_step_key`` carries the SDLC phase tagged by the specifier (see
+    :mod:`hermes_cli.kanban_phases`); it is advisory routing data that the
+    decomposer reads back off the root card, never a second status axis.
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
+            "SELECT title, body, assignee, current_step_key FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
         ).fetchone()
         if existing is None:
@@ -3781,6 +5285,10 @@ def specify_triage_task(
             sets.append("assignee = ?")
             params.append(assignee)
             changed_fields.append("assignee")
+        if current_step_key is not None and current_step_key != (existing["current_step_key"] or None):
+            sets.append("current_step_key = ?")
+            params.append(current_step_key)
+            changed_fields.append("phase")
         params.append(task_id)
         cur = conn.execute(
             f"UPDATE tasks SET {', '.join(sets)} "
@@ -3805,7 +5313,10 @@ def specify_triage_task(
     return True
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
+def archive_task(
+    conn: sqlite3.Connection, task_id: str, *, signal_fn=None,
+    expected_run_id: Optional[int] = None, force: bool = False,
+) -> bool:
     """Archive a task; a *running* task's host-local worker is terminated.
 
     Clearing ``worker_pid`` in the DB alone left the OS process running past its
@@ -3818,7 +5329,41 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     dispatcher can spawn a duplicate worker off the released claim. The
     termination outcome lands as its own ``archive_worker_termination`` event so
     the ``archived`` event stays atomic with the status flip.
+
+    ``expected_run_id``/``force`` are new (t_6c8342e0 Finding 2): this verb had NO
+    run-id parameter at all, so its missing CAS was *structural* — it ended a live
+    reviewer run whether the caller's pins were present or absent, and it is an
+    open CLI verb (``hermes kanban archive``) with no orchestrator guard. The
+    pre-check + in-txn CAS now pin the run, and a worker-sponsored caller that does
+    not own the live run is refused (``archive_refused_not_owner``) unless
+    ``force=True`` (``archive_forced_not_owner``) — and that ``forced`` name is
+    the worker-pinned lane's, not the operator's: a pin-less shell archives a live
+    unowned run through the recovery lane, recorded as
+    ``archive_displaced_not_owner`` (round-3 review Finding 1).
     """
+    # Run-end invariant (t_6c8342e0 Finding 2). Before the txn so a refusal
+    # leaves the card byte-identical; re-checked inside, where the CAS enforces it.
+    owner_ok, cas_run = _run_end_allowed(
+        conn, task_id, expected_run_id, verb="archive",
+    )
+    if not owner_ok and not force:
+        _audit_run_end_refusal(
+            conn, task_id, "archive", int(cas_run), expected_run_id, "archive",
+        )
+        return False
+    if not owner_ok:
+        _audit_run_end_forced(
+            conn, task_id, "archive", int(cas_run), expected_run_id, "archive",
+        )
+    # Operator recovery/cleanup taking a live unowned run: audited as
+    # ``archive_displaced_not_owner``, not silent (round-2 review Finding 1). Read
+    # only when the caller owned the run — the ``force`` branch above already
+    # emitted its own event — and emitted after the archive commits, so a no-op
+    # archive leaves no ``archive_displaced_not_owner`` record behind.
+    displaced = (
+        _operator_displaced_live_run(conn, task_id, expected_run_id, verb="archive")
+        if owner_ok else None
+    )
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
@@ -3831,16 +5376,32 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
-            "WHERE id = ? AND status != 'archived'", (task_id,),
+            "WHERE id = ? AND status != 'archived'"
+            # ALWAYS-armed run CAS (t_6c8342e0 Finding 2): `IS` so a card with no
+            # live run still pins NULL. Without it a claim landing between the
+            # pre-check and this UPDATE would be archived out from under its
+            # owner — the structural hole this verb shipped with.
+            # Hand-merge at the pin: upstream added the run CAS; we clear the
+            # start-time fingerprint alongside worker_pid. Both are kept.
+            + " AND current_run_id IS ?",
+            (task_id, cas_run),
         )
         if cur.rowcount != 1:
             return False
+        # Archiving can take a sticky park out of ``blocked``; the episode ends
+        # with the card leaving the lane (t_81a1f095).
+        _supersede_sticky_block(conn, task_id, origin="archive")
         # Archived mid-run (dashboard): close the run so history isn't orphaned.
         run_id = _end_run(
             conn, task_id, outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
+    if displaced is not None:
+        _audit_run_end_displaced(
+            conn, task_id, "archive", displaced[0], expected_run_id, "archive",
+            via=displaced[1],
+        )
     if was_running:
         termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
         with write_txn(conn):
@@ -3883,10 +5444,42 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 def schedule_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
-    expected_run_id: Optional[int] = None,
+    expected_run_id: Optional[int] = None, reactivate_on: Optional[str] = None,
+    force: bool = False,
 ) -> bool:
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
-    until ``unblock_task`` re-gates it."""
+    until ``unblock_task`` re-gates it.
+
+    ``reactivate_on`` distinguishes the *graph-deferred* flavour
+    (``reactivate_on="children_done"`` — auto-released by ``recompute_ready``
+    once every child is done) from the *human-deferred* flavour (None, the
+    legacy behaviour — parked forever until an operator unblocks). The flag
+    rides the ``scheduled`` event payload, never a schema column; see
+    ``_graph_deferred_pending`` and ``recompute_ready``.
+
+    ``force=True`` displaces a live run the caller does not own and audits
+    ``schedule_forced_not_owner`` (t_6c8342e0). Without it, a worker-sponsored
+    caller that cannot prove ownership is refused (``schedule_refused_not_owner``)
+    — and so is a PIN-LESS caller, because §3 of the T5 runbook never schedules:
+    the documented STOP is a dependency block, and a *queued* card needs no verb
+    at all. ``force=True`` is therefore the operator's explicit exit here
+    (round-2 review Finding 1: this verb previously displaced a live review run
+    silently).
+    """
+    # Run-end invariant (t_6c8342e0 Finding 2). Before the txn so a refusal leaves
+    # the card byte-identical; the in-txn CAS below enforces it.
+    owner_ok, cas_run = _run_end_allowed(
+        conn, task_id, expected_run_id, verb="schedule",
+    )
+    if not owner_ok and not force:
+        _audit_run_end_refusal(
+            conn, task_id, "schedule", int(cas_run), expected_run_id, reason,
+        )
+        return False
+    if not owner_ok:
+        _audit_run_end_forced(
+            conn, task_id, "schedule", int(cas_run), expected_run_id, reason,
+        )
     with write_txn(conn):
         params: list[Any] = [task_id]
         sql = """
@@ -3895,18 +5488,36 @@ def schedule_task(
                    claim_lock   = NULL,
                    claim_expires= NULL,
                    worker_pid   = NULL
-             WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'blocked')
+            WHERE id = ?
+              AND status IN ('todo', 'ready', 'running', 'blocked')
         """
-        if expected_run_id is not None:
-            sql += " AND current_run_id = ?"
-            params.append(int(expected_run_id))
+        # ALWAYS-armed run CAS (t_6c8342e0 Finding 2): `IS` so a card with no live
+        # run pins NULL. Re-read here because a claim can land between the
+        # pre-check and this UPDATE.
+        cas_ok, cas_run = _run_end_allowed(
+            conn, task_id, expected_run_id, verb="schedule",
+        )
+        if not cas_ok and not force:
+            return False
+        sql += " AND current_run_id IS ?"
+        params.append(cas_run)
         if conn.execute(sql, params).rowcount != 1:
             return False
+        # ``schedule_task`` accepts a ``blocked`` row: the card leaves the
+        # human-park lane for the time-deferred one, so the sticky episode ends
+        # (t_81a1f095). Emitted before the ``scheduled`` event so
+        # ``_graph_deferred_pending`` still reads the fresh ``scheduled`` row.
+        _supersede_sticky_block(conn, task_id, origin="schedule")
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
         )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        payload: dict[str, Any] = {"reason": reason}
+        if reactivate_on is not None:
+            # Only the graph-deferred flavour carries the flag; a human-
+            # deferred park (reactivate_on=None) keeps the legacy payload
+            # shape so existing callers/tests are unaffected.
+            payload["reactivate_on"] = reactivate_on
+        _append_event(conn, task_id, "scheduled", payload, run_id=run_id)
         return True
 
 
@@ -3916,24 +5527,421 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     """Everything a worker should read about its task: header, body,
     attachments, prior attempts, done-parent handoffs, the assignee's recent
     work, comments. Lists are tail-capped and fields char-capped
-    (``_CTX_MAX_*``) so the prompt stays bounded on pathological boards."""
+    (``_CTX_MAX_*``) so the prompt stays bounded on pathological boards.
+
+    The latest request-changes verdict is rendered FIRST (right after the
+    header) because an over-threshold payload keeps only its head inline; see
+    :func:`_ctx_review_directive`.
+    """
     task = get_task(conn, task_id)
     if not task:
         raise ValueError(f"unknown task {task_id}")
     from hermes_cli.kanban_db_context import (
-        _ctx_attachments, _ctx_comments, _ctx_header, _ctx_parent_results, _ctx_prior_attempts,
+        _ctx_attachments, _ctx_comments, _ctx_parent_results, _ctx_prior_attempts,
         _ctx_role_history,
     )
+    # NOTE: _ctx_header is deliberately NOT imported here — the worker_context
+    # module's twin bundles the task body into the header, while the fork's
+    # routing-only header keeps the receipt directive between header and body
+    # (t_9642c749); the inline definition below is the one that runs.
     # One clock reading so every relative age in this rendering agrees.
     now = int(time.time())
     lines: list[str] = []
     _ctx_header(lines, task)
+    _ctx_review_directive(lines, conn, task_id)
+    _ctx_body(lines, task)
     _ctx_attachments(lines, list_attachments(conn, task_id))
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)
     _ctx_role_history(lines, conn, task, now)
     _ctx_comments(lines, list_comments(conn, task_id), now)
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
+    """Truncate to ``limit`` chars with a visible ellipsis."""
+    if not s:
+        return ""
+    s = s.strip()
+    if len(s) <= limit:
+        return s
+    return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
+
+
+def _ctx_stamp(ts: int, now: int) -> str:
+    """``YYYY-MM-DD HH:MM`` plus a relative age when one is available."""
+    disp = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+    age = _relative_age(ts, now)
+    return f"{disp}, {age}" if age else disp
+
+
+def _ctx_metadata_line(metadata: Any) -> Optional[str]:
+    if not metadata:
+        return None
+    try:
+        return f"_metadata_: `{_ctx_cap(json.dumps(metadata, ensure_ascii=False, sort_keys=True))}`"
+    except Exception:
+        return None
+
+
+def _ctx_tail(items: list, cap: int, noun: str) -> tuple[list, Optional[str]]:
+    """Keep the newest ``cap`` items; describe the omitted head, if any."""
+    omitted = max(0, len(items) - cap)
+    if not omitted:
+        return items, None
+    return items[-cap:], (
+        f"_({omitted} earlier {noun}{'s' if omitted != 1 else ''} "
+        f"omitted; showing most recent {cap})_"
+    )
+
+
+def _ctx_header(lines: list[str], task: Task) -> None:
+    """Identity/routing lines only. The body is rendered separately by
+    :func:`_ctx_body` so the review directive can precede it (see
+    :func:`_ctx_review_directive`)."""
+    lines.append(f"# Kanban task {task.id}: {task.title}")
+    lines.append("")
+    lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
+    lines.append(f"Status:   {task.status}")
+    if task.tenant:
+        lines.append(f"Tenant:   {task.tenant}")
+    lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
+    if task.max_runtime_seconds is not None:
+        terminal_timeout = _worker_terminal_timeout_env(
+            task.max_runtime_seconds, os.environ.get("TERMINAL_TIMEOUT"),
+        )
+        effective_terminal_timeout = terminal_timeout or os.environ.get("TERMINAL_TIMEOUT")
+        lines.append(f"Max runtime: {task.max_runtime_seconds}s")
+        if effective_terminal_timeout:
+            lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
+    if task.branch_name:
+        lines.append(f"Branch:   {task.branch_name}")
+    lines.append("")
+
+
+def _ctx_body(lines: list[str], task: Task) -> None:
+    if task.body and task.body.strip():
+        lines.append("## Body")
+        lines.append(_ctx_cap(task.body, _CTX_MAX_BODY_BYTES))
+        lines.append("")
+
+
+def latest_review_directive(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """The newest un-addressed request-changes verdict, or None.
+
+    "Un-addressed" = no ``review_requested`` handoff has been recorded SINCE the
+    verdict, i.e. the implementer has not yet handed the rework back. A verdict
+    already answered by a newer handoff is history, not a directive.
+
+    The comparison is on run IDs, not timestamps: the verdict event and the
+    re-handoff run routinely land in the same second, and a ``started_at >=
+    created_at`` test reads that tie as "already answered" — silently muting the
+    directive exactly when the loop is tightest.
+
+    Returns ``{round, reason, reviewer, receipt_path, age_seconds, no_revision_streak}``.
+    """
+    row = conn.execute(
+        "SELECT id, payload, created_at, run_id FROM task_events "
+        "WHERE task_id = ? AND kind = 'changes_requested' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    payload = _json_dict(_row_get(row, "payload"))
+    reason = str(payload.get("reason") or "").strip()
+    if not reason:
+        return None
+    verdict_run_id = _row_get(row, "run_id")
+    if verdict_run_id is not None:
+        answered = conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id = ? AND outcome = 'review_requested' "
+            "AND id > ? LIMIT 1", (task_id, int(verdict_run_id)),
+        ).fetchone()
+        if answered is not None:
+            return None
+    receipt = payload.get("receipt_path")
+    event_ts = int(_row_get(row, "created_at") or 0)
+    return {
+        "round": payload.get("round"),
+        "reason": reason,
+        "reviewer": payload.get("reviewer"),
+        "receipt_path": receipt if isinstance(receipt, str) and receipt.strip() else None,
+        "age_seconds": max(0, int(time.time()) - event_ts),
+        "no_revision_streak": payload.get("no_revision_streak"),
+    }
+
+
+def _json_escaped_len(text: str) -> int:
+    """Length of ``text`` as it appears INSIDE a JSON string (quotes excluded).
+
+    The spillover preview slices the serialized payload, so this — not
+    ``len(text)`` — is the budget a value placed at the head of ``kanban_show``
+    actually has. ``json.dumps`` escapes non-ASCII to ``\\uXXXX``: 6 chars per
+    CJK character, ~1.8 per emoji, 1.1 for ASCII (t_9642c749 review F3).
+    """
+    return len(json.dumps(text)) - 2
+
+
+def _assemble_directive_block(
+    header: str, reason_text: str, trailing: str
+) -> str:
+    """The exact string both channels share; keep in ONE place so the escaped
+    measurement below always measures what is actually emitted."""
+    return "\n".join(
+        [header, "", reason_text] + (["", trailing] if trailing else [])
+    )
+
+
+def _fit_reason_to_escaped_budget(
+    header: str, reason: Any, streak_line: str, receipt_line: str,
+    escaped_limit: int, char_limit: int,
+) -> tuple[str, str]:
+    """``(reason_text, trailing)`` shrunk so the assembled block satisfies BOTH
+    bounds: at most ``char_limit`` characters, and at most ``escaped_limit``
+    characters once JSON-escaped.
+
+    Returns the longest prefix of ``reason`` (with the visible truncation
+    marker) that fits. The receipt line is reserved FIRST — it is the only
+    pointer to the untruncated verdict — and the advisory streak line is dropped
+    before any part of it can be lost.
+
+    A prefix search rather than a char budget because the escape ratio is
+    per-character: the same 1,200 chars are 1,251 escaped as ASCII, 1,431 as
+    Lithuanian, and 5,226 as CJK. Both constraints are monotone in the prefix
+    length, so the search is a bisection. If even the bare header cannot fit, the
+    emitted block is just the header — the smallest thing that still marks the
+    text as a verdict.
+    """
+    raw_reason = str(reason or "")
+
+    def fits(reason_text: str, tail: str) -> bool:
+        block = _assemble_directive_block(header, reason_text, tail)
+        return (
+            len(block) <= char_limit
+            and _json_escaped_len(block) <= escaped_limit
+        )
+
+    if not fits(_ctx_cap(raw_reason, 0), receipt_line):
+        # Not even the header plus the receipt pointer fits: keep the pointer
+        # alone (the one thing worth having) or nothing at all.
+        return "", receipt_line if fits("", receipt_line) else ""
+
+    # Prefer keeping the streak advisory; drop it only if it costs the reason.
+    tail = "\n\n".join(part for part in (streak_line, receipt_line) if part)
+    if not fits(_ctx_cap(raw_reason, 0), tail):
+        tail = receipt_line
+    if not fits(_ctx_cap(raw_reason, 0), tail):
+        return "", ""
+
+    lo, hi = 0, len(raw_reason)
+    best = _ctx_cap(raw_reason, 0)
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = _ctx_cap(raw_reason, mid)
+        if fits(candidate, tail):
+            best = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best, tail
+
+
+def review_directive_block(
+    directive: dict, *, limit: int = _CTX_MAX_REVIEW_DIRECTIVE_BYTES,
+    escaped_limit: Optional[int] = None,
+) -> str:
+    """Render one directive as the bounded, unmissable block both delivery
+    channels share (the ``worker_context`` head and ``kanban_show``'s first key).
+
+    ``limit`` bounds the WHOLE block, not just the verdict text: the assembled
+    string is what must fit wherever it is placed, and on the ``kanban_show``
+    side that placement is inside a 1.5 KB spillover preview. The receipt line is
+    reserved first so truncating a pathological verdict can never drop the one
+    pointer to the untruncated text.
+
+    ``escaped_limit`` additionally bounds that same block by its JSON-ESCAPED
+    length, which is the real budget on the ``kanban_show`` side — the preview is
+    a slice of the serialized payload (t_9642c749 review F3). Callers placing the
+    block at the head of a JSON payload pass it; the ``worker_context`` channel
+    does not, and keeps the larger ``limit`` allowance.
+    """
+    round_no = directive.get("round")
+    reviewer = directive.get("reviewer")
+    header = ("**Requested changes from review"
+              + (f", round {round_no}" if round_no else "")
+              + (f" ({reviewer})" if reviewer else "")
+              + " — address these before re-requesting review:**")
+    receipt = directive.get("receipt_path")
+    receipt_line = (
+        f"_Full verdict on disk (read it if anything above is truncated): `{receipt}`._"
+        if receipt else ""
+    )
+    streak = directive.get("no_revision_streak")
+    streak_line = (
+        f"_{streak} consecutive rounds have carried no new revision of the "
+        f"deliverable; the reviewer re-measured the artifact each time. If you "
+        f"cannot change the deliverable, do NOT re-request review — call "
+        f"`kanban_block` with the reason._"
+        if isinstance(streak, int) and streak >= 2 else ""
+    )
+    trailing = "\n\n".join(part for part in (streak_line, receipt_line) if part)
+    if escaped_limit is not None:
+        reason_text, trailing = _fit_reason_to_escaped_budget(
+            header, directive.get("reason"), streak_line, receipt_line,
+            escaped_limit, limit,
+        )
+        return _assemble_directive_block(header, reason_text, trailing)
+    overhead = len(header) + len(trailing) + 8  # separators + a safety margin
+    reason_budget = max(200, limit - overhead)
+    return _assemble_directive_block(
+        header, _ctx_cap(directive.get("reason"), reason_budget), trailing,
+    )
+
+
+def _ctx_review_directive(lines: list[str], conn: sqlite3.Connection, task_id: str) -> None:
+    """The newest request-changes verdict, at the very TOP of the worker context.
+
+    Ordering is the fix, not decoration (t_9642c749): once a card's payload
+    exceeds the tool-result spillover threshold only its HEAD survives inline, so
+    a directive placed among the comments — or anywhere behind the attempt history
+    — is exactly what stops reaching the implementer.
+    """
+    directive = latest_review_directive(conn, task_id)
+    if directive is None:
+        return
+    lines.append("## Requested changes (latest review verdict)")
+    lines.append(review_directive_block(directive))
+    lines.append("")
+
+
+def _ctx_attachments(lines: list[str], attachments: list[Attachment]) -> None:
+    """Absolute on-disk paths so the worker's file tools read them directly
+    (remote terminal backends need the attachments dir mounted)."""
+    if not attachments:
+        return
+    lines.append("## Attachments")
+    lines.append(
+        "Files attached to this task. Read them with the file/terminal "
+        "tools at the absolute paths below:"
+    )
+    for att in attachments:
+        size_kb = max(1, (att.size + 1023) // 1024) if att.size else 0
+        size_str = f", {size_kb} KB" if size_kb else ""
+        ctype = f", {att.content_type}" if att.content_type else ""
+        lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
+    lines.append("")
+
+
+def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
+    """Closed runs on this task (the active run is this worker), newest
+    ``_CTX_MAX_PRIOR_ATTEMPTS`` in full, older ones as a one-line marker."""
+    all_prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
+    shown, omitted_note = _ctx_tail(all_prior, _CTX_MAX_PRIOR_ATTEMPTS, "attempt")
+    if not shown:
+        return
+    first_shown_idx = len(all_prior) - len(shown) + 1
+    lines.append("## Prior attempts on this task")
+    if omitted_note:
+        lines.append(omitted_note)
+    for offset, run in enumerate(shown):
+        profile = run.profile or "(unknown)"
+        outcome = run.outcome or run.status
+        lines.append(
+            f"### Attempt {first_shown_idx + offset} — {outcome} ({profile}, {_ctx_stamp(run.started_at, now)})"
+        )
+        if run.summary and run.summary.strip():
+            lines.append(_ctx_cap(run.summary))
+        if run.error and run.error.strip():
+            lines.append(f"_error_: {_ctx_cap(run.error)}")
+        meta_line = _ctx_metadata_line(run.metadata)
+        if meta_line:
+            lines.append(meta_line)
+        lines.append("")
+
+
+def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
+    """Done-parent handoffs: newest ``completed`` run's summary+metadata,
+    falling back to ``task.result`` for pre-runs-table data. Stamped with a
+    relative age so the worker re-verifies stale upstream results."""
+    parent_rows = conn.execute(
+        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id", (task_id,),
+    ).fetchall()
+    wrote_header = False
+    for pid in (r["parent_id"] for r in parent_rows):
+        pt = get_task(conn, pid)
+        if not pt or pt.status != "done":
+            continue
+        runs = [r for r in list_runs(conn, pid) if r.outcome == "completed"]
+        runs.sort(key=lambda r: r.started_at, reverse=True)
+        run = runs[0] if runs else None
+        if not wrote_header:
+            lines.append("## Parent task results")
+            lines.append(
+                "_Handoffs from upstream tasks, captured when each parent "
+                "completed (see age below). These are point-in-time "
+                "snapshots, not live state — if a result drives your "
+                "current work and it's not recent, re-verify against the "
+                "source before acting on it as current._"
+            )
+            wrote_header = True
+        done_ts = run.ended_at if run is not None and run.ended_at else (pt.completed_at or None)
+        age = _relative_age(done_ts, now)
+        lines.append(f"### {pid}" + (f" (completed {age})" if age else ""))
+        if run is not None and run.summary and run.summary.strip():
+            lines.append(_ctx_cap(run.summary))
+        elif pt.result:
+            lines.append(_ctx_cap(pt.result))
+        else:
+            lines.append("(no result recorded)")
+        meta_line = _ctx_metadata_line(run.metadata) if run is not None else None
+        if meta_line:
+            lines.append(meta_line)
+        lines.append("")
+
+
+def _ctx_role_history(lines: list[str], conn: sqlite3.Connection, task: Task, now: int) -> None:
+    """The assignee's 5 most recent completed runs on OTHER tasks — implicit
+    role continuity without wiring anything into SOUL.md / MEMORY.md."""
+    if not task.assignee:
+        return
+    role_rows = conn.execute(
+        "SELECT t.id, t.title, r.summary, r.ended_at "
+        "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
+        "WHERE r.profile = ? AND r.task_id != ? "
+        "  AND r.outcome = 'completed' "
+        "ORDER BY r.ended_at DESC LIMIT 5", (task.assignee, task.id),
+    ).fetchall()
+    if not role_rows:
+        return
+    lines.append(f"## Recent work by @{task.assignee}")
+    for row in role_rows:
+        first = _first_line(row["summary"], 200) or "(no summary)"
+        lines.append(
+            f"- {row['id']} — {row['title']} ({_ctx_stamp(_to_epoch(row['ended_at']) or 0, now)}): {first}"
+        )
+    lines.append("")
+
+
+def _ctx_comments(lines: list[str], comments: list[Comment], now: int) -> None:
+    """Newest ``_CTX_MAX_COMMENTS`` comments. The explicit "comment from
+    worker" framing stops an operator-controlled HERMES_PROFILE like
+    "hermes-system" being read as a system directive above an
+    attacker-influenceable body (defense-in-depth)."""
+    shown, omitted_note = _ctx_tail(comments, _CTX_MAX_COMMENTS, "comment")
+    if not shown:
+        return
+    lines.append("## Comment thread")
+    if omitted_note:
+        lines.append(omitted_note)
+    for c in shown:
+        # Render author with explicit "comment from worker" framing so operator-controlled HERMES_PROFILE
+        # values like "hermes-system" or "operator" can't be misread by the next worker as a system
+        # directive above the (attacker-influenceable) comment body. Defense-in-depth — the LLM-controlled
+        # author-forgery surface was already closed in #22435. See #22452.
+        safe_author = (c.author or "").replace("`", "")
+        lines.append(f"comment from worker `{safe_author}` at {_ctx_stamp(c.created_at, now)}:")
+        lines.append(_ctx_cap(c.body, _CTX_MAX_COMMENT_BYTES))
+        lines.append("")
 
 
 # --- Stats + SLA helpers ---

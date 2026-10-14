@@ -72,6 +72,55 @@ The baseline duties in the Procedure section still apply on every round; the len
 
 The same principle applies outside the Kanban review lane. When spawning multiple parallel reviewers via `delegate_task`, give each reviewer a different lens — one diff-only brief, one full-context brief, one checkout-and-run brief — rather than identical briefs. Identical briefs produce correlated verdicts and duplicate findings; varied briefs cover more defect classes for the same review spend.
 
+## Delivery of your findings (read before requesting changes)
+
+Your `reason` reaches the implementer through two bounded channels — both ride
+the SAME payload the worker reads (`kanban_show` returns `worker_context` inside
+it), so what makes them safe is their POSITION at the head, not a second
+transport:
+
+- **At the top of the next implementer run's context.** `request_changes` stamps
+  the verdict with its round number and the reviewer records it in the card's
+  event payload. The next worker's `worker_context` renders it as
+  `## Requested changes (latest review verdict)`, immediately after the header,
+  and `kanban_show` returns the same text under the `review_directive` key as the
+  FIRST field of its JSON.
+- **A durable receipt on disk.** Each verdict is also written to
+  `<root>/kanban/review_receipts/<task-id>/round-<N>.md`. The path is in the
+  `changes_requested` payload and in the directive block.
+
+Both are bounded on purpose. A card's comment thread can be tens of kilobytes,
+and once the `kanban_show` payload passes the tool-result spillover threshold the
+agent replaces it with a file pointer whose inline preview covers only the first
+~1.5 KB — so a finding that lives only in a comment is exactly what stops
+arriving. Put the actionable requirement in the `reason`; keep supporting
+evidence in the comment. If your verdict is longer than the direct channel
+carries, the worker is told to read the receipt, which holds it untruncated.
+
+`kanban_show` also reports `review_convergence`. When consecutive rework rounds
+declare no new revision, `request_changes` escalates to the human lane instead of
+returning the card to the implementer: you get a `review_not_converging` event
+and the card lands in `blocked` with a `needs_input` label, so a further
+`request_changes` is neither needed nor possible. That is the loop's own escape
+hatch — use it rather than issuing another round against a deliverable that has
+not moved.
+
+"Declares no new revision" means the implementer's handoff carries none of
+`commit` / `commits` / `sha` / `head` / `merge_commit` / `published_pr` / `merged`
+in a value that names something — a str sha, a list of shas, a truthy bool, a
+non-zero number, or a per-artifact mapping such as
+`commits: {fix: <sha>, doc_note: <sha>}`. An empty `{}` / `[]` / `""` / `False` /
+`0` correctly reads as no revision. Before treating an escalation as real,
+confirm the implementer's handoff did not commit under a shape you did not expect,
+and check `hermes kanban show <id>` for whether HEAD actually moved.
+
+After the human decides, `unblock` resumes the card in the **implementer's own
+lane** with your verdict still at the head of its context, plus the operator's
+`UNBLOCK: <reason>` comment. It deliberately does not come back to you: you could
+only re-issue `request_changes`, which would re-escalate on the same unchanged
+deliverable and leave the implementer unrun. If you want a fresh round on a card
+that has been unblocked, the implementer has to hand it back to you first.
+
 ## Procedure
 
 ### 1. Orient from the durable task record

@@ -180,6 +180,40 @@ def test_engine_works_on_sqlite_row_objects(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+def test_review_not_converging_rule_surfaces_the_human_decision(kanban_home) -> None:
+    """The escalation emitted by ``request_changes`` must be legible on the
+    board: a bare ``blocked`` card hides WHY it stopped converging."""
+    events = [
+        _event("changes_requested", escalated=True, no_revision_streak=2),
+        _event("blocked", block_kind="needs_input", origin="review_not_converging",
+               reason="cannot converge"),
+        _event("review_not_converging", ts=time.time(), round=5, no_revision_streak=2,
+               limit=2, receipt_path="/tmp/round-5.md"),
+    ]
+    diags = kd.compute_task_diagnostics(_task(status="blocked"), events, [], config={})
+    hits = [d for d in diags if d.kind == "review_not_converging"]
+    assert len(hits) == 1
+    diag = hits[0]
+    assert diag.severity == "error"
+    assert diag.data["round"] == 5
+    assert diag.data["no_revision_streak"] == 2
+    assert diag.data["receipt_path"] == "/tmp/round-5.md"
+    assert any(a.kind == "cli_hint" for a in diag.actions)
+
+
+def test_review_not_converging_rule_absent_without_the_event(kanban_home) -> None:
+    events = [_event("blocked", reason="cannot converge")]
+    assert [d for d in kd.compute_task_diagnostics(
+        _task(status="blocked"), events, [], config={},
+    ) if d.kind == "review_not_converging"] == []
+
+
+def test_review_not_converging_is_a_registered_diagnostic_kind() -> None:
+    assert "review_not_converging" in kd.DIAGNOSTIC_KINDS
+    assert any(getattr(r, "__name__", "") == "_rule_review_not_converging"
+               for r in kd._RULES)
+
+
 def test_stranded_in_ready_fires_when_age_exceeds_threshold():
     """Default threshold = 30 min. A ready task promoted 45 min ago
     with no claim should fire as a warning."""

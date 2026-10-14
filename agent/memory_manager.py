@@ -48,6 +48,19 @@ def _has_var_kwargs(params) -> bool:
     return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
+def _accepts_keyword(fn: Callable[..., Any], keyword: str) -> bool:
+    """True if ``fn`` can be called with ``keyword`` (uninspectable signatures -> False).
+
+    Providers are duck-typed and most predate the optional keywords the host grew, so an
+    unconditional keyword would raise TypeError on an older provider and skip its
+    extraction entirely. Filtering by signature keeps the older contract working.
+    """
+    params = _signature_params(fn)
+    if params is None:
+        return False
+    return _has_var_kwargs(params) or keyword in params
+
+
 def _accepts_require_checkpoint(fn: Callable[..., Any]) -> bool:
     """True if ``fn`` can receive the ``require_checkpoint`` keyword (unreadable signatures -> False).
 
@@ -739,10 +752,23 @@ class MemoryManager:
 
         self._each_provider("on_turn_start failed", _tick)
 
-    def on_session_end(self, messages: list[dict[str, Any]]) -> None:
+    def on_session_end(self, messages: list[dict[str, Any]], *, mid_session: bool = False) -> None:
+        """Fan on_session_end out to providers.
+
+        ``mid_session=True`` is a HOST mid-session commit (compaction), not the end of the
+        conversation: providers that retain a session's durable output only must skip it, while
+        per-turn extractors still want the boundary. The keyword is filtered per provider by
+        signature so a provider that predates it keeps its old call shape.
+        """
         messages = _redact_messages_for_egress(messages or [])
-        self._each_provider("on_session_end failed", lambda p: p.on_session_end(messages), level=logging.WARNING,
-                            exc_info=True)
+
+        def _end(provider: MemoryProvider) -> None:
+            if mid_session and _accepts_keyword(provider.on_session_end, "mid_session"):
+                provider.on_session_end(messages, mid_session=True)
+            else:
+                provider.on_session_end(messages)
+
+        self._each_provider("on_session_end failed", _end, level=logging.WARNING, exc_info=True)
 
     def commit_session_boundary_async(self, messages: list[dict[str, Any]], *, new_session_id: str,
                                       parent_session_id: str = "", reason: str = "new_session") -> None:

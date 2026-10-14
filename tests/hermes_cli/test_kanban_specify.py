@@ -93,6 +93,98 @@ def test_specify_task_happy_path(kanban_home):
     assert "**Goal**" in (task.body or "")
 
 
+def test_specify_task_persists_phase_from_json_field(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+
+    content = jsonlib.dumps({
+        "title": "Refined",
+        "body": "**Goal**\nx",
+        "phase": "system-design",
+    })
+    p, _ = _patch_aux_client(content)
+    with p:
+        outcome = spec.specify_task(tid, author="ace")
+
+    assert outcome.ok is True
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).current_step_key == "system-design"
+
+
+def test_specify_task_phase_falls_back_to_body_frontmatter(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+
+    content = jsonlib.dumps({
+        "title": "Refined",
+        "body": "phase: Research\n\n**Goal**\nx",
+    })
+    p, _ = _patch_aux_client(content)
+    with p:
+        outcome = spec.specify_task(tid, author="ace")
+
+    assert outcome.ok is True
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).current_step_key == "research"
+
+
+def test_specify_task_does_not_wipe_existing_phase(kanban_home):
+    """A re-specify with no phase in the reply keeps the card's tag."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET current_step_key = 'testing' WHERE id = ?", (tid,))
+
+    content = jsonlib.dumps({"title": "Refined", "body": "**Goal**\nx"})
+    p, _ = _patch_aux_client(content)
+    with p:
+        outcome = spec.specify_task(tid, author="ace")
+
+    assert outcome.ok is True
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).current_step_key == "testing"
+
+
+def test_specify_task_drops_unknown_phase(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+
+    content = jsonlib.dumps({
+        "title": "Refined", "body": "**Goal**\nx", "phase": "deployment",
+    })
+    p, _ = _patch_aux_client(content)
+    with p:
+        outcome = spec.specify_task(tid, author="ace")
+
+    assert outcome.ok is True
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).current_step_key is None
+
+
+def test_specify_task_records_phase_change_in_audit_comment(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+
+    content = jsonlib.dumps({
+        "title": "Refined", "body": "**Goal**\nx", "phase": "research",
+    })
+    p, _ = _patch_aux_client(content)
+    with p:
+        outcome = spec.specify_task(tid, author="ace")
+
+    assert outcome.ok is True
+    with kbc.connect() as conn:
+        comments = kb.list_comments(conn, tid)
+    assert any("phase" in (c.body or "") for c in comments)
+
+
+def test_specify_system_prompt_documents_the_phase_contract():
+    prompt = spec._SYSTEM_PROMPT
+    assert "grounding -> review -> research -> system-design -> engineering-planning -> implementation -> testing" in prompt
+    assert '"phase"' in prompt
+    assert "phase: <name>" in prompt
+
+
 
 
 

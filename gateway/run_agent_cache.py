@@ -911,7 +911,10 @@ class GatewayAgentCacheMixin:
             return
         try:
             messages = getattr(agent, "_session_messages", None)
-            agent.commit_memory_session(messages if isinstance(messages, list) else None)
+            # ``mid_session=True``: resource-only eviction keeps the provider and the session
+            # may resume on the same task_id, so this is NOT the session's end — a provider
+            # that retains a completed session's durable output must not fire here.
+            agent.commit_memory_session(messages if isinstance(messages, list) else None, mid_session=True)
             logger.debug(
                 "Committed on_session_end extraction before soft-evicting "
                 "session=%s (resource eviction)", key,
