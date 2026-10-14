@@ -77,9 +77,9 @@ def _pre_verify_nudge(agent, final_response, attempt: int) -> Optional[str]:
 
 
 def _kanban_stop_nudge(agent, messages) -> Optional[str]:
-    """Workers must end with a terminal board tool (kanban_complete / kanban_block /
-    kanban_request_review / kanban_request_changes); a narrated stop is recorded
-    as protocol_violation, so nudge once or twice first."""
+    """Workers must end with a terminal board tool that hands the card off
+    (kanban_complete / kanban_request_review / kanban_block, or kanban_request_changes for a
+    reviewer); a narrated stop is recorded as protocol_violation, so nudge once or twice first."""
     try:
         from agent.kanban_stop import build_kanban_stop_nudge
 
@@ -165,6 +165,10 @@ def apply_stop_gates(
             agent._kanban_stop_nudges,
             os.environ.get("HERMES_KANBAN_TASK", ""),
         )
+        # Hand-merge at the pin: upstream moved this notice to the diagnostic rail
+        # (``_emit_diagnostic_status``, cd3de040ab); our carried commit kept the
+        # older ``_emit_status`` call because our fork's base had it. Upstream's
+        # emitter is the later, better wiring — taken here.
         agent._emit_diagnostic_status(
             "⚠️ Kanban worker tried to exit without a terminal board call "
             "(kanban_complete/kanban_request_review/kanban_block) — nudging to finish"

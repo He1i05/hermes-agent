@@ -431,6 +431,120 @@ def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
         assert next_review is not None
 
 # ---------------------------------------------------------------------------
+# The dashboard's force=True is EFFECTIVE, not decorative (t_6c8342e0 round-2
+# Finding 2). Round 2 shipped `force=True` on the dashboard verbs with a comment
+# claiming it "keeps the audit trail instead of leaving a displaced run
+# indistinguishable from an ordinary handoff" — but the dashboard server is
+# pin-less, so `_run_end_allowed` admitted it and the call sites' `if not
+# owner_ok:` audit guard never fired. `force` was inert and the claim false.
+#
+# After the operator-lane narrowing, a pin-less end of a live unowned run is
+# REFUSED for `block`/`schedule`, so the flag is load-bearing and the
+# `*_forced_not_owner` audit really lands. These tests drive the REST surface the
+# UI actually calls, because that is where the false claim lived.
+# ---------------------------------------------------------------------------
+
+def _mid_review_card(*, reviewer_pid: int):
+    """A card whose live run belongs to another process, mid-review.
+
+    ``_OPENED_RUNS`` is cleared for the card afterwards: in production the
+    DISPATCHER (the dashboard server's parent, a different process) opens the
+    review run, so the caller holds no opened-run ledger entry for it. Without
+    this the in-process ``claim_review_task`` would make the caller the run's
+    owner and the displacement assertions below would pass vacuously.
+    """
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="dashboard force", assignee="builder")
+        implementation = kb.claim_task(conn, task_id)
+        assert implementation is not None
+        assert kb.request_review(
+            conn, task_id, summary="ready",
+            reviewer="reviewer", expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id)
+        assert review is not None
+        live = kb.get_task(conn, task_id).current_run_id
+        # Attribute the review run to another process (the dispatcher's child).
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (reviewer_pid, task_id))
+        conn.execute("UPDATE task_runs SET worker_pid=? WHERE id=?", (reviewer_pid, live))
+        board = kb._board_identity(conn)
+    kb._OPENED_RUNS.pop((board, task_id), None)
+    return task_id, live
+
+
+def _audit_kinds(task_id: str) -> list[str]:
+    with kbc.connect() as conn:
+        return [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (task_id,),
+            )
+        ]
+
+
+def test_dashboard_drag_to_scheduled_audits_the_displaced_live_run(client):
+    """PATCH ``scheduled`` from the dashboard displaces a live unowned run and
+    must SAY SO. This is the exact claim round 2 made and could not substantiate."""
+    task_id, live = _mid_review_card(reviewer_pid=os.getpid() + 1)
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "scheduled", "block_reason": "deferred by operator"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["status"] == "scheduled"
+
+    kinds = _audit_kinds(task_id)
+    assert "schedule_forced_not_owner" in kinds, (
+        f"the dashboard drag displaced a live run with no forced audit: {kinds}"
+    )
+    with kbc.connect() as conn:
+        run = conn.execute(
+            "SELECT ended_at, outcome FROM task_runs WHERE id=?", (live,),
+        ).fetchone()
+    assert run["ended_at"] is not None, "the live run was never displaced"
+    assert run["outcome"] == "scheduled"
+
+
+def test_dashboard_drag_to_blocked_audits_the_displaced_live_run(client):
+    """PATCH ``blocked`` — same claim, the other verb."""
+    task_id, live = _mid_review_card(reviewer_pid=os.getpid() + 1)
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "blocked", "block_reason": "human decision"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["status"] == "blocked"
+
+    kinds = _audit_kinds(task_id)
+    assert "block_forced_not_owner" in kinds, (
+        f"the dashboard drag displaced a live run with no forced audit: {kinds}"
+    )
+    assert "block_refused_not_owner" not in kinds, (
+        "the dashboard's own drag was refused; the human override is not working"
+    )
+
+
+def test_dashboard_archive_reports_its_displacement(client):
+    """Archive sits in the operator RECOVERY lane, so a pin-less dashboard is
+    admitted WITHOUT force — the record comes from the seam's own audit
+    (``archive_displaced_not_owner``). Pinned so the comment's narrower, TRUE
+    claim stays true: the drag is never silent, whichever lane carried it."""
+    task_id, live = _mid_review_card(reviewer_pid=os.getpid() + 1)
+
+    r = client.patch(f"/api/plugins/kanban/tasks/{task_id}", json={"status": "archived"})
+    assert r.status_code == 200, r.text
+
+    kinds = _audit_kinds(task_id)
+    assert "archive_displaced_not_owner" in kinds, (
+        f"archive displaced a live run with no record at all: {kinds}"
+    )
+    with kbc.connect() as conn:
+        run = conn.execute("SELECT ended_at FROM task_runs WHERE id=?", (live,)).fetchone()
+    assert run["ended_at"] is not None
+
+
+# ---------------------------------------------------------------------------
 # DELETE /tasks/:id
 # ---------------------------------------------------------------------------
 
@@ -580,6 +694,176 @@ def test_bulk_status_ready(client):
     ready = next(col for col in board["columns"] if col["name"] == "ready")
     ids = {task["id"] for task in ready["tasks"]}
     assert {a["id"], b["id"], c2["id"]}.issubset(ids)
+
+
+def test_drag_out_of_blocked_closes_the_sticky_episode(client):
+    """t_81a1f095: dragging a card out of the ``blocked`` column must end the
+    sticky episode, so a later reopen + breaker trip can auto-recover.
+
+    The dashboard's ``_set_status_direct`` is a raw write for the
+    todo/triage targets (``blocked -> ready`` goes through ``unblock_task``,
+    which already emits ``unblocked``), so without the fix the residual
+    ``blocked`` event would keep the card reading human-parked forever.
+    """
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "drag me", "assignee": "builder"},
+    ).json()["task"]
+    # Park it through the dashboard's own block verb (PATCH status=blocked ->
+    # kanban_db.block_task), which is what writes the sticky `blocked` event.
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "blocked", "block_reason": "needs a human"},
+    ).status_code == 200
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, task["id"]).status == "blocked"
+        assert kb._has_sticky_block(conn, task["id"]) is True
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "triage", "block_reason": "park it"},
+    )
+    assert response.status_code == 200, response.text
+
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, task["id"]).status == "triage"
+        assert kb._has_sticky_block(conn, task["id"]) is False, (
+            "leaving the blocked column via the dashboard must close the episode"
+        )
+        exit_event = [e for e in kb.list_events(conn, task["id"]) if e.kind == "unblocked"][-1]
+        assert exit_event.payload["origin"] == "dashboard_direct"
+
+
+def test_drag_blocked_to_ready_still_uses_unblock_task(client):
+    """Control: ``blocked -> ready`` keeps going through ``unblock_task`` (the
+    documented operator exit), whose own ``unblocked`` is the only one written —
+    the dashboard must not double-emit for that target."""
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "to ready", "assignee": "builder"},
+    ).json()["task"]
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "blocked", "block_reason": "needs a human"},
+    ).status_code == 200
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"status": "ready"},
+    )
+    assert response.status_code == 200, response.text
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, task["id"]).status == "ready"
+        assert kb._has_sticky_block(conn, task["id"]) is False
+        unblocked = [e for e in kb.list_events(conn, task["id"]) if e.kind == "unblocked"]
+        assert len(unblocked) == 1, [e.kind for e in kb.list_events(conn, task["id"])]
+
+
+def test_drag_reopens_a_residual_row_and_it_auto_recovers(client):
+    """ROUND 2 (round-1 verdict, AC5): the round-1 guard was keyed on the card
+    being CURRENTLY in ``blocked``, so a residual row — a ``blocked`` event left
+    as the newest of the pair while the row sits in ``done``/``archived`` —
+    never closed its episode on a drag into a dispatchable lane. All six live
+    residual rows froze on a later breaker trip this way.
+
+    The helper is now called unconditionally (it self-guards), so the drag closes
+    the episode and the card recovers."""
+    import time as _time
+
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "residual", "assignee": "builder"},
+    ).json()["task"]
+    tid = task["id"]
+    # Park it, then leave ``done`` the pre-fix way: no episode close.
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{tid}",
+        json={"status": "blocked", "block_reason": "needs a human"},
+    ).status_code == 200
+    with kbc.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='done', completed_at=?, claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL, current_run_id=NULL WHERE id=?",
+                (int(_time.time()), tid),
+            )
+        assert kb._has_sticky_block(conn, tid) is True, "fixture is not residual"
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{tid}", json={"status": "ready"},
+    )
+    assert response.status_code == 200, response.text
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+        assert kb._has_sticky_block(conn, tid) is False, (
+            "a residual row dragged into a dispatchable lane must close its episode"
+        )
+        exit_event = [e for e in kb.list_events(conn, tid) if e.kind == "unblocked"][-1]
+        assert exit_event.payload["origin"] == "dashboard_direct"
+
+        # The REAL breaker trip, then the recovery tick.
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+    kbd._record_task_failure(conn, tid, "spawn failed", outcome="spawn_failed",
+                             failure_limit=1, release_claim=True, end_run=True)
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET consecutive_failures=0 WHERE id=?", (tid,))
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_drag_out_of_an_archived_residual_row_also_recovers(client):
+    """Same as above for an ``archived`` residual row (4 of the 6 live rows were
+    archived), driven end to end through the REST surface."""
+    import time as _time
+
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "archived residual", "assignee": "builder"},
+    ).json()["task"]
+    tid = task["id"]
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{tid}",
+        json={"status": "blocked", "block_reason": "needs a human"},
+    ).status_code == 200
+    with kbc.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='archived', claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL, current_run_id=NULL WHERE id=?",
+                (tid,),
+            )
+        assert kb._has_sticky_block(conn, tid) is True, "fixture is not residual"
+
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{tid}", json={"status": "ready"},
+    ).status_code == 200
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+        assert kb._has_sticky_block(conn, tid) is False
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+    kbd._record_task_failure(conn, tid, "spawn failed", outcome="spawn_failed",
+                             failure_limit=1, release_claim=True, end_run=True)
+    with kbc.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET consecutive_failures=0 WHERE id=?", (tid,))
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_ordinary_drag_writes_no_episode_close(client):
+    """Control: the now-unconditional helper must stay a no-op on an ordinary
+    move — a card that was never parked must not gain an ``unblocked`` event."""
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "plain move", "assignee": "builder"},
+    ).json()["task"]
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"status": "triage"},
+    ).status_code == 200
+    with kbc.connect() as conn:
+        kinds = [e.kind for e in kb.list_events(conn, task["id"])]
+        assert "unblocked" not in kinds, kinds
+
 
 def test_bulk_review_assignment_preserves_implementer_provenance(client):
     tasks = [

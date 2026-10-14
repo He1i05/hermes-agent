@@ -1902,6 +1902,12 @@ DEFAULT_CONFIG = {
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
         # crashed) for the same task/profile. Reassignment resets the streak.
         "failure_limit": 2,
+        # Consecutive `request_changes` rework rounds whose handoff declared no new revision of
+        # the deliverable (no commit/sha/PR in run metadata) before the card escalates out of
+        # the dispatch loop for a human routing decision. Below this, rework is a normal review
+        # cycle. Only cards that HAVE declared a revision are eligible, so commit-less
+        # documentation/analysis workflows are never escalated on a signal they cannot satisfy.
+        "review_non_convergence_rounds": 2,
         # Worker stdout/stderr log rotation at spawn time (2 MiB + one backup). Raise to keep more
         # early failure evidence from long-running workers.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,

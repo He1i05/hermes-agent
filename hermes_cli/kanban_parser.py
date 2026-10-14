@@ -257,7 +257,15 @@ _SPECS = [
              help="Provider the model belongs to (worker is spawned with "
                   "--provider <name>). Cleared together with the model."),
     ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
-    _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
+    _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON,
+        _arg("--force", action="store_true",
+             help="Override the live-run ownership guard: reclaim a run whose "
+                  "live owner is another process, terminating that worker. "
+                  "Records a reclaim_forced_not_owner event — but only for a "
+                  "caller that carries a worker pin. Operator recovery (a "
+                  "pin-less shell) already lands by default and is recorded as "
+                  "reclaim_displaced_not_owner, with or without this flag."),
+    ], help="Release an active worker claim on a running task"),
     _cmd("reassign", [
         _TASK_ID,
         _arg("profile", help="New profile name (or 'none' to unassign)"),
@@ -302,7 +310,9 @@ _SPECS = [
                   '"tests_run": 12}\'). Stored on the closing run.'),
         _arg("--force", action="store_true",
              help="Override the live-claim guard: complete a running, claimed task "
-                  "even without owning its run (closes the worker's run)."),
+                  "even without owning its run (closes the worker's run). Displaces "
+                  "another process's live run and records a "
+                  "completion_forced_not_owner event."),
     ], help="Mark one or more tasks done"),
     _cmd("edit", [
         _TASK_ID,
@@ -322,11 +332,20 @@ _SPECS = [
                   "blocked for a human; 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
+        _arg("--force", action="store_true",
+             help="Override the live-run ownership guard: end a live run that "
+                  "belongs to another process even for a non-'dependency' kind. "
+                  "Records a block_forced_not_owner event. 'dependency' parks "
+                  "never need it (that is the sanctioned T5 stop)."),
     ], help="Mark one or more tasks blocked"),
     _cmd("schedule", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),
         _bulk_ids("schedule"),
+        _arg("--force", action="store_true",
+             help="Override the live-run ownership guard: park a task whose live "
+                  "run belongs to another process (displaces that worker). "
+                  "Records a schedule_forced_not_owner event."),
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
@@ -341,7 +360,14 @@ _SPECS = [
              help="Override the live-claim guard: move a running, claimed "
                   "task to review even without owning its run (clears the worker's claim)."),
     ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block"),
-    _cmd("request-changes", [_TASK_ID, _arg("reason", nargs="+", help="Concrete changes required before re-review")],
+    _cmd("request-changes", [
+        _TASK_ID,
+        _arg("reason", nargs="+", help="Concrete changes required before re-review"),
+        _arg("--force", action="store_true",
+             help="Override the live-run ownership guard: issue the verdict even "
+                  "when the active review run belongs to another process. Records "
+                  "a changes_forced_not_owner event."),
+    ],
          help="Reviewer verdict: return the active review run to its implementer"),
     _cmd("reopen-review", [
         _TASK_IDS,
@@ -358,6 +384,13 @@ _SPECS = [
         _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
         _arg("--rm", dest="purge_ids", nargs="+",
              help="Permanently delete already-archived task ids from the board"),
+        _arg("--force", action="store_true",
+             help="Override the live-run ownership guard: archive a task whose "
+                  "live run belongs to another process (terminates that worker). "
+                  "Records an archive_forced_not_owner event for a caller that "
+                  "carries a worker pin; a pin-less shell already archives "
+                  "(recorded as archive_displaced_not_owner) with or without "
+                  "this flag."),
     ], help="Archive one or more tasks"),
     _cmd("tail", [_TASK_ID, _arg("--interval", type=float, default=1.0)], help="Follow a task's event stream"),
     _cmd("dispatch", [

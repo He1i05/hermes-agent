@@ -162,8 +162,15 @@ class MemoryProvider(ABC):
         on an uninitialized instance on every inbound message, so keep it cheap and read-only."""
         return {}
 
-    def on_session_end(self, messages: list[dict[str, Any]]) -> None:
-        """End-of-session extraction; fires only at real session boundaries, never per-turn."""
+    def on_session_end(self, messages: list[dict[str, Any]], *, mid_session: bool = False) -> None:
+        """End-of-session extraction. ``mid_session=False`` means the conversation is
+        really over (process exit, ``/new``); ``mid_session=True`` means the HOST is
+        committing mid-session (transcript compaction) and the conversation continues
+        under the same or a rotated id. A provider that retains only the DURABLE OUTPUT
+        of a completed session must therefore skip the mid-session form: the live
+        transcript at a compaction boundary is the transcript ABOUT to be summarized
+        away, so its tail is mid-run narration, not a handoff. Providers that extract
+        per-turn history (and so genuinely want the boundary commit) ignore the keyword."""
 
     def on_session_switch(
         self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False, rewound: bool = False, **kwargs,

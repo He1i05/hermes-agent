@@ -1115,7 +1115,8 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
         try:
             self._session_db.create_session(
                 session_id=new_session_id, source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
-                model=self.model, parent_session_id=parent_session_id, system_prompt=parent_prompt or None,
+                model=self._resolve_model_default(), parent_session_id=parent_session_id,
+                system_prompt=parent_prompt or None,
                 model_config=with_session_yolo({"max_iterations": self.max_turns, "reasoning_config":
                                                 self.reasoning_config, "_branched_from": parent_session_id}, parent_session_id))
         except Exception as e:

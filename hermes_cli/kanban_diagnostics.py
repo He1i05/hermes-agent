@@ -591,6 +591,56 @@ def _rule_running_with_open_parents(task, events, runs, now, cfg) -> list[Diagno
     )]
 
 
+def _rule_review_not_converging(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """A review loop that stopped producing new revisions of its deliverable.
+
+    Fires on the ``review_not_converging`` event emitted by
+    ``kanban_db.request_changes`` when consecutive rework handoffs declared no
+    new revision (t_9642c749). The card is already moved to the human lane by
+    that transition; this rule is what makes the reason legible on the board
+    (``hermes kanban show`` / dashboard warnings) instead of a bare ``blocked``.
+    """
+    hit = None
+    for ev in events:
+        if _event_kind(ev) == "review_not_converging":
+            hit = ev
+    if hit is None:
+        return []
+
+    payload = _parse_payload(hit)
+    task_id = str(_task_field(task, "id") or "")
+    streak = payload.get("no_revision_streak")
+    round_no = payload.get("round")
+    detail_bits = []
+    if round_no:
+        detail_bits.append(f"review round {round_no}")
+    if streak is not None:
+        detail_bits.append(f"{streak} consecutive rounds with no new revision")
+    context = f" ({', '.join(detail_bits)})" if detail_bits else ""
+
+    actions: list[DiagnosticAction] = []
+    if task_id:
+        actions.append(_cli_hint(
+            "Read the full verdict", f"hermes kanban show {task_id}", suggested=True,
+        ))
+        actions.append(_cli_hint(
+            "Resume it in the implementer's lane once decided",
+            f"hermes kanban unblock {task_id}",
+        ))
+    return [Diagnostic(
+        kind="review_not_converging", severity="error",
+        title=f"Review cannot converge{context}",
+        detail="Consecutive rework rounds handed the deliverable back with no new revision, "
+               "so another ``request_changes`` cannot converge. The card was moved out of "
+               "the dispatch loop for a human routing decision: fix the deliverable directly, "
+               "split or re-scope the card, or accept what has landed and close it.",
+        actions=actions,
+        first_seen_at=_event_ts(hit), last_seen_at=_event_ts(hit), count=1,
+        data={"round": round_no, "no_revision_streak": streak,
+              "limit": payload.get("limit"), "receipt_path": payload.get("receipt_path")},
+    )]
+
+
 def _rule_stuck_in_blocked(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Blocked for >= cfg["blocked_stale_hours"] (default 24) with no comment
     or unblock since the last ``blocked`` event."""
@@ -744,7 +794,10 @@ _RULES: list[RuleFn] = [
     _rule_repeated_failures,
     _rule_repeated_crashes,
     _rule_review_dependency_deadlock,
+    # Hand-merge at the pin: upstream added _rule_running_with_open_parents; ours adds
+    # _rule_review_not_converging. Distinct rules — keep both.
     _rule_running_with_open_parents,
+    _rule_review_not_converging,
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
@@ -832,3 +885,23 @@ def compute_task_diagnostics(
     severity_idx = {s: i for i, s in enumerate(SEVERITY_ORDER)}
     out.sort(key=lambda d: (-severity_idx.get(d.severity, -1), -(d.last_seen_at or 0)))
     return out
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+
+DIAGNOSTIC_KINDS = (
+    "hallucinated_cards",
+    "triage_aux_unavailable",
+    "prose_phantom_refs",
+    "repeated_failures",
+    "repeated_crashes",
+    "review_dependency_deadlock",
+    "review_not_converging",
+    "stuck_in_blocked",
+    "block_unblock_cycling",
+    "stranded_in_ready",
+)
+# ---- END PLUGIN-COMPAT ----

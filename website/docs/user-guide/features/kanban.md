@@ -418,6 +418,15 @@ are complete, or **`todo`** while any parent remains open. A `todo` task keeps
 its source-phase provenance and returns to `review` or `ready` automatically
 when the dependency gate clears. `unblock` never routes directly to `triage`.
 
+One exception to the `review` landing: if the card is still assigned to the
+profile that authored the implementation, `unblock` resumes it in the
+**implementer's** lane (`ready`) instead. The dispatcher claims review-lane rows
+by their `assignee` and spawns that profile, so a `review` landing there would
+hand the implementer a reviewer-owned run on its own card — free to
+`kanban_complete` it (self-approval) or `request_changes` itself. Every ordinary
+review path assigns the card to the reviewer, so this guard is a no-op for them;
+it exists for cards that reach `review` without a reviewer on record.
+
 If you unblock a task and it later shows up in **`triage`**, the unblock is not
 what put it there. A subsequent *re-block for the same reason* did: after a task
 is blocked → unblocked → re-blocked for the same cause `BLOCK_RECURRENCE_LIMIT`
@@ -460,11 +469,11 @@ Dispatcher-owned workers receive their task lifecycle tools automatically.
 
 | Tool | Purpose | Required params |
 |---|---|---|
-| `kanban_show` | Read the current task (title, body, prior attempts, parent handoffs, comments, full pre-formatted `worker_context`). Defaults to the env's task id. | — |
+| `kanban_show` | Read the current task (title, body, prior attempts, parent handoffs, comments, full pre-formatted `worker_context`). Defaults to the env's task id. Returns `review_directive` (the latest un-addressed `request_changes` verdict, bounded by both its char and JSON-escaped length so it survives the tool-result spillover preview) and `review_convergence` as its first two keys. | — |
 | `kanban_list` | List task summaries with filters for `assignee`, `status`, `tenant`, archived visibility, and limit. Intended for orchestrators discovering board work. | — |
 | `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
 | `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
-| `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
+| `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. The verdict is also written to `kanban/review_receipts/<task-id>/round-<N>.md` and is rendered at the head of the worker context the next implementer run reads (`kanban_show`'s first JSON key and the top of `worker_context`), placed there so a long thread cannot hide it. Consecutive rounds whose handoff declares no new revision leave the dispatch loop for the human lane instead. | `reason` |
 | `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes when an incomplete parent finishes; with no open parent it is recorded as `needs_input` instead, since the wait could never be satisfied), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
 | `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |
@@ -604,13 +613,12 @@ synthetic nudges when it detects the model is about to stop without a terminal
 board tool call. This catches the common case where the model narrates the next
 step ("Let me write the report") and stops with `finish_reason=stop`. The nudge
 reminds the model to call `kanban_complete`, `kanban_request_review` or `kanban_block`
-immediately. A worker that already handed its card off (`kanban_request_review`, or
-`kanban_request_changes` from a reviewer) is never nudged — the handoff is its terminal
-call, and the nudge never asks it to `kanban_complete` a card that is under review. This
-guard is active only for the dispatcher-spawned worker itself (`HERMES_KANBAN_TASK` is
-set and the run owns that task) — `delegate_task` children and cron jobs run inside
-the worker inherit the variable but are never nudged, since they have no board tools —
-and can be disabled with `HERMES_KANBAN_STOP_NUDGE=0`.
+immediately. A worker that already handed its card off — `kanban_request_review` from
+an implementer, `kanban_request_changes` from a reviewer, or the card simply no longer
+being `running` under this claim — is never nudged: the handoff is its terminal call,
+and the nudge never asks it to `kanban_complete` a card that is under review. This
+guard is active only for dispatcher-spawned workers (`HERMES_KANBAN_TASK` is
+set) and can be disabled with `HERMES_KANBAN_STOP_NUDGE=0`.
 
 **Dispatcher-side recovery:** If the nudges are exhausted or the worker crashes
 before reaching the nudge, the dispatcher gives the violation a **bounded retry**

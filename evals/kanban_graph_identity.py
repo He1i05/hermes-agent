@@ -1,4 +1,14 @@
-"""Credential-free SQLite integration probe; run with --repo PATH."""
+"""Credential-free SQLite integration probe; run with --repo PATH.
+
+Safety: like evals/kanban_phase_cascade.py, the child writes a real SQLite
+kanban DB, so a bare ``--child`` invocation must be refused unless BOTH hold:
+``HERMES_HOME`` is set and points OUTSIDE the real ``~/.hermes``, AND the
+effective resolved kanban DB path (``hermes_cli.kanban_db.kanban_db_path()``)
+also lands outside it. ``HERMES_KANBAN_DB`` wins over ``HERMES_HOME`` and is
+exported into every kanban worker session, so the ``HERMES_HOME``-only check
+passed while the write still hit the live board (2026-09-12/13 leak hardening;
+see ``evals/kanban_child_guard.py``).
+"""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import importlib
@@ -24,6 +34,10 @@ def main():
                 [sys.executable, str(Path(__file__).resolve()), "--repo", str(args.repo), "--child"],
                 cwd=args.repo, env=env, check=False,
             ).returncode
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from kanban_child_guard import require_isolated_child
+
+    require_isolated_child(args.repo)
     sys.path.insert(0, str(args.repo))
     from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
     from hermes_cli.kanban_db_dispatch import dispatch_once

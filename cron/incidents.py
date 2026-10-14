@@ -18,7 +18,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 from cron import executions as _executions
 from hermes_constants import get_hermes_home
@@ -128,9 +128,37 @@ def _redact_error(error: str) -> str:
     return text[:MAX_ERROR_CHARS]
 
 
+# Volatile tokens that must NOT participate in the dedup signature. An error that merely
+# EMBEDS a run-varying token — the dated output dir in rsync's stderr (``.../hermes-backup/
+# 2026-09-28/...`` vs ``2026-10-08/...`` minted one incident per night and defeated dedup,
+# t_49fc646c), a wall-clock time, a hex request id, an rsync ``mkstemp`` random stem — is the
+# SAME failure to the operator. Applied only to the signature, never to the stored error text.
+_VOLATILE_TOKEN_PATTERNS = (
+    # ISO-8601 datetimes (normalized text is lowercased first, hence the lowercase 't').
+    (re.compile(r"\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:?\d{2})?"), "<ts>"),
+    (re.compile(r"\d{4}-\d{2}-\d{2}"), "<date>"),
+    (re.compile(r"\d{2}:\d{2}:\d{2}"), "<time>"),
+    (re.compile(r"\b[0-9a-f]{8,}\b"), "<hex>"),
+    # rsync mkstemp random suffix: "...mkstemp \"/path/.manifest.json.a4imyc\" failed" — a
+    # 5-8 char alphanumeric token right after a dot and immediately before a closing quote.
+    (re.compile(r"(?<=\.)[a-z0-9]{5,8}(?=\")"), "<tmp>"),
+)
+
+
+def _dedup_normalize_error(error: str) -> str:
+    """Signature-key normalization: whitespace/lowercase, then scrub volatile tokens (run dates,
+    times, hex ids, temp-file stems) so the same failure keeps ONE signature across runs."""
+    text = _normalize_error(error)
+    for pattern, replacement in _VOLATILE_TOKEN_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 def _error_signature(job_id: str, error: str) -> str:
-    """Dedup key: stable for same job + same normalized error prefix."""
-    normalized = _DURATION_RE.sub("#s", _normalize_error(error))[:_MAX_SIGNATURE_ERROR_CHARS]
+    """Dedup key: stable for same job + same normalized error prefix. Volatile tokens are
+    scrubbed first (``_dedup_normalize_error``) so an error that embeds the run date keeps the
+    same signature across runs instead of minting one incident per night."""
+    normalized = _dedup_normalize_error(error)[:_MAX_SIGNATURE_ERROR_CHARS]
     return hashlib.sha256(job_id.encode() + normalized.encode()).hexdigest()[:12]
 
 
@@ -161,7 +189,8 @@ def upsert_incident(
     is_new)``. An existing row for the signature refreshes
     ``last_seen_at``/``error``/``output_file`` and keeps its state — a ``closed`` incident stays
     closed, while a ``resolved`` one (job recovered, then broke the same way again) re-opens as
-    ``detected`` so the operator is alerted once more. A changed error text mints a new incident."""
+    ``detected`` so the operator is alerted once more. A changed error text (after the
+    volatile-token scrub the signature applies) mints a new incident."""
     job_id = str(job_id or "")
     sig = _error_signature(job_id, error)
     stored_error = _redact_error(error)
@@ -255,6 +284,61 @@ def close_incidents_for_recovered_job(job_id: str) -> int:
             (now, str(job_id or "")),
         )
         return int(cursor.rowcount or 0)
+
+
+def delete_incidents_for_job(job_id: str) -> int:
+    """Delete every incident row for ``job_id``; returns how many rows were removed.
+
+    Called from ``cron.jobs.remove_job`` so a deleted job leaves no incident behind. **Delete, not
+    resolve, is the deliberate choice:** ``resolved`` is only meaningful for a job that still
+    exists — a resolved row re-opens if the same signature recurs (see ``upsert_incident``), it
+    keeps occupying ``hermes cron incidents``, and ``close_incidents_for_recovered_job`` can never
+    fire for a job whose next run does not exist. A job that is gone can never recover, so its
+    incident rows are dead weight; removing them keeps the ledger from accumulating permanently
+    open incidents for jobs that no longer exist (the t_4e6cff2a orphan class)."""
+    with _transaction() as conn:
+        cursor = conn.execute(
+            "DELETE FROM cron_incidents WHERE job_id=?", (str(job_id or ""),)
+        )
+        return int(cursor.rowcount or 0)
+
+
+def delete_incidents_for_job_ids(job_ids: Iterable[str]) -> int:
+    """Delete every incident row for any of ``job_ids`` in one transaction; returns rows removed.
+
+    Batch form of :func:`delete_incidents_for_job` for the removal paths that drop SEVERAL records
+    in one store write — the due scan's retention sweep and the retired/wedged one-shot removals
+    (``_clear_incidents_for_removed_jobs`` in ``cron.jobs``). One transaction instead of one per id
+    keeps a sweep that prunes many aged records from opening N connections. Empty/blank ids are
+    ignored; an empty set is a no-op returning 0.
+    """
+    ids = sorted({str(j) for j in job_ids if j})
+    if not ids:
+        return 0
+    placeholders = ",".join("?" for _ in ids)
+    with _transaction() as conn:
+        cursor = conn.execute(
+            f"DELETE FROM cron_incidents WHERE job_id IN ({placeholders})", tuple(ids)
+        )
+        return int(cursor.rowcount or 0)
+
+
+def prune_orphan_incidents() -> List[Dict[str, Any]]:
+    """Delete incidents whose ``job_id`` is absent from the live cron store; returns the rows
+    removed (idempotent — a second call removes nothing).
+
+    Guard: the set of valid ids is read from ``cron.jobs.load_jobs()`` (``cron/jobs.json``), so an
+    incident for a job that still exists is never touched. Sweeps the residual orphans left behind
+    by a ``remove_job`` from before the ledger-clearing fix landed."""
+    from cron.jobs import load_jobs  # late import: cron.jobs imports this module's caller lazily
+
+    live_ids = {str(job.get("id")) for job in load_jobs() if isinstance(job, dict)}
+    with _transaction() as conn:
+        rows = [dict(row) for row in conn.execute("SELECT * FROM cron_incidents").fetchall()]
+        orphans = [row for row in rows if str(row.get("job_id")) not in live_ids]
+        for orphan in orphans:
+            conn.execute("DELETE FROM cron_incidents WHERE id=?", (orphan["id"],))
+    return orphans
 
 
 def _state_filter(state: Optional[str]) -> tuple[str, tuple]:

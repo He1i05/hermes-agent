@@ -882,11 +882,16 @@ class AIAgent(
             _quietly(lambda: self._memory_manager.shutdown_all())
         _notify_context_engine_session_end(self, messages)
 
-    def commit_memory_session(self, messages: list | None = None) -> None:
+    def commit_memory_session(self, messages: list = None, *, mid_session: bool = False) -> None:
         """Flush end-of-session extraction on session_id rotation (/new, compression) without tearing providers
-        down."""
+        down.
+
+        ``mid_session=True`` (compression: the conversation continues) reaches providers as
+        ``on_session_end(mid_session=True)``; the default is a real end of session. The keyword only
+        reaches providers whose signature accepts it, so an older provider keeps its extraction.
+        """
         if self._memory_manager:
-            _quietly(lambda: self._memory_manager.on_session_end(messages or []))
+            _quietly(lambda: self._memory_manager.on_session_end(messages or [], mid_session=mid_session))
         _notify_context_engine_session_end(self, messages)
 
     def _sync_external_memory_for_turn(self, *, original_user_message: Any, final_response: Any, interrupted: bool,

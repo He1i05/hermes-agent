@@ -114,3 +114,85 @@ def test_boundary_commit_switch_still_fires_when_end_raises():
     assert ("switch", "new-sid", True) in provider.calls
 
 
+# ---------------------------------------------------------------------------
+# on_session_end(mid_session=...) — a compaction commit is NOT a session's end
+# ---------------------------------------------------------------------------
+
+
+class _MidSessionAwareProvider(MemoryProvider):
+    """Provider with the current hook shape, recording what the host passed."""
+
+    def __init__(self):
+        self.ends: List[tuple] = []
+
+    @property
+    def name(self) -> str:
+        return "mid-session-aware"
+
+    def is_available(self) -> bool:
+        return True
+
+    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        return []
+
+    def initialize(self, session_id: str = "", **kwargs) -> None:
+        return None
+
+    def on_session_end(self, messages: List[Dict[str, Any]], *, mid_session: bool = False) -> None:
+        self.ends.append((list(messages), mid_session))
+
+
+class _LegacyProvider(MemoryProvider):
+    """Provider whose hook predates ``mid_session`` (positional-only messages)."""
+
+    def __init__(self):
+        self.ends: List[list] = []
+
+    @property
+    def name(self) -> str:
+        return "legacy"
+
+    def is_available(self) -> bool:
+        return True
+
+    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        return []
+
+    def initialize(self, session_id: str = "", **kwargs) -> None:
+        return None
+
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        self.ends.append(list(messages))
+
+
+def test_mid_session_commit_reaches_a_provider_that_declares_it():
+    provider = _MidSessionAwareProvider()
+    mm = _make_manager(provider)
+
+    msgs = [{"role": "assistant", "content": "compacting now"}]
+    mm.on_session_end(msgs, mid_session=True)
+
+    assert provider.ends == [(msgs, True)]
+
+
+def test_plain_session_end_reports_mid_session_false():
+    provider = _MidSessionAwareProvider()
+    mm = _make_manager(provider)
+
+    mm.on_session_end([{"role": "assistant", "content": "done"}])
+
+    assert provider.ends == [([{"role": "assistant", "content": "done"}], False)]
+
+
+def test_legacy_provider_still_extracts_on_a_mid_session_commit():
+    """A provider predating ``mid_session`` must not raise (and lose its extraction)
+    just because the host grew the keyword: the call shape is filtered by signature."""
+    provider = _LegacyProvider()
+    mm = _make_manager(provider)
+
+    msgs = [{"role": "user", "content": "old turn"}]
+    mm.on_session_end(msgs, mid_session=True)
+
+    assert provider.ends == [msgs]
+
+
