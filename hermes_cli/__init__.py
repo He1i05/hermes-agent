@@ -11,9 +11,11 @@ def __getattr__(name: str) -> str:
     """Old-updater compat: shipped updaters import ``__version__`` after the checkout swap.
 
     tests/compat/old_updater_surface.json freezes that import. In-tree code resolves
-    identity through hermes_cli.version_info.get_version_info(); this reads only the
-    install stamp -- never git -- and keeps the pre-stamp placeholder when a checkout
-    has no stamp.
+    identity through hermes_cli.version_info.get_version_info(); when ``pm`` is
+    importable this defers to that resolver, so a stale install stamp can no longer
+    make the label disagree with the banner. With no stamp at this install root it
+    keeps the pre-stamp placeholder, and on a pre-``pm`` tree it falls back to a
+    stamp-only read (never git).
 
     Lazy because ``pm`` is not importable when this package loads: a venv
     editable-installed from a pre-PM tree maps only the top-level packages it knew
@@ -22,7 +24,6 @@ def __getattr__(name: str) -> str:
     """
     if name != "__version__":
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    from hermes_cli.steward import read_install_stamp
     try:
         from pm.paths import repo_root
     except ModuleNotFoundError as exc:
@@ -36,7 +37,18 @@ def __getattr__(name: str) -> str:
             return str(stamp.get("baseVersion") or "0.0.0")
         except (OSError, ValueError, AttributeError):
             return "0.0.0"
-    return str(read_install_stamp(repo_root()).get("baseVersion") or "0.0.0")
+    # ``pm`` is importable, so this tree can resolve its own identity: defer to the
+    # authoritative reader instead of the raw stamp, which serves a stale baseVersion
+    # after an out-of-band checkout move. With no stamp at this install root, keep the
+    # placeholder: the resolver's git fallback answers about the *executing checkout*,
+    # not this install root, which is not this stub's job.
+    from hermes_cli.steward import read_install_stamp
+    stamp = read_install_stamp(repo_root())
+    if not stamp:
+        return "0.0.0"
+    from hermes_cli.version_info import get_version_info
+    resolved = get_version_info().base_version
+    return resolved if resolved != "unknown" else str(stamp.get("baseVersion") or "0.0.0")
 
 
 def _ensure_utf8() -> bool:
