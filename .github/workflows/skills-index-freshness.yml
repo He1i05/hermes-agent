@@ -1,9 +1,31 @@
-name: Skills Index Freshness Check
+name: Skills Index Freshness Check (fork canary)
 
-# Belt-and-suspenders for the twice-daily build_skills_index pipeline.
-# If the live /docs/api/skills-index.json ever goes more than 26 hours
-# stale OR the file disappears entirely OR a major source has collapsed,
-# this workflow opens a GitHub issue so we hear about it before users do.
+# FORK-ONLY re-derivation of the upstream watchdog.
+# Base: NousResearch/hermes-agent @ origin/main .github/workflows/skills-index-freshness.yml
+# Re-derived 2026-10-15 (origin/main 0e427d78). The fork's previous copy
+# (fork/main 3a270499) was 77 lines behind and had no check-catalog-cors job.
+#
+# Why the fork keeps this half of the pair: this install consumes
+#   https://hermes-agent.nousresearch.com/docs/api/skills-index.json
+# through tools/skills_hub_search.py:26 (HERMES_INDEX_URL). Upstream files its
+# alerts in its own repo (NousResearch/hermes-agent), which this install does not
+# monitor, and the fork's copy never ran at all (upstream job guard, false on a
+# fork -> every run concluded "skipped", zero jobs, zero runner minutes).
+# This file watches the same URL and files its issue HERE -- the same intent
+# ("so we hear about it before users do"), addressed to this fork's owner.
+#
+# Deliberate deviations from upstream (the fork-scoping edits):
+#   1. job-level guards re-scoped NousResearch/hermes-agent -> He1i05/hermes-agent
+#   2. get-app-token steps DROPPED (the fork holds no App credentials; this probe
+#      is a public curl + issues: write and needs none), and the checkout step
+#      dropped from check-freshness with them (it existed only so the local
+#      composite action ./.github/actions/get-app-token could be resolved)
+#   3. floors aligned with scripts/build_skills_index.py EXPECTED_FLOORS --
+#      upstream shipped skills.sh:100 / clawhub:50 under a comment claiming
+#      parity with the producer, whose real floors are 10000 / 20000, so the
+#      upstream watchdog cannot see the collapse class it exists for
+#   4. environment: trusted-automation dropped -- no protected secret is consumed
+#      here, and a protected environment would stall an unattended scheduled canary
 #
 # Triggered every 4 hours so we catch a stuck cron within one tick.
 
@@ -18,19 +40,10 @@ permissions:
 
 jobs:
   check-freshness:
-    if: github.repository == 'NousResearch/hermes-agent'
+    if: github.repository == 'He1i05/hermes-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    environment: trusted-automation
     steps:
-      # `Get GitHub App token` below is a LOCAL composite action
-      # (./.github/actions/get-app-token), so the repository must be on disk
-      # before it can be resolved. Without this checkout the job dies with
-      # "Can't find 'action.yml' ... under .github/actions/get-app-token"
-      # every time the probe is non-ok — i.e. exactly when the watchdog is
-      # supposed to file its issue.
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
       - name: Probe live index
         id: probe
         run: |
@@ -76,11 +89,13 @@ jobs:
           except Exception:
               pass
 
-          # Floors — same as build_skills_index.py EXPECTED_FLOORS.
+          # Floors -- same as build_skills_index.py EXPECTED_FLOORS (fork edit #3).
+          # Upstream shipped 100/100/50/50/30/50 under a comment claiming parity;
+          # the producer's real floors are 10000/100/20000/50/30/50.
           floors = {
-              "skills.sh": 100,
+              "skills.sh": 10000,
               "lobehub": 100,
-              "clawhub": 50,
+              "clawhub": 20000,
               "official": 50,
               "github": 30,
               "browse-sh": 50,
@@ -100,11 +115,10 @@ jobs:
           if issues:
               detail = "; ".join(issues)
               print("status=degraded")
-              # GITHUB_OUTPUT doesn't allow newlines without explicit delimiter
               print(f"detail={detail}")
           else:
               print("status=ok")
-              print(f"detail=Index OK — {total} skills, generated {generated_at}")
+              print(f"detail=Index OK -- {total} skills, generated {generated_at}")
               by_summary = ", ".join(f"{k}={v}" for k, v in by_src.most_common(8))
               print(f"summary={by_summary}")
           PY
@@ -117,23 +131,17 @@ jobs:
             echo "Summary:      ${{ steps.probe.outputs.summary }}"
           fi
 
-      - name: Get GitHub App token
-        if: steps.probe.outputs.status != 'ok'
-        id: app-token
-        uses: ./.github/actions/get-app-token
-        with:
-          client-id: ${{ vars.APP_CLIENT_ID }}
-          private-key: ${{ secrets.APP_PRIVATE_KEY }}
-
       - name: Open issue on degraded / failed probe
         if: steps.probe.outputs.status != 'ok'
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
           STATUS: ${{ steps.probe.outputs.status }}
           DETAIL: ${{ steps.probe.outputs.detail }}
         run: |
-          # Find existing open issue by title prefix so we don't spam — we
-          # append a comment instead of opening a new one each tick.
+          # set -e is deliberate: if the fork's default GITHUB_TOKEN cannot be
+          # granted issues:write, the gh call below fails and the JOB GOES RED.
+          # The red scheduled run IS the fallback alert (never a silent green).
+          set -e
           TITLE_PREFIX="[skills-index-watchdog]"
           existing=$(gh issue list \
             --repo "${{ github.repository }}" \
@@ -147,21 +155,85 @@ jobs:
           **Status:** \`$STATUS\`
           **Detail:** $DETAIL
 
-          The Skills Hub at /docs/skills depends on \`/docs/api/skills-index.json\`.
-          The unified index is rebuilt by \`.github/workflows/skills-index.yml\` (cron 6/18 UTC)
-          and \`.github/workflows/deploy-site.yml\` (on every push affecting website/skills).
-          If this issue keeps reopening, check the latest runs:
+          This install consumes \`/docs/api/skills-index.json\` through
+          \`tools/skills_hub_search.py\` (HERMES_INDEX_URL). The unified index is
+          produced and published upstream; upstream's own watchdog lives at
+          https://github.com/NousResearch/hermes-agent/actions/workflows/skills-index-freshness.yml
 
-          - https://github.com/${{ github.repository }}/actions/workflows/skills-index.yml
-          - https://github.com/${{ github.repository }}/actions/workflows/deploy-site.yml
-
-          This issue was opened by \`.github/workflows/skills-index-freshness.yml\`. Close it once the underlying problem is fixed; the next probe will reopen if it's still broken."
+          This issue was opened by the fork's canary
+          \`.github/workflows/skills-index-freshness.yml\` (job \`check-freshness\`).
+          Close it once the index is fresh again; the next probe reopens it if not."
           if [ -n "$existing" ]; then
             echo "Appending to existing issue #$existing"
-            gh issue comment "$existing" --repo "${{ github.repository }}" --body "Probe still failing at $(date -u +%FT%TZ): \`$STATUS\` — $DETAIL"
+            gh issue comment "$existing" --repo "${{ github.repository }}" --body "Probe still failing at $(date -u +%FT%TZ): \`$STATUS\` -- $DETAIL"
           else
             echo "Opening new watchdog issue"
             gh issue create --repo "${{ github.repository }}" \
               --title "$TITLE_PREFIX Skills index is stale or degraded ($STATUS)" \
+              --body "$BODY"
+          fi
+
+  check-catalog-cors:
+    # Desktop's hermes://plugin/install?catalog= links fetch /docs/api/plugins.json
+    # cross-origin. A browser rejects that fetch when any response in the redirect
+    # chain lacks Access-Control-Allow-Origin (#136483). The probe above uses
+    # curl -L, which never checks CORS, so it stays green while Desktop is blocked.
+    if: github.repository == 'He1i05/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Checkout is REQUIRED here: the probe is a repo script
+      # (scripts/ci/check_catalog_cors.py, vendored fork-only in the same commit).
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+
+      - name: Fetch the plugin catalog the way Desktop does
+        id: probe
+        run: |
+          set +e
+          detail=$(python3 scripts/ci/check_catalog_cors.py)
+          code=$?
+          echo "$detail"
+          echo "detail=$detail" >> "$GITHUB_OUTPUT"
+          case "$code" in
+            0) echo "status=ok" >> "$GITHUB_OUTPUT" ;;
+            1) echo "status=blocked" >> "$GITHUB_OUTPUT" ;;
+            *) echo "status=unreachable" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Open issue when Desktop cannot read the catalog
+        if: steps.probe.outputs.status != 'ok'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATUS: ${{ steps.probe.outputs.status }}
+          DETAIL: ${{ steps.probe.outputs.detail }}
+        run: |
+          set -e
+          TITLE_PREFIX="[plugin-catalog-cors-watchdog]"
+          existing=$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --state open \
+            --search "in:title \"$TITLE_PREFIX\"" \
+            --json number,title \
+            --jq '.[] | select(.title | startswith("'"$TITLE_PREFIX"'")) | .number' \
+            | head -1)
+          BODY="Hermes Desktop cannot read the plugin catalog.
+
+          **Status:** \`$STATUS\`
+          **Detail:** $DETAIL
+
+          Desktop's \`hermes://plugin/install?catalog=\` links fetch \`/docs/api/plugins.json\`
+          cross-origin. A browser rejects that fetch when any response in the redirect
+          chain lacks \`Access-Control-Allow-Origin\`. Background: #136483.
+
+          This issue was opened by the fork's canary
+          \`.github/workflows/skills-index-freshness.yml\` (job \`check-catalog-cors\`).
+          Close it once the header is back; the next probe reopens it if not."
+          if [ -n "$existing" ]; then
+            echo "Appending to existing issue #$existing"
+            gh issue comment "$existing" --repo "${{ github.repository }}" --body "Probe still failing at $(date -u +%FT%TZ): \`$STATUS\` -- $DETAIL"
+          else
+            echo "Opening new watchdog issue"
+            gh issue create --repo "${{ github.repository }}" \
+              --title "$TITLE_PREFIX Desktop cannot read the plugin catalog ($STATUS)" \
               --body "$BODY"
           fi
