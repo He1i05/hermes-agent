@@ -280,6 +280,99 @@ def test_old_updater_version_stub_reads_the_same_stamp_as_version_info(tmp_path)
     assert read(unstamped)[0] == "0.0.0"
 
 
+def test_old_updater_version_stub_defers_to_the_resolver_when_pm_is_importable(tmp_path, monkeypatch):
+    """With ``pm`` importable the stub reports the resolver's base version, so a stale
+    install stamp can no longer make ``hermes_cli.__version__`` disagree with the banner."""
+    import hermes_cli
+    import hermes_cli.version_info as version_info
+
+    (tmp_path / "install-stamp.json").write_text(json.dumps(
+        {"commit": "a" * 40, "baseVersion": "0.22.0", "source": "ci", "updateMechanism": "external"}))
+    monkeypatch.setenv("HERMES_INSTALL_ROOT", str(tmp_path))
+    monkeypatch.setattr(version_info, "get_version_info",
+                        lambda: VersionInfo("9.9.9", "9.9.9", None, None, None, "build"))
+    version_info._reset_version_info_cache()
+
+    assert hermes_cli.__version__ == "9.9.9"
+
+
+def test_old_updater_version_stub_keeps_placeholder_without_a_stamp_here(tmp_path, monkeypatch):
+    """No stamp at this install root -> the pre-stamp placeholder is preserved. The
+    resolver is deliberately ignored here: its git fallback answers about the
+    *executing checkout*, not this install root, and that is not the stub's job."""
+    import hermes_cli
+    import hermes_cli.version_info as version_info
+
+    monkeypatch.setenv("HERMES_INSTALL_ROOT", str(tmp_path))
+    monkeypatch.setattr(version_info, "get_version_info",
+                        lambda: VersionInfo("unknown", "unknown", None, None, None, "unknown"))
+    version_info._reset_version_info_cache()
+
+    assert hermes_cli.__version__ == "0.0.0"
+
+
+def test_old_updater_version_stub_declines_a_stale_git_stamp_like_the_resolver(tmp_path, monkeypatch):
+    """A ``source=git`` stamp whose commit disagrees with the live HEAD is declined by
+    the resolver; the stub must report the resolver's git-derived base, not the stamp."""
+    import hermes_cli
+    import hermes_cli.version_info as version_info
+
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", "-c", "user.email=t@example.invalid", "-c", "user.name=t", *args],
+                       cwd=repo, check=True, capture_output=True)
+
+    git("init", "-q")
+    (repo / "a.txt").write_text("a", encoding="utf-8")
+    git("add", "a.txt")
+    git("commit", "-qm", "one")
+    git("tag", "v9.9.0")
+    stale_commit = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                                  capture_output=True, text=True, check=True).stdout.strip()
+    (repo / "a.txt").write_text("b", encoding="utf-8")
+    git("commit", "-aqm", "two")  # HEAD moves past the stamped commit
+
+    (repo / "install-stamp.json").write_text(json.dumps(
+        {"commit": stale_commit, "baseVersion": "0.22.0", "source": "git", "updateMechanism": "external"}))
+    monkeypatch.setenv("HERMES_INSTALL_ROOT", str(repo))
+    monkeypatch.setattr("hermes_cli.version_info._resolve_repo_dir", lambda: repo)
+    version_info._reset_version_info_cache()
+
+    assert hermes_cli.__version__ == get_version_info().base_version == "9.9.0"
+
+
+def test_old_updater_version_stub_pre_pm_fallback_is_stamp_only(monkeypatch):
+    """On a pre-``pm`` tree (the documented reason the stub is lazy) the fallback stays
+    stamp-only: it returns the checkout stamp's baseVersion and never consults git."""
+    import builtins
+
+    import hermes_cli
+    import hermes_cli.version_info as version_info
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "pm" or name.startswith("pm."):
+            raise ModuleNotFoundError(f"No module named {name!r}", name="pm")
+        return real_import(name, *args, **kwargs)
+
+    def no_git(*_args, **_kwargs):
+        raise AssertionError("the pre-pm fallback must not consult git")
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(version_info, "_run_git", no_git)
+
+    stamp_file = Path(hermes_cli.__file__).resolve().parents[1] / "install-stamp.json"
+    try:
+        expected = str(json.loads(stamp_file.read_text(encoding="utf-8-sig")).get("baseVersion") or "0.0.0")
+    except (OSError, ValueError):
+        expected = "0.0.0"
+
+    assert hermes_cli.__version__ == expected
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="the blocking untracked scan uses a FIFO")
 def test_a_timed_out_status_probe_never_strands_index_lock(tmp_path):
     """The update opens its receipt with this probe; killed by its 3 s timeout while refreshing
