@@ -1,108 +1,114 @@
-name: Build Skills Index
+name: Verify Skills Index (fork consume-only)
+
+# FORK-ONLY re-derivation of upstream .github/workflows/skills-index.yml.
+# Base: NousResearch/hermes-agent @ origin/main (re-derived 2026-10-15).
+#
+# Upstream's file BUILDS the index: an App-token crawl of six sources, artifact
+# upload, then a deploy-site.yml re-trigger. A fork cannot do that, and must not:
+#   * .github/actions/get-app-token degrades to GITHUB_TOKEN (1,000 req/h) when
+#     no App credentials exist, which is the fork's case;
+#   * the rate-limited crawl lands under scripts/build_skills_index.py
+#     EXPECTED_FLOORS, and that script exits 2 WITHOUT writing the output
+#     (scripts/build_skills_index.py:466) -> a failed run and no artifact, which
+#     is strictly worse than today's silent skip;
+#   * the publish half (deploy-site.yml) is itself upstream-guarded
+#     (.github/workflows/deploy-site.yml:53), so nothing fork-local would publish;
+#   * nothing on the fork consumes a fork-built index -- the real consumers are the
+#     local CLI (tools/skills_hub_search.py:26) and the docs site, both reading the
+#     upstream URL.
+# So the fork keeps the SCHEDULE and drops the WORK: this job asserts that the
+# index this install consumes is fresh, complete, and above the producer's floors.
+# Green run = the dependency is healthy. Red run = the alert (no issue needed).
 
 on:
   schedule:
-    # Run twice daily: 6 AM and 6 PM UTC
+    # Same cadence as upstream's build (twice daily: 6 AM and 6 PM UTC).
     - cron: "0 6,18 * * *"
-  workflow_dispatch: # Manual trigger
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
-      - "scripts/build_skills_index.py"
+      # Self-test: the first push of this file onto fork main produces an
+      # immediate green/red run, which is the fastest proof the fix works.
       - ".github/workflows/skills-index.yml"
 
 permissions:
   contents: read
-  actions: write # to trigger deploy-site.yml on schedule
 
 jobs:
-  build-index:
-    # Only run on the upstream repository, not on forks
-    if: github.repository == 'NousResearch/hermes-agent'
+  verify-index:
+    if: github.repository == 'He1i05/hermes-agent'
     runs-on: ubuntu-latest
-    # Critical path (Sep 2026): clawhub walk ∥ github taps ~8 min, then skills.sh
-    # resolve ~6 min, then a bounded 8 min owner enrichment. 15 min cancelled every
-    # scheduled run for two months and left the live index frozen; on Sep 17 ClawHub
-    # page latency went from ~2.5 s to ~10 s, so the ~400-page walk alone runs 60-70 min
-    # and 50 min cancelled it again (#114525). The cron is 12-hourly; 120 min leaves headroom.
-    timeout-minutes: 120
-    environment: trusted-automation
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+      - name: Fetch the live index and assert age / total / per-source floors
+        run: |
+          set -euo pipefail
+          URL="https://hermes-agent.nousresearch.com/docs/api/skills-index.json"
+          echo "Verifying $URL"
+          curl -fsSL --retry 3 --retry-delay 10 -o /tmp/skills-index.json "$URL"
+          ls -l /tmp/skills-index.json
+          python3 <<'PY'
+          import json
+          import sys
+          from collections import Counter
+          from datetime import datetime, timezone
 
-      - name: Get GitHub App token
-        id: app-token
-        uses: ./.github/actions/get-app-token
-        with:
-          client-id: ${{ vars.APP_CLIENT_ID }}
-          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          MAX_AGE_HOURS = 26
+          MIN_TOTAL = 1500
+          # Same values as scripts/build_skills_index.py EXPECTED_FLOORS (upstream).
+          FLOORS = {
+              "skills.sh": 10000,
+              "lobehub": 100,
+              "clawhub": 20000,
+              "official": 50,
+              "github": 30,
+              "browse-sh": 50,
+          }
 
-      - uses: ./.github/actions/setup-pm
-        with:
-          cache-python: true
+          try:
+              with open("/tmp/skills-index.json") as f:
+                  data = json.load(f)
+          except Exception as e:
+              print(f"FAIL: cannot parse the downloaded index: {e}")
+              sys.exit(1)
 
-      - name: Install dependencies
-        uses: ./.github/actions/retry
-        with:
-          command: python -m scripts.ci.python_packages httpx==0.28.1 ruamel.yaml==0.18.17
+          generated_at = data.get("generated_at", "")
+          total = data.get("skill_count", 0)
+          skills = data.get("skills", [])
+          if not isinstance(skills, list):
+              print(f"FAIL: 'skills' is {type(skills).__name__}, not a list")
+              sys.exit(1)
 
-      - name: Build skills index
-        env:
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: python scripts/build_skills_index.py
+          by_src = Counter(s.get("source", "") for s in skills)
 
-      # Plugin-catalog star counts follow the same rule as the index: GitHub is consulted
-      # only here, on the schedule (one GraphQL request for every catalog repo), and docs
-      # deploys reuse the artifact / live copy without touching the API.
-      #
-      # Fresh token: the App installation token minted at job start lives 1 h, and the
-      # index walk above runs 60-85 min, so the probe used an expired token and 401'd on
-      # every scheduled run from Sep 18 (#118113). Mint again right before the probe.
-      - name: Get GitHub App token for the stars probe
-        id: probe-token
-        uses: ./.github/actions/get-app-token
-        with:
-          client-id: ${{ vars.APP_CLIENT_ID }}
-          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          age_hours = None
+          try:
+              ts = datetime.fromisoformat(str(generated_at).replace("Z", "+00:00"))
+              age_hours = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+          except Exception as e:
+              print(f"WARN: unparseable generated_at {generated_at!r}: {e}")
 
-      - name: Probe plugin catalog stars
-        env:
-          GITHUB_TOKEN: ${{ steps.probe-token.outputs.token }}
-        run: python website/scripts/fetch-plugin-stars.py --probe
+          print(f"generated_at : {generated_at}")
+          print(f"age_hours    : {'unknown' if age_hours is None else f'{age_hours:.2f}'} (limit {MAX_AGE_HOURS})")
+          print(f"skill_count  : {total} (floor {MIN_TOTAL})")
+          for src, floor in FLOORS.items():
+              print(f"  {src:<10}: {by_src.get(src, 0):>6} (floor {floor})")
 
-      - name: Upload index artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: skills-index
-          path: |
-            website/static/api/skills-index.json
-            website/static/api/plugin-stars.json
-          retention-days: 7
+          problems = []
+          if age_hours is not None and age_hours > MAX_AGE_HOURS:
+              problems.append(f"stale: {age_hours:.1f}h > {MAX_AGE_HOURS}h")
+          if total < MIN_TOTAL:
+              problems.append(f"total: {total} < {MIN_TOTAL}")
+          for src, floor in FLOORS.items():
+              count = by_src.get(src, 0)
+              if src == "skills.sh":
+                  count = by_src.get("skills.sh", 0) + by_src.get("skills-sh", 0)
+              if count < floor:
+                  problems.append(f"{src}: {count} < {floor}")
 
-  # Re-trigger the docs deploy so the refreshed index lands on the live site.
-  # The deploy itself is owned by deploy-site.yml (which crawls and deploys
-  # everything in one pipeline); we just kick it on a schedule.
-  trigger-deploy:
-    needs: build-index
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    environment: trusted-automation
-    steps:
-      # Required: `Get GitHub App token` is a LOCAL composite action
-      # (./.github/actions/get-app-token) and cannot resolve without the repo
-      # checked out. `build-index` above already does this; this job did not,
-      # so the scheduled deploy re-trigger never fired.
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
-
-      - name: Get GitHub App token
-        id: app-token
-        uses: ./.github/actions/get-app-token
-        with:
-          client-id: ${{ vars.APP_CLIENT_ID }}
-          private-key: ${{ secrets.APP_PRIVATE_KEY }}
-
-      - name: Trigger Deploy Site workflow
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: gh workflow run deploy-site.yml --repo ${{ github.repository }} -f skills_index_run_id=${{ github.run_id }}
+          if problems:
+              print("RED: index is degraded -- " + "; ".join(problems))
+              sys.exit(1)
+          print("GREEN: index is fresh and above every producer floor.")
+          PY
