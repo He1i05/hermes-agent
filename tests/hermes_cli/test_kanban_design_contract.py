@@ -630,11 +630,18 @@ def test_specify_outcome_defaults_keep_design_fields_absent():
 
 def test_guard_flags_a_live_pin_that_escapes_the_sandbox(tmp_path):
     """The exact 2026-09-12 leak: a worker's HERMES_KANBAN_DB pin (live board)
-    resolving outside the temp sandbox must be reported, not silently written."""
-    live = Path("/home/juozas/.hermes/kanban.db")
+    resolving outside the temp sandbox must be reported, not silently written.
+
+    The escaping path is derived from ``tmp_path`` rather than spelled as the
+    real ``~/.hermes`` path: resolving a literal real-home path IS I/O against
+    production state, which the conftest home I/O guard refuses (reads as much
+    as writes), so the literal form tripped that guard before the predicate
+    could report the escape. The predicate branch exercised is the same.
+    """
+    live = tmp_path.parent / "live-board" / "kanban.db"
     msg = _escaped_the_sandbox(live, str(live), [tmp_path])
     assert msg and "escaped the test sandbox" in msg
-    assert str(live) in msg
+    assert str(live.resolve()) in msg
 
 
 def test_guard_allows_a_sandboxed_path(tmp_path):
