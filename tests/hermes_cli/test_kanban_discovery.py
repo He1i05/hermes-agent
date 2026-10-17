@@ -68,7 +68,7 @@ def _decompose(tid: str, payload: str, names: list[str]):
         p.start()
     try:
         with _patch_aux_client(payload), patch(
-            "hermes_cli.kanban_decompose._load_config", return_value={},
+            "hermes_cli.config.load_config_readonly", return_value={},
         ):
             return decomp.decompose_task(tid, author="t")
     finally:

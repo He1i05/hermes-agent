@@ -370,7 +370,7 @@ def test_clean_children_emits_landing_and_buckets_every_card(kanban_home):
     assert reason == ""
     # Build child untouched by the landing engine.
     assert len([c for c in children if c.get("wiki_landing")]) == 1
-    landing = [c for c in children if c.get("wiki_landing")][0]
+    landing = next(c for c in children if c.get("wiki_landing"))
     assert landing["assignee"] == "wiki-keeper"
     # Every card, landing included, carries the P0 bucket headings.
     for c in children:
@@ -441,8 +441,8 @@ def test_fanout_persists_the_gated_landing_child(kanban_home):
             "scout": "research. CAPABILITY: BEHAVIOR: research, review.",
             "wiki-keeper": "wiki. CAPABILITY: BEHAVIOR: wiki, docs, knowledge.",
         },
-    ) + [_patch_aux_client(_fan_llm_payload()), patch.object(
-        decomp, "_load_config",
+    ) + [_patch_aux_client(_fan_llm_payload()), patch(
+        "hermes_cli.config.load_config_readonly",
         return_value={"kanban": {"default_assignee": "orchestrator"}},
     )])
     try:
@@ -484,8 +484,8 @@ def test_landing_promotes_only_after_its_research_parent_completes(kanban_home):
             "scout": "research. CAPABILITY: BEHAVIOR: research.",
             "wiki-keeper": "wiki. CAPABILITY: BEHAVIOR: wiki, docs.",
         },
-    ) + [_patch_aux_client(_fan_llm_payload()), patch.object(
-        decomp, "_load_config",
+    ) + [_patch_aux_client(_fan_llm_payload()), patch(
+        "hermes_cli.config.load_config_readonly",
         return_value={"kanban": {"default_assignee": "orchestrator"}},
     )])
     try:
@@ -517,8 +517,8 @@ def test_fanout_writes_wiki_landing_emitted_audit_event(kanban_home):
             "scout": "research. CAPABILITY: BEHAVIOR: research.",
             "wiki-keeper": "wiki. CAPABILITY: BEHAVIOR: wiki, docs.",
         },
-    ) + [_patch_aux_client(_fan_llm_payload()), patch.object(
-        decomp, "_load_config",
+    ) + [_patch_aux_client(_fan_llm_payload()), patch(
+        "hermes_cli.config.load_config_readonly",
         return_value={"kanban": {"default_assignee": "orchestrator"}},
     )])
     try:

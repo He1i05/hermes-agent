@@ -220,7 +220,7 @@ def test_fanout_writes_capability_routed_events(kanban_home):
             "scout": "research. CAPABILITY: BEHAVIOR: research, review.",
         },
     ) + [_patch_aux_client(llm_payload), patch(
-        "hermes_cli.kanban_decompose._load_config",
+        "hermes_cli.config.load_config_readonly",
         return_value={"kanban": {"default_assignee": "orchestrator"}},
     )])
     try:
@@ -257,7 +257,7 @@ def test_fanout_false_single_path_untouched(kanban_home):
     })
     patches = _run_patches(_patch_list_profiles(["orchestrator", "engineer"]) + [
         _patch_aux_client(llm_payload),
-        patch("hermes_cli.kanban_decompose._load_config", return_value={}),
+        patch("hermes_cli.config.load_config_readonly", return_value={}),
     ])
     try:
         outcome = decomp.decompose_task(tid, author="me")
