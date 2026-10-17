@@ -3450,16 +3450,13 @@ def _record_opened_run(conn: sqlite3.Connection, task_id: str, run_id: int) -> N
 def _board_identity(conn: sqlite3.Connection) -> Optional[str]:
     """The resolved ``main`` DB path of *conn*, or ``None`` when unavailable.
 
-    Thin import of ``kanban_guard.conn_db_path`` (a ``PRAGMA database_list``
-    read) so the ledger's key and the guard's own path resolution can never
-    disagree about which board a connection points at.
+    Thin import of ``sqlite_safe_read._canonical_db_path`` (a ``PRAGMA
+    database_list`` read) so the ledger's key and the safe-read path resolution
+    can never disagree about which board a connection points at.
     """
-    try:
-        from hermes_cli.kanban_guard import conn_db_path
+    from hermes_cli.sqlite_safe_read import _canonical_db_path
 
-        resolved = conn_db_path(conn)
-    except Exception:
-        return None
+    resolved = _canonical_db_path(conn)
     return None if resolved is None else str(resolved)
 
 
