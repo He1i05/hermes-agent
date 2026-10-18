@@ -76,7 +76,10 @@ def daemon(root, home, env, *, barrier, fixture='local_recovery_daemon.py'):
     with (home / ('first.log' if barrier else 'restart.log')).open('w+') as log:
         proc = subprocess.Popen(command, cwd=root, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
         try:
-            deadline = time.monotonic() + 120
+            # A borrowing data root syncs its own venv on first boot (venv_sync
+            # design); that costs minutes on slow hosts, so the budget is
+            # env-tunable instead of hardcoded (t_97673f26).
+            deadline = time.monotonic() + int(os.environ.get('KANBAN_RECOVERY_BOOT_DEADLINE', '420'))
             desc = {}
             while proc.poll() is None and time.monotonic() < deadline:
                 try:
