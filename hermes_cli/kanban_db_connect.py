@@ -57,8 +57,19 @@ def _resolve_busy_timeout_ms() -> int:
 def _sqlite_connect(path: Path) -> sqlite3.Connection:
     """Open a Kanban SQLite connection via ``connect_tracked``: while registered,
     byte-level probes of the file are refused because an ``open()``/``close()``
-    would cancel this process's POSIX advisory locks (see ``sqlite_safe_read``)."""
+    would cancel this process's POSIX advisory locks (see ``sqlite_safe_read``).
+
+    The single bottom boundary every kanban read/write open funnels through
+    (``connect``, ``init_db``, ``repair_db``, ``_probe_integrity``), so the
+    live-board guard is armed here as well as at the write boundary. It runs
+    BEFORE the open, which also blocks the "opener materialises an empty DB on
+    top of the live path" case. See ``hermes_cli.kanban_guard``.
+    """
     from hermes_cli.sqlite_safe_read import connect_tracked
+
+    from hermes_cli.kanban_guard import assert_not_live_board
+
+    assert_not_live_board(path, op="connect")
 
     busy_timeout_ms = _resolve_busy_timeout_ms()
     conn = connect_tracked(
@@ -350,6 +361,12 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     Returns the main backup path, or ``None`` if the copy failed (the caller
     still raises loudly). Writes are confined to the DB's parent directory:
     the basename derives only from ``path.name`` + content hash."""
+    from hermes_cli.kanban_guard import assert_not_live_board
+
+    # This copy lands BESIDE the DB (``<parent>/<name>.corrupt.<hash>.bak``),
+    # i.e. outside ``_sqlite_connect``'s reach and outside the test-side
+    # deny-list's (which patches ``connect`` only) — so it needs its own call.
+    assert_not_live_board(path, op="quarantine")
     # Pin the resolved parent (``resolve()`` collapses ``..`` and symlinks); we
     # only ever write inside it.
     resolved = path.resolve()
@@ -807,6 +824,14 @@ def init_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> P
     migration pass — callers that know the on-disk schema may have drifted
     (tests writing legacy event kinds, external upgrades) use it to force it."""
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
+    from hermes_cli.kanban_guard import assert_not_live_board
+
+    # ``init_db`` resolves its own path and always re-runs the migration pass, so
+    # a check placed only in ``connect()`` would leave it reachable. Inside the
+    # body on purpose: ``kanban_db`` re-exports this function under a second name.
+    # Runs before the dead-board check so no path resolution side effect precedes
+    # the guard on a live board.
+    assert_not_live_board(path, op="init_db")
     _refuse_dead_board_resurrection(path, board)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Clear the cache entry so connect() re-runs schema + migrations.
@@ -1003,7 +1028,27 @@ def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:
     matching task_runs row so end-run / heartbeat have something to write.
     write_txn serializes against concurrent dispatchers, and the per-row
     UPDATE uses ``current_run_id IS NULL`` as a CAS guard so a racing claim
-    can't produce an orphaned row."""
+    can't produce an orphaned row.
+
+    Each synthesized run is also REGISTERED as opened by the backfilling process
+    (``_kb._record_opened_run``, t_6c8342e0 review round 1). Without it the run
+    exists but no clause of the live-run ownership guard can match it — the task
+    row carries no ``worker_pid`` (that is the whole point of this legacy shape)
+    and ``HERMES_KANBAN_TASK`` is not in play — so the very next
+    ``complete_task``/``heartbeat_worker`` is refused and the card is stuck
+    ``running`` with an OPEN synthesized run. That is the fingerprint the T5
+    watchdog tier alerts on (``open_run_on_terminal_card``), and it broke
+    ``test_migration_backfills_inflight_run_for_legacy_db``. Registering here is
+    correct by construction: whoever runs the migration is the process that
+    adopts the in-flight card, and the ledger is process-local, so no other
+    process gains anything.
+
+    Recording is also what evicts a STALE entry: a prior claim in this same
+    process left ``(board, task_id) -> old_run_id`` behind, and the old run row
+    was just deleted. ``_kb._opened_run_matches`` drops an entry that no longer
+    names the live run and one whose run row is gone, so the stale entry cannot
+    admit the new run on its own — the re-record below is what does.
+    """
     with write_txn(conn):
         inflight = conn.execute(
             "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
@@ -1044,6 +1089,22 @@ def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:
                     "    outcome = 'reclaimed', ended_at = ? "
                     "WHERE id = ?",
                     (int(time.time()), cur.lastrowid),
+                )
+                continue
+            # The pointer landed, so this run is the card's live run and this
+            # process just adopted it. Register it so the ownership guard can
+            # see that (t_6c8342e0 review round 1). Re-derived onto the
+            # post-refactor tree: eb9cf51f98's re-integration dropped this hunk,
+            # which left a backfilled legacy run un-completable by its opener
+            # (pinned by test_t5_legacy_backfilled_run_is_completable_by_its_opener).
+            try:
+                _kb._record_opened_run(conn, row["id"], int(cur.lastrowid))
+            except Exception:
+                # A guard-ledger failure must not fail a migration: the run is
+                # real and the card is consistent either way.
+                _kb._log.debug(
+                    "legacy backfill: could not register opened run %s for %s",
+                    cur.lastrowid, row["id"], exc_info=True,
                 )
 
 
@@ -1249,6 +1310,16 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     since those side effects would fire while the outer txn can still roll back.
     """
     _kb._assert_not_delegated_child_mutation(_main_db_file(conn))
+    # The WRITE boundary — the only kanban-API write that a caller-supplied
+    # ``sqlite3.Connection`` still passes through (``connect()`` never saw it, so
+    # the connection-open guard and the test-side deny-list are both blind here).
+    # Reuses the shape of the delegated-child guard directly above; in the body,
+    # because ``kanban_db`` re-exports ``write_txn`` under a second name.
+    # Hand-merge at the pin: upstream evolved the descendant fence (path-scoped
+    # ``_main_db_file(conn)``); our guard is an independent addition — keep both.
+    from hermes_cli.kanban_guard import assert_conn_not_live_board
+
+    assert_conn_not_live_board(conn, op="write_txn")
     if getattr(conn, "in_transaction", False):
         if not allow_nested:
             raise RuntimeError(

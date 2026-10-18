@@ -62,6 +62,13 @@ def _placeholders(items) -> str:
 def _snapshot_db(source: Path, target: Path) -> None:
     """Consistent copy of ``source`` via the online-backup API (a file copy
     would miss pages still in the ``-wal`` sidecar and could tear)."""
+    from hermes_cli.kanban_guard import assert_not_live_board
+
+    # ``source`` is the BOARD; opening it (even for a backup) is a r/w open that
+    # can recover/checkpoint the live file. ``target`` is deliberately NOT
+    # guarded: it is the caller's own export path, never a board, and guarding it
+    # would break ``hermes kanban export``. See ``kanban_guard``.
+    assert_not_live_board(source, op="snapshot")
     with contextlib.closing(sqlite3.connect(str(source))) as src, \
             contextlib.closing(sqlite3.connect(str(target))) as dst:
         src.backup(dst)

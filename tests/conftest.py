@@ -659,6 +659,11 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
 
     Uses ``monkeypatch.setattr`` so pytest restores ``connect`` automatically
     after each test (no stacked wrappers or state leakage across tests).
+
+    The in-code companion (``hermes_cli.kanban_guard``, #69283 follow-up) is
+    armed from inside ``kanban_db_connect``'s bodies, so it also covers the two
+    structural holes a monkeypatch cannot reach: writes issued before this
+    fixture runs, and caller-supplied connections that never call ``connect()``.
     """
     _kdb = sys.modules.get("hermes_cli.kanban_db")
     _kdbc = sys.modules.get("hermes_cli.kanban_db_connect")
@@ -674,6 +679,18 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
     _orig_connect = getattr(_kdbc, "connect", None)
     if _orig_connect is None or getattr(_kdb, "kanban_db_path", None) is None:
         return
+
+    # Feed the in-code guard the pre-sandbox real root. ``_REAL_KANBAN_ROOT`` is
+    # captured above before the session sandbox rewired HERMES_HOME, so it is
+    # correct even for a custom-root (Docker/portable) install where
+    # ``~/.hermes`` is NOT production — the same reason
+    # ``_state_db_write_guard`` injects ``_STATE_DB_GUARD_EXTRA_DENY_ROOTS``.
+    # monkeypatch restores the tuple, so the guard is inert again next test.
+    _kg = importlib.import_module("hermes_cli.kanban_guard")
+    monkeypatch.setattr(_kg, "_KANBAN_GUARD_EXTRA_DENY_ROOTS", (_REAL_KANBAN_ROOT,))
+    # A shell-leaked bypass must not disarm the guard for in-process code under
+    # test (mirrors the state-db guard's handling of its env twin).
+    monkeypatch.delenv(_kg.GUARD_ENV_BYPASS, raising=False)
 
     def _guarded_connect(db_path=None, *args, **kwargs):
         if db_path is not None:
