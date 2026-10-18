@@ -41,6 +41,15 @@ from pathlib import Path
 
 import pytest
 
+# Re-derived onto the post-refactor tree: upstream's b897d79ba2
+# (tests/home_io_guard.py) guards every real-home path, and this file's
+# live-target twin reads the REAL ~/.hermes/kanban.db on purpose (read-only
+# snapshots around a negative eval). Same opt-out as the sibling
+# test_kanban_write_guard.py: the marker exempts the I/O guard, never the
+# behaviour assertions — refusal is proved by the fake-root twin, a leak by
+# the snapshot mismatch, not by the home guard.
+pytestmark = pytest.mark.allow_real_home_io
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EVALS = REPO_ROOT / "evals"
 SCRIPT = EVALS / "kanban_pr_acceptance_live.py"
@@ -75,6 +84,7 @@ def _run(env: dict) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(SCRIPT), str(REPO_ROOT)],
         env=env, capture_output=True, text=True, cwd=str(REPO_ROOT), timeout=_TIMEOUT,
+        check=False,
     )
 
 
