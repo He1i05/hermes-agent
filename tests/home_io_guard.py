@@ -46,17 +46,20 @@ _PAYLOAD_MANIFEST = _normcase(os.fspath(Path(__file__).resolve().parent.parent.p
 
 
 def _is_install_facts(absolute: str, roots) -> bool:
-    """``<guarded root>/installs/<install-id>/facts.json``: an install's tool-store version facts.
+    """An install's tool-store version facts: ``<root>/tools/facts.json`` and
+    ``<root>/installs/<install-id>/facts.json``.
 
     ``scripts/bundles/native.py`` reads ``store_dir / "facts.json"`` to learn which python/node/
     ffmpeg generation an install owns. A login-shell snapshot bootstrap (``SubprocessEnvironment
     .init_session`` -> bash -l -> the install's launcher) reads it for the REAL install even when
     ``HERMES_HOME`` points at a temp dir, because the launcher resolves its own tree — so three
-    kanban terminal-session tests tripped the guard on ``$HERMES_HOME/installs/<id>/facts.json``
-    (t_97673f26 item 4). Same class as the payload manifest: install metadata, not Hermes state,
-    and only that one file at that depth — the generated venvs beside it stay guarded.
+    kanban terminal-session tests tripped the guard on those two paths (t_97673f26 item 4). Same
+    class as the payload manifest: install metadata, not Hermes state. Only that file: the
+    generated venvs and every other file beside it stay guarded.
     """
     for root in roots:
+        if absolute == root + os.sep + "tools" + os.sep + "facts.json":
+            return True
         prefix = root + os.sep + "installs" + os.sep
         if absolute.startswith(prefix) and absolute.endswith(os.sep + "facts.json"):
             if os.sep not in absolute[len(prefix):-len(os.sep + "facts.json")]:

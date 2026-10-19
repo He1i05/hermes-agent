@@ -66,8 +66,9 @@ scripts/run_tests.sh -v --tb=long                       # pytest flags pass thro
   `$HERMES_HOME/tools`, the sealed payload manifest beside the checkout
   (`$HERMES_HOME/manifest.json`, read once at `import hermes_bootstrap` via
   `pm.environments._payload_manifest`), and an install's tool-store facts
-  (`$HERMES_HOME/installs/<id>/facts.json`, read by `scripts/bundles/native.py` during a
-  login-shell snapshot bootstrap). Anything else under the home is still refused, writes to
+  (`$HERMES_HOME/tools/facts.json` or `$HERMES_HOME/installs/<id>/facts.json`, read by
+  `scripts/bundles/native.py` during a login-shell snapshot bootstrap). Anything else under the
+  home is still refused, writes to
   those paths included. A refusal naming a real-home path is therefore a real isolation bug
   unless the path is one of those four — when it is, fix the fixture or the exemption, never
   re-baseline the file as "environmental". And a suite run from this checkout is not comparable

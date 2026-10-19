@@ -220,12 +220,16 @@ def test_install_facts_are_install_metadata_not_hermes_state(tmp_path):
     facts.write_text("{}", encoding="utf-8")
     guard = HomeIOGuard(lambda: [home])
     guard.check(facts)
+    guard.check(home / "tools" / "facts.json")
+    guard.check(home / "installs" / "abc123" / "facts.json")
     with pytest.raises(AssertionError, match="REAL hermes home"):
         guard.check(facts, destructive=True)
     with pytest.raises(AssertionError, match="REAL hermes home"):
         guard.check(home / "installs" / "abc123" / "state.json")
     with pytest.raises(AssertionError, match="REAL hermes home"):
         guard.check(home / "installs" / "abc123" / "venv" / "facts.json")
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(home / "tools" / "lock.json")
 
 
 def test_hermes_exported_scratch_tmp_is_not_the_test_temp_root(tmp_path):
