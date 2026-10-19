@@ -58,6 +58,21 @@ scripts/run_tests.sh -v --tb=long                       # pytest flags pass thro
   ```
   Tests that `patch.object(Path, "home", ...)` must ALSO set `HERMES_HOME` — code reads the
   env var, not `Path.home()/.hermes`.
+- **The real-home tripwire is also an install-topology tripwire.** `tests/conftest.py` installs
+  `tests/home_io_guard.py`, which refuses I/O against a real `~/.hermes`. The default install
+  lays the checkout down INSIDE that home (`install.sh`: `INSTALL_DIR=$HERMES_HOME/hermes-agent`),
+  so four legitimate production reads land inside the guarded root by construction and are
+  exempt: the checkout tree and its `.venv`, the interpreter's own installation under
+  `$HERMES_HOME/tools`, the sealed payload manifest beside the checkout
+  (`$HERMES_HOME/manifest.json`, read once at `import hermes_bootstrap` via
+  `pm.environments._payload_manifest`), and an install's tool-store facts
+  (`$HERMES_HOME/installs/<id>/facts.json`, read by `scripts/bundles/native.py` during a
+  login-shell snapshot bootstrap). Anything else under the home is still refused, writes to
+  those paths included. A refusal naming a real-home path is therefore a real isolation bug
+  unless the path is one of those four — when it is, fix the fixture or the exemption, never
+  re-baseline the file as "environmental". And a suite run from this checkout is not comparable
+  to upstream CI for files that touch the home: compare against an untouched checkout of the
+  same branch, and record the environment-fixed subset once instead of per card.
 
 ## Don't fake the host OS
 
