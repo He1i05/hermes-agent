@@ -67,7 +67,12 @@ def main():
             return child
         return original_popen(*args, **kwargs)
     def wait_for(predicate):
-        until = time.monotonic() + 50
+        # A worker spawned from a borrowing data root finishes its per-process dependency prep
+        # before it reaches the board (venv_sync design: 'preparing dependencies for this data
+        # root'); on slow hosts that alone outlasts the 50 s this used to hardcode, so the
+        # budget is env-tunable like the boot deadline (t_97673f26 item 2). Defaults keep the
+        # old value: only a caller that measured a longer prep raises it.
+        until = time.monotonic() + int(os.environ.get('KANBAN_RECOVERY_WAIT_BUDGET', '50'))
         while time.monotonic() < until:
             if predicate():
                 return
