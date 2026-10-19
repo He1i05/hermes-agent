@@ -139,6 +139,13 @@ class HomeIOGuard:
             # once at import to find the venv/store this tree belongs to. Reads only.
             if not destructive and absolute == _PAYLOAD_MANIFEST:
                 return
+            # An install's TOOL STORE (<home>/tools: the interpreter, node, ffmpeg, browser, and the
+            # facts.json naming their generations) is installation, not Hermes state. A login
+            # shell whose PATH points there stats and execs into it for the REAL install even when
+            # HERMES_HOME is isolated, so a terminal-session test reads it through no fault of its
+            # own (t_97673f26 item 4). Reads only — anything destructive stays refused.
+            if not destructive and any(_within(absolute, root + os.sep + "tools") for root in roots):
+                return
             # An install's tool-store facts (see _is_install_facts). Reads only.
             if not destructive and _is_install_facts(absolute, roots):
                 return
