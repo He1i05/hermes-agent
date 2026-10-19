@@ -66,8 +66,13 @@ async def rpc(ws, method, **params):
 
 def websocket(home, desc):
     grant = control(home, 'session-ticket', {'profile_id': str(home), 'instance_id': desc['instance_id'], 'purpose': 'interactive'})
+    # The client's 10 s default open_timeout is the wrong ceiling for a gateway that is still
+    # warming its first request path on a loaded host: measured, a passing restart-mode run
+    # lost its first attempt to 'timed out during opening handshake' while the same run
+    # succeeded on retry (t_97673f26 item 2). Ceiling, not cost.
     return connect(desc['api_origin'].replace('http:', 'ws:') + '/api/ws',
-                   subprotocols=['hermes-gateway-v1', 'hermes-gateway-ticket.' + grant['ticket']])
+                   subprotocols=['hermes-gateway-v1', 'hermes-gateway-ticket.' + grant['ticket']],
+                   open_timeout=float(os.environ.get('KANBAN_RECOVERY_HANDSHAKE_TIMEOUT', '60')))
 
 
 @contextmanager
