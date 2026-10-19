@@ -45,6 +45,25 @@ _INTERPRETER_PREFIX_STRS = tuple(_normcase(os.fspath(p)) for p in _INTERPRETER_P
 _PAYLOAD_MANIFEST = _normcase(os.fspath(Path(__file__).resolve().parent.parent.parent / "manifest.json"))
 
 
+def _is_install_facts(absolute: str, roots) -> bool:
+    """``<guarded root>/installs/<install-id>/facts.json``: an install's tool-store version facts.
+
+    ``scripts/bundles/native.py`` reads ``store_dir / "facts.json"`` to learn which python/node/
+    ffmpeg generation an install owns. A login-shell snapshot bootstrap (``SubprocessEnvironment
+    .init_session`` -> bash -l -> the install's launcher) reads it for the REAL install even when
+    ``HERMES_HOME`` points at a temp dir, because the launcher resolves its own tree — so three
+    kanban terminal-session tests tripped the guard on ``$HERMES_HOME/installs/<id>/facts.json``
+    (t_97673f26 item 4). Same class as the payload manifest: install metadata, not Hermes state,
+    and only that one file at that depth — the generated venvs beside it stay guarded.
+    """
+    for root in roots:
+        prefix = root + os.sep + "installs" + os.sep
+        if absolute.startswith(prefix) and absolute.endswith(os.sep + "facts.json"):
+            if os.sep not in absolute[len(prefix):-len(os.sep + "facts.json")]:
+                return True
+    return False
+
+
 def _within(path: str, prefix: str) -> bool:
     """``Path(path).is_relative_to(prefix)`` for two normalized, case-folded absolute strings."""
     if path == prefix:
@@ -116,6 +135,9 @@ class HomeIOGuard:
             # The checkout's own payload manifest (see _PAYLOAD_MANIFEST): bootstrap reads it
             # once at import to find the venv/store this tree belongs to. Reads only.
             if not destructive and absolute == _PAYLOAD_MANIFEST:
+                return
+            # An install's tool-store facts (see _is_install_facts). Reads only.
+            if not destructive and _is_install_facts(absolute, roots):
                 return
             # Check the lexical path first: resolving must not probe a protected
             # tree merely to decide that the original path was forbidden.

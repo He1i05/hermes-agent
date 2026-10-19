@@ -207,6 +207,27 @@ def test_checkout_inside_a_guarded_root_is_not_hermes_state():
         guard.check(PROJECT_ROOT.parent / "config.yaml")
 
 
+def test_install_facts_are_install_metadata_not_hermes_state(tmp_path):
+    """``<home>/installs/<id>/facts.json`` carries an install's tool-store version facts
+    (``scripts/bundles/native.py``); a login-shell snapshot bootstrap reads it for the REAL
+    install even when HERMES_HOME is isolated, because the launcher resolves its own tree.
+    Only that one file at that depth is exempt — the generated venv beside it is not."""
+    from tests.home_io_guard import HomeIOGuard
+
+    home = tmp_path / "home"
+    facts = home / "installs" / "abc123" / "facts.json"
+    facts.parent.mkdir(parents=True)
+    facts.write_text("{}", encoding="utf-8")
+    guard = HomeIOGuard(lambda: [home])
+    guard.check(facts)
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(facts, destructive=True)
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(home / "installs" / "abc123" / "state.json")
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(home / "installs" / "abc123" / "venv" / "facts.json")
+
+
 def test_hermes_exported_scratch_tmp_is_not_the_test_temp_root(tmp_path):
     """A Hermes-launched shell hands pytest TMPDIR=<home>/cache/scratch (tagged by
     HERMES_SCRATCH_DIR). With that home guarded, honoring it would put the session
