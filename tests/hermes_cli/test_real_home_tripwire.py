@@ -196,6 +196,13 @@ def test_checkout_inside_a_guarded_root_is_not_hermes_state():
     guard = HomeIOGuard(lambda: [PROJECT_ROOT.parent])
     guard.check(PROJECT_ROOT / "tests" / "home_io_guard.py")
     guard.check(PROJECT_ROOT / ".venv" / "bin" / "python", metadata=True)
+    # The sealed payload's manifest sits beside the checkout and names the venv/store that
+    # this tree belongs to; ``import hermes_bootstrap`` reads it once. That read is install
+    # metadata, and on a default install its only possible location is inside the home
+    # (t_97673f26 item 4). Reading is exempt; writing or replacing it is not.
+    guard.check(PROJECT_ROOT.parent / "manifest.json")
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(PROJECT_ROOT.parent / "manifest.json", destructive=True)
     with pytest.raises(AssertionError, match="REAL hermes home"):
         guard.check(PROJECT_ROOT.parent / "config.yaml")
 

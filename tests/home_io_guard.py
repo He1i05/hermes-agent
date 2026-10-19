@@ -31,6 +31,19 @@ _INTERPRETER_PREFIXES = tuple({
 _normcase = os.path.normcase
 _INTERPRETER_PREFIX_STRS = tuple(_normcase(os.fspath(p)) for p in _INTERPRETER_PREFIXES)
 
+#: The sealed payload's manifest sits BESIDE the checkout, not inside it: install.sh lays the
+#: tree down at ``$HERMES_HOME/hermes-agent`` and the manifest at ``$HERMES_HOME/manifest.json``
+#: (``pm/environments.py:_payload_manifest`` = ``root.parent / "manifest.json"``). On a default
+#: install that parent IS the real Hermes home, so ``import hermes_bootstrap`` — which calls
+#: ``activate_dependencies`` at import time — reads one file inside the guarded root and every
+#: test that builds an agent trips the guard before it can assert anything (measured: 20/20
+#: ``tests/agent/test_kanban_turn_recovery.py`` and 9/9 ``test_kanban_budget_checkpoint.py``
+#: refused at this exact read, t_97673f26 item 4). Reading the manifest that names the checkout's
+#: own venv/store is install metadata, the same class as the checkout's own ``.venv`` above —
+#: and it is exactly what upstream CI does with an unguarded ENOENT because its checkout has no
+#: home parent. Non-destructive reads only: a write to it is still refused.
+_PAYLOAD_MANIFEST = _normcase(os.fspath(Path(__file__).resolve().parent.parent.parent / "manifest.json"))
+
 
 def _within(path: str, prefix: str) -> bool:
     """``Path(path).is_relative_to(prefix)`` for two normalized, case-folded absolute strings."""
@@ -100,6 +113,10 @@ class HomeIOGuard:
             for prefix in _INTERPRETER_PREFIX_STRS:
                 if _within(absolute, prefix) or (metadata and _contains(absolute, prefix)):
                     return
+            # The checkout's own payload manifest (see _PAYLOAD_MANIFEST): bootstrap reads it
+            # once at import to find the venv/store this tree belongs to. Reads only.
+            if not destructive and absolute == _PAYLOAD_MANIFEST:
+                return
             # Check the lexical path first: resolving must not probe a protected
             # tree merely to decide that the original path was forbidden.
             for root in roots:
