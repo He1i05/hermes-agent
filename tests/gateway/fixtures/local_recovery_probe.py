@@ -52,7 +52,24 @@ CHILD_ENV_KEYS = ('PATH', 'LANG', 'TZ', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', '
 
 
 def child_env():
-    return {k: os.environ[k] for k in CHILD_ENV_KEYS if k in os.environ}
+    """Whitelisted environment for a probe child process.
+
+    ``HERMES_DISABLE_LAZY_INSTALLS`` belongs to that contract, not to convenience. Every child
+    of these probes launches as ``python -m hermes_cli.main`` / ``gateway.run`` under a
+    test-owned ``HERMES_HOME``, which makes it a *borrowing* data root, and
+    ``hermes_bootstrap.prepare_launch`` then re-syncs the checkout's dependency generation for
+    that root on EVERY launch (``venv_sync``: "preparing dependencies for this data root").
+    The suite already sets this switch in the pytest process (``tests/conftest.py``), but this
+    dict is an allowlist, so the value died at the boundary. Measured on the 4-core Pi at load
+    4-6: one such launch did not finish its install within 60 s (killed mid-install), versus
+    10.8 s with the switch on — that is what expired the probes' 50 s discovery budget, the
+    descendant test's 45 s CLI budget and the CLI exit-status test's 30 s spawn budget. The
+    suite's own interpreter already carries the dependencies (``run_tests.sh`` syncs
+    ``pm.testenv``), so the per-root sync is provisioning noise for a test (t_238f2d3f).
+    """
+    env = {k: os.environ[k] for k in CHILD_ENV_KEYS if k in os.environ}
+    env['HERMES_DISABLE_LAZY_INSTALLS'] = '1'
+    return env
 
 
 async def rpc(ws, method, **params):

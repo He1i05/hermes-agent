@@ -15,6 +15,21 @@ from tools.environments.local import LocalEnvironment
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def _cli_deadline() -> int:
+    """Wall-clock ceiling for ONE ``python -m hermes_cli.main`` launch.
+
+    A ceiling, not a cost: a warm launch returns in 10.8 s (measured on the 4-core Pi,
+    ``kanban list`` under a borrowed ``HERMES_HOME`` with the suite's lazy-install switch).
+    The hardcoded 45 s this replaces was below the *steady-state* cost of a launch that
+    still had to prepare this data root's dependencies (>60 s, killed mid-install — see
+    ``tests/gateway/fixtures/local_recovery_probe.py:child_env``), so on a loaded host
+    ``subprocess.TimeoutExpired`` escaped before any scope assertion could run. 180 s keeps
+    a genuinely hung CLI bounded while leaving room for load dilation; env-tunable because
+    two of the ingress paths below run under allowlisted child envs (t_238f2d3f).
+    """
+    return max(1, int(os.environ.get("KANBAN_DESCENDANT_CLI_DEADLINE", "180")))
+
+
 def _worker_board(tmp_path, monkeypatch):
     db = tmp_path / "assigned.db"
     conn = connect(db)
@@ -34,6 +49,7 @@ def _worker_board(tmp_path, monkeypatch):
 
 def test_terminal_descendants_cannot_mutate_even_after_task_is_removed(tmp_path, monkeypatch):
     conn, own, foreign = _worker_board(tmp_path, monkeypatch)
+    deadline = _cli_deadline()
     script = tmp_path / "descendant.py"
     script.write_text(
         "import os, sys, json, subprocess\n"
@@ -46,7 +62,7 @@ def test_terminal_descendants_cannot_mutate_even_after_task_is_removed(tmp_path,
         "out['show'] = json.loads(kt._handle_show({'task_id':own}))\n"
         "out['tools'] = [json.loads(kt._handle_complete({'task_id': t, 'summary':'must refuse'})) for t in (own,foreign)]\n"
         "os.environ.pop('HERMES_KANBAN_TASK', None)\n"
-        f"p = subprocess.run([sys.executable, '-m', 'hermes_cli.main', 'kanban', 'complete', foreign, '--result', 'must refuse'], cwd={str(ROOT)!r}, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=45)\n"
+        f"p = subprocess.run([sys.executable, '-m', 'hermes_cli.main', 'kanban', 'complete', foreign, '--result', 'must refuse'], cwd={str(ROOT)!r}, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout={deadline!r})\n"
         "out['later_cli'] = {'rc': p.returncode, 'out':p.stdout, 'err':p.stderr}\n"
         "print('SCOPE_RESULT=' + json.dumps(out))\n"
     )
@@ -61,15 +77,19 @@ def test_terminal_descendants_cannot_mutate_even_after_task_is_removed(tmp_path,
     from tools.mcp_tool_config import _build_safe_env
 
     command = f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}"
-    outputs = [result.get("output", ""), run_inline_shell(command, tmp_path, 45),
-               _spawn(ShellHookSpec(event="session:start", command=command, timeout=45), "{}")['stdout']]
+    outputs = [result.get("output", ""), run_inline_shell(command, tmp_path, deadline),
+               _spawn(ShellHookSpec(event="session:start", command=command, timeout=deadline), "{}")['stdout']]
     child_envs = [
         _build_child_env(rpc_endpoint="fixture", rpc_token="fixture", tmpdir=str(tmp_path), child_python=sys.executable),
         _build_safe_env({"HERMES_HOME": os.environ["HERMES_HOME"]}),
     ]
     for env in child_envs:
+        # Both builders are allowlists and drop HERMES_*; without the suite's lazy-install
+        # switch the generated CLI re-syncs this data root's dependencies before it runs
+        # (>60 s measured, see _cli_deadline).
+        env["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
         proc = subprocess.run([sys.executable, str(script)], env=env, cwd=tmp_path,
-                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=45, check=False)
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=deadline, check=False)
         assert proc.returncode == 0, proc.stderr
         outputs.append(proc.stdout)
     for output in outputs:
@@ -88,11 +108,12 @@ def test_terminal_descendants_cannot_mutate_even_after_task_is_removed(tmp_path,
 
 def test_worker_cli_cannot_use_foreign_task_to_drop_run_scope(tmp_path, monkeypatch):
     conn, own, foreign = _worker_board(tmp_path, monkeypatch)
+    deadline = _cli_deadline()
     assert "error" in json.loads(kanban_tools._handle_complete({"task_id": foreign, "summary": "no"}))
     proc = subprocess.run(
         [sys.executable, "-m", "hermes_cli.main", "kanban", "complete", foreign, "--result", "no"],
         cwd=ROOT, env=dict(os.environ), stdin=subprocess.DEVNULL,
-        capture_output=True, text=True, timeout=45,
+        capture_output=True, text=True, timeout=deadline,
         check=False,
     )
     assert proc.returncode != 0 and "worker is scoped to task" in proc.stderr, (proc.stdout, proc.stderr)
@@ -103,7 +124,7 @@ def test_worker_cli_cannot_use_foreign_task_to_drop_run_scope(tmp_path, monkeypa
     for arguments in (["attach", foreign, str(attachment)], ["unblock", foreign]):
         proc = subprocess.run([sys.executable, "-m", "hermes_cli.main", "kanban", *arguments],
                               cwd=ROOT, env=dict(os.environ), stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, timeout=45, check=False)
+                              capture_output=True, text=True, timeout=deadline, check=False)
         assert proc.returncode != 0, (arguments, proc.stdout, proc.stderr)
     assert not kb.list_attachments(conn, foreign)
     assert json.loads(kanban_tools._handle_complete({"task_id": own, "summary": "parent"}))["ok"]

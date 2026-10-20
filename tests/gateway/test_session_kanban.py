@@ -6,6 +6,15 @@ from types import SimpleNamespace
 import pytest
 
 
+# Eight tests, five of which boot a real gateway daemon, dispatcher and worker. Measured on the
+# 4-core Pi: 642 s under a two-file parallel run, >300 s solo once the lazy-install opt-out is in
+# (one green probe alone is ~56 s). Under the flat 300 s cap the file was SIGKILL'd before it
+# collected and the sweep reported "no tests ran" — the miscount this declaration removes. A
+# ceiling, not a cost: a green probe returns as soon as its predicate holds, and
+# KANBAN_PROBE_TIMEOUT (boot + 4 × wait + 360) is what bounds a real hang.
+FILE_TIMEOUT_MIN_SECONDS = 2400
+
+
 def test_claim_freezes_task_policy_and_rejects_forgery(tmp_path, monkeypatch):
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect

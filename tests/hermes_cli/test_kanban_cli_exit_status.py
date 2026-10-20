@@ -12,10 +12,26 @@ from pathlib import Path
 ROOT = Path(__file__).parents[2]
 
 
+def _spawn_timeout() -> int:
+    """Ceiling for one spawned ``hermes kanban`` CLI, not a cost.
+
+    A warm launch needs ~11 s here (measured on the loaded 4-core Pi: cold interpreter plus
+    the checkout's imports). The hardcoded 30 s expired under 4-way sweep load in
+    t_97673f26's round-3 run, before any exit-status assertion could be reached — the same
+    slow-host budget class as the descendant/dialogue ceilings. Env-tunable for sweeps that
+    run on a busier host; the file's own runner ceiling still bounds a genuine hang.
+    """
+    return max(1, int(os.environ.get("KANBAN_CLI_SPAWN_TIMEOUT", "120")))
+
+
 def _run_hermes(home: Path, *args: str, marker: bool = False) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["HERMES_HOME"] = str(home)
     env["HERMES_KANBAN_HOME"] = str(home)
+    # A test-owned HERMES_HOME makes this checkout a borrowing data root, so the CLI would
+    # re-sync its dependencies per launch (>60 s measured); the suite's switch must survive
+    # the copy for the spawned process (t_238f2d3f).
+    env["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
     for name in (
         "HERMES_KANBAN_BOARD",
         "HERMES_KANBAN_DB",
@@ -34,7 +50,7 @@ def _run_hermes(home: Path, *args: str, marker: bool = False) -> subprocess.Comp
         capture_output=True,
         text=True,
         check=False,
-        timeout=30,
+        timeout=_spawn_timeout(),
     )
 
 

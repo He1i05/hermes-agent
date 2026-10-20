@@ -155,6 +155,16 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
 #     tests/gateway/test_kanban_recovery.py). They are ceilings, not costs, and
 #     they are meaningless inside the pytest process unless forwarded here —
 #     each test republishes them into its probe's whitelisted child env.
+#   * KANBAN_DESCENDANT_CLI_DEADLINE / KANBAN_CLI_SPAWN_TIMEOUT are the same
+#     class for the CLI-ingress tests (tests/tools/test_kanban_descendant_scope.py,
+#     tests/hermes_cli/test_kanban_cli_exit_status.py): ceilings for one spawned
+#     `python -m hermes_cli.main`, measured at ~11 s warm on the 4-core Pi.
+#   * HERMES_DISABLE_LAZY_INSTALLS is forwarded so a child that reaches the
+#     hermes_bootstrap launch path before pytest's conftest sets the switch
+#     (tests/conftest.py) still skips the per-data-root dependency sync. Under a
+#     test-owned HERMES_HOME the checkout is a BORROWING root and every such
+#     launch re-syncs it (>60 s measured) — the single largest slow-host cost
+#     behind the fixed budgets above (t_238f2d3f).
 #
 # These are test-infrastructure knobs, not credentials — same class as the
 # HERMES_RUN_SLOW_PET_TESTS / HERMES_E2E_BROWSER / HERMES_RUN_E2E opt-ins
@@ -172,7 +182,8 @@ for _test_var in HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
   HERMES_E2E_STRICT_ACCEPTANCE HERMES_TEST_SSH_HOST HERMES_TEST_SSH_USER HERMES_TEST_SSH_PORT \
   HERMES_TEST_SSH_KEY HERMES_TEST_DOCKER_IMAGE \
   KANBAN_PROBE_TIMEOUT KANBAN_PROBE_WAIT_BUDGET KANBAN_RECOVERY_BOOT_DEADLINE KANBAN_RECOVERY_WAIT_BUDGET \
-  KANBAN_RECOVERY_HANDSHAKE_TIMEOUT; do
+  KANBAN_RECOVERY_HANDSHAKE_TIMEOUT KANBAN_DESCENDANT_CLI_DEADLINE KANBAN_CLI_SPAWN_TIMEOUT \
+  HERMES_DISABLE_LAZY_INSTALLS; do
   if [ -n "${!_test_var:-}" ]; then
     TEST_ENV+=("$_test_var=${!_test_var}")
   fi

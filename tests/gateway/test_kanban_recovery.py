@@ -9,6 +9,15 @@ import sys
 import pytest
 
 
+# The runner's flat 300 s per-file cap cannot fit three real daemon + worker recoveries, and
+# `test_durations.json` — the only other source of a larger bound — is gitignored, so a fresh
+# checkout (and every CI runner) has nothing to scale from. Measured on the 4-core Pi:
+# 234.6 s green solo after the fixture's lazy-install opt-out, 1117-1284 s under a 4-way sweep.
+# A ceiling, not a cost: the probe returns as soon as its predicate holds, and the probe's own
+# KANBAN_RECOVERY_BOOT_DEADLINE/KANBAN_PROBE_TIMEOUT ceilings are what bound a real hang.
+FILE_TIMEOUT_MIN_SECONDS = 1500
+
+
 # The probe traces the transport client's opens with strace (Linux-only tool, Linux openat
 # flags); without it the probe cannot prove the client never opens state.db writable.
 @pytest.mark.platforms('linux')
@@ -17,6 +26,10 @@ import pytest
 def test_owner_board_recovery(tmp_path, mode):
     repo = Path(__file__).resolve().parents[2]
     env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TZ', 'TIRITH_ENABLED') if k in os.environ}
+    # Same allowlist boundary as child_env(): without the suite's lazy-install switch the
+    # probe's worker client re-syncs this borrowing data root before it ever reaches the
+    # board (see tests/gateway/fixtures/local_recovery_probe.py:child_env, t_238f2d3f).
+    env['HERMES_DISABLE_LAZY_INSTALLS'] = '1'
     # Both budgets are ceilings, not costs: a green run returns as soon as the predicate holds.
     # They are forwarded explicitly because the probe env is a whitelist, and a borrowing data
     # root's per-process dependency prep on a slow host outlasts the old hardcoded values
