@@ -62,3 +62,66 @@ def test_only_first_attempt_clean_durations_feed_the_cache() -> None:
     kept = mod._clean_pass_durations(file_times, failures, flaky_results)
 
     assert kept == [(clean, 12.0)]
+
+
+def test_declared_floor_covers_a_cost_the_cache_cannot_supply(tmp_path) -> None:
+    """A structurally slow file declares its own ceiling.
+
+    Real-daemon files need 15+ minutes even with every fast path taken, and the duration
+    cache that would scale their bound is gitignored — a fresh checkout (and every CI
+    runner) has no entry, so the flat 300s cap SIGKILL'd them before collection and the
+    summary reported "no tests ran" (t_238f2d3f). The declaration travels with the file.
+    """
+    mod = _load_runner()
+    slow = tmp_path / "test_slow_gateway.py"
+    slow.write_text(
+        '"""Real daemons."""\n'
+        "FILE_TIMEOUT_MIN_SECONDS = 2700  # measured 900s clean; 3x for load dilation\n"
+        "\n\ndef test_x():\n    assert True\n"
+    )
+    floors = mod._declared_timeout_floors([slow])
+    assert floors == {slow: 2700.0}
+
+    # No cache entry (fresh checkout / CI) → the declaration alone is the bound.
+    assert mod._effective_file_timeout(slow, REPO_ROOT, 300.0, None, floors) == 2700.0
+    assert mod._effective_file_timeout(slow, REPO_ROOT, 300.0, {}, floors) == 2700.0
+
+    # A larger cached duration still wins; a smaller one cannot lower the floor.
+    assert mod._effective_file_timeout(
+        slow, REPO_ROOT, 300.0, {mod._format_file(slow, REPO_ROOT): 1200.0}, floors
+    ) == 3600.0
+    assert mod._effective_file_timeout(
+        slow, REPO_ROOT, 300.0, {mod._format_file(slow, REPO_ROOT): 200.0}, floors
+    ) == 2700.0
+
+    # An explicit --file-timeout above the declaration also wins (max, never min).
+    assert mod._effective_file_timeout(slow, REPO_ROOT, 4000.0, None, floors) == 4000.0
+
+
+def test_missing_declaration_and_unreadable_file_add_no_floor(tmp_path) -> None:
+    mod = _load_runner()
+    plain = tmp_path / "test_plain.py"
+    plain.write_text("def test_x():\n    assert True\n")
+    assert mod._declared_timeout_floors([plain]) == {}
+    assert mod._declared_timeout_floors([tmp_path / "absent.py"]) == {}
+    assert mod._effective_file_timeout(plain, REPO_ROOT, 300.0, None, {}) == 300.0
+
+
+def test_filtered_runs_do_not_poison_the_duration_cache() -> None:
+    """A `-k`/`-m`/nodeid run measures a subset, so its per-file wall is not a duration.
+
+    Measured failure (t_238f2d3f): `-k timeout` on a 5-probe file cached 55.7s, so the next
+    full sweep sized that file at max(300, 3 × 55.7) = 300s, SIGKILL'd it before it
+    collected, and reported "no tests ran".
+    """
+    mod = _load_runner()
+    assert mod._narrows_per_file(["-k", "timeout"])
+    assert mod._narrows_per_file(["-k=timeout"])
+    assert mod._narrows_per_file(["-m", "not slow"])
+    assert mod._narrows_per_file(["--deselect", "tests/x.py::test_y"])
+    assert mod._narrows_per_file(["--deselect=tests/x.py::test_y"])
+    assert mod._narrows_per_file(["tests/gateway/test_x.py::test_y"])
+    # Whole-file runs (paths, verbosity, output flags) keep caching durations.
+    assert not mod._narrows_per_file([])
+    assert not mod._narrows_per_file(["-v", "--tb=long"])
+    assert not mod._narrows_per_file(["tests/gateway/test_x.py"])

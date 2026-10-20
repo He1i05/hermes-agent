@@ -35,6 +35,14 @@ scripts/run_tests.sh -v --tb=long                       # pytest flags pass thro
   wall-clock bounds ≥ 2s, event-based sync, no `assert not _wait_until(...)` races. A new
   non-zero `time.sleep`/`asyncio.sleep` in a test fails the ratchet (HX013): wait on an Event or
   poll with `tests.waiting.wait_until` / `async_wait_until`.
+- **A file that is structurally slow declares its own ceiling.**
+  `FILE_TIMEOUT_MIN_SECONDS = <seconds>` at module level (in the header, next to the imports) is
+  the runner's floor for that file — `scripts/run_tests_parallel.py` reads it and takes
+  `max(flat cap, declaration, 3 × cached duration)`. Use it when the cost is real daemons or real
+  CLI bootstraps rather than test count: `test_durations.json` is gitignored, so a fresh checkout
+  and every CI runner start with no cached duration and would SIGKILL such a file before it
+  collected, which the summary then reports as "no tests ran". Put the measured clean wall in the
+  trailing comment; the number must come from a run, not from a wish.
 - **Placement mirrors the source tree.** A test lives in `tests/<top-level source dir>/` (`tests/hermes_cli/`,
   `tests/agent/`, `tests/hermes_state/`, `tests/gateway/relay/`, ...); installer/updater script tests
   under `tests/scripts/{install,desktop_update}/`. Only tests of root-level modules (`batch_runner`,

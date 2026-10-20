@@ -144,6 +144,31 @@ _SKIP_PARTS = {"integration", "e2e", "docker"}
 # time while keeping a genuinely hung file bounded.
 _DEFAULT_FILE_TIMEOUT_SECONDS = 300.0
 
+# A test module whose cost is structurally above the flat cap declares its own floor:
+#
+#     FILE_TIMEOUT_MIN_SECONDS = 2700    # measured 900s clean; 3× for load dilation
+#
+# The duration cache below cannot cover this case on its own: it is gitignored and local,
+# so a fresh checkout — and every CI runner — has no entry and applies the bare cap to a
+# file that needs 15+ minutes of real daemons. Such a file is then SIGKILL'd before it
+# collects, which the summary reports as "no tests ran" and a reader chases as a
+# collection error. A declaration travels with the file that needs it, cannot drift across
+# a rename, and is auditable in the diff that adds the slow test.
+#
+# Read from the first _DECLARATION_READ_BYTES of the module — the constant is expected in
+# the header next to the imports, and the runner already parses these sources for test
+# counts (see _approximately_count_tests), so this is the same class of cheap scan.
+_DECLARATION_READ_BYTES = 4096
+_DECLARED_TIMEOUT_RE = re.compile(
+    r"^FILE_TIMEOUT_MIN_SECONDS\s*=\s*(\d+(?:\.\d+)?)\s*(?:#.*)?$", re.MULTILINE
+)
+
+# Pass-through pytest flags that select a SUBSET of the tests inside each file. Their
+# wall time describes the subset, never the file, so such a run must not write the
+# duration cache (see _narrows_per_file).
+_NARROWING_FLAGS = frozenset({"-k", "-m", "--deselect", "--ignore", "--lf", "--last-failed",
+                              "--ff", "--failed-first"})
+
 # One-shot retry of failing test FILES. A file that exits non-zero is re-run
 # once in a fresh subprocess; if the re-run passes, the file counts as passed
 # but is loudly reported as FLAKY so it gets fixed rather than hidden.
@@ -491,11 +516,50 @@ def _kill_detached_leftovers(temproot: str) -> None:
             continue
 
 
+def _declared_timeout_floors(files: list[Path]) -> dict[Path, float]:
+    """Read each test module's own ``FILE_TIMEOUT_MIN_SECONDS`` floor, if it declares one.
+
+    Missing/unreadable file, no declaration, or a non-numeric value → no entry (the flat
+    cap applies). This never lowers a bound: callers take ``max`` against the flat cap.
+    """
+    floors: dict[Path, float] = {}
+    for path in files:
+        try:
+            with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
+                head = handle.read(_DECLARATION_READ_BYTES)
+        except OSError:
+            continue
+        match = _DECLARED_TIMEOUT_RE.search(head)
+        if match:
+            floors[path] = float(match.group(1))
+    return floors
+
+
+def _narrowing_flags(pytest_args: list[str]) -> list[str]:
+    """The pass-through arguments that make a run measure only PART of each file."""
+    return [arg for arg in pytest_args
+            if arg in _NARROWING_FLAGS or arg.startswith(("--deselect=", "--ignore=", "-k=", "-m="))]
+
+
+def _narrows_per_file(pytest_args: list[str]) -> bool:
+    """True when this invocation restricts which tests inside each file run.
+
+    A narrowed run's per-file wall is the cost of the subset, not of the file, so it must
+    not feed the duration cache that sizes the per-file timeout (see the cache write in
+    main()). Positional roots are NOT narrowing — the runner already resolves those into
+    ``files``; node ids (``path::test``) are.
+    """
+    return bool(_narrowing_flags(pytest_args)) or any(
+        not arg.startswith("-") and "::" in arg for arg in pytest_args
+    )
+
+
 def _effective_file_timeout(
     file: Path,
     repo_root: Path,
     file_timeout: float,
     durations: dict[str, float] | None,
+    declared_floors: dict[Path, float] | None = None,
 ) -> float:
     """Scale the per-file timeout for files whose last observed runtime
     approaches the flat cap.
@@ -512,13 +576,24 @@ def _effective_file_timeout(
     without a cache entry keep the flat cap. This only ever *raises* the
     bound — a genuinely hung file is still killed, just with headroom
     proportional to its known-good runtime.
+
+    A file may also declare its own floor (``FILE_TIMEOUT_MIN_SECONDS``) for costs the
+    cache cannot know about on a fresh checkout — a file that boots real daemons for
+    minutes has no cached entry on CI, and the bare cap would SIGKILL it before it
+    collects. The declaration is a floor under the same ``max``, so it cannot lower a
+    bound either.
     """
+    base = file_timeout
+    if declared_floors:
+        declared = declared_floors.get(file)
+        if declared:
+            base = max(base, float(declared))
     if not durations:
-        return file_timeout
+        return base
     cached = durations.get(_format_file(file, repo_root))
     if not cached:
-        return file_timeout
-    return max(file_timeout, float(cached) * 3.0)
+        return base
+    return max(base, float(cached) * 3.0)
 
 
 def _clean_pass_durations(
@@ -1538,13 +1613,14 @@ def main() -> int:
         # proportional headroom instead of a false timeout-kill under
         # CI load (see _effective_file_timeout).
         timeout_durations = _load_durations(repo_root)
+        timeout_floors = _declared_timeout_floors(files)
         futures: list[Future] = []
         for file in files:
             t0 = time.monotonic()
             fut = pool.submit(
                 _run_one_file, file, pytest_passthrough, repo_root,
                 _effective_file_timeout(
-                    file, repo_root, args.file_timeout, timeout_durations
+                    file, repo_root, args.file_timeout, timeout_durations, timeout_floors
                 ),
                 args.file_retries,
             )
@@ -1615,10 +1691,20 @@ def main() -> int:
     # Save durations for future runs (LPT slicing and the per-file timeout
     # scaler, see _effective_file_timeout). _save_durations merges with any
     # existing cache so entries from previous runs aren't lost.
+    #
+    # A NARROWED run (``-k``/``-m``/``--deselect``) measures a subset of each file, so its
+    # wall time is not that file's duration. Writing it anyway poisons the scaler: one
+    # `-k timeout` run of a 5-probe file cached 55.7s and the next full sweep computed
+    # max(300, 3 × 55.7) = 300 for a file that needs 642s, SIGKILL'd it before it collected,
+    # and reported "no tests ran" (t_238f2d3f). Keep the previous entries instead.
     clean_times = _clean_pass_durations(
         file_times, failures, _FLAKY_RESULTS,
     )
-    if clean_times:
+    if clean_times and _narrows_per_file(pytest_passthrough):
+        print(f"  Durations NOT cached: this run was filtered by "
+              f"{' '.join(_narrowing_flags(pytest_passthrough))} (partial-file walls, see "
+              f"_effective_file_timeout)")
+    elif clean_times:
         _save_durations(clean_times, repo_root)
         print(f"  Durations cached to {_DURATIONS_FILE} ({len(clean_times)} files)")
 
