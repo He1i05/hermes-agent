@@ -62,9 +62,20 @@ def test_real_dispatcher_lifecycle(tmp_path, mode):
     repo = Path(__file__).resolve().parents[2]
     from tests.gateway.fixtures.local_recovery_probe import child_env
     env = child_env()
-    env.update(HOME=str(tmp_path / 'home'), USERPROFILE=str(tmp_path / 'home'), HERMES_HOME=str(tmp_path / 'state'), PYTHONPATH=str(repo), KANBAN_PROBE_MODE=mode)
+    # The probe boots a real daemon out of a borrowing data root (its first boot syncs a
+    # venv) and then drives one full dispatch lifecycle: a green run takes ~153 s on a
+    # loaded 4-core host, so the old hardcoded 150 s cap cut it short by three seconds
+    # (t_97673f26 item 3). Ceilings, not costs — a green run returns as soon as its
+    # predicate holds. The outer cap is derived from the probe's own boot deadline so the
+    # parent can never fire before the probe's ceiling, and the budgets are forwarded
+    # explicitly because the probe env is a whitelist (an inherited value could not reach it).
+    boot = int(os.environ.get('KANBAN_RECOVERY_BOOT_DEADLINE', '420'))
+    env.update(HOME=str(tmp_path / 'home'), USERPROFILE=str(tmp_path / 'home'), HERMES_HOME=str(tmp_path / 'state'), PYTHONPATH=str(repo), KANBAN_PROBE_MODE=mode,
+               KANBAN_RECOVERY_BOOT_DEADLINE=str(boot),
+               KANBAN_RECOVERY_HANDSHAKE_TIMEOUT=os.environ.get('KANBAN_RECOVERY_HANDSHAKE_TIMEOUT', '60'))
+    timeout = int(os.environ.get('KANBAN_PROBE_TIMEOUT', str(boot + 120)))
     result = subprocess.run([sys.executable, str(Path(__file__).parent / 'fixtures' / 'kanban_owner_probe.py')],
-        env=env, cwd=repo, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=150, check=False)
+        env=env, cwd=repo, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout, check=False)
     assert result.returncode == 0, result.stdout + result.stderr
     receipt = json.loads((tmp_path / 'state' / 'receipt.json').read_text())
     print(json.dumps(receipt))
