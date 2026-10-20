@@ -66,15 +66,21 @@ def test_real_dispatcher_lifecycle(tmp_path, mode):
     # venv) and then drives one full dispatch lifecycle: a green run takes ~153 s on a
     # loaded 4-core host, so the old hardcoded 150 s cap cut it short by three seconds
     # (t_97673f26 item 3). Ceilings, not costs — a green run returns as soon as its
-    # predicate holds. The outer cap is derived from the probe's own boot deadline so the
-    # parent can never fire before the probe's ceiling, and the budgets are forwarded
-    # explicitly because the probe env is a whitelist (an inherited value could not reach it).
+    # predicate holds. The parent cap is derived from the probe's OWN ceiling chain so it
+    # outlasts it: boot (local_recovery_probe.daemon) + the four budget() waits in
+    # kanban_owner_probe.py (release at :36, timeout-mode arrival at :115, wait_for at
+    # :122, arrival at :137) + the lifecycle tail. Deriving it from boot alone was wrong:
+    # at boot + 120 s (540 s) it fired on mode=billing while the probe's own chain still
+    # had ceilings ahead of it (3600 s sweep at c6b00422ea, t_97673f26 round 3). The
+    # budgets are forwarded explicitly because the probe env is a whitelist (an inherited
+    # value could not reach it).
     boot = int(os.environ.get('KANBAN_RECOVERY_BOOT_DEADLINE', '420'))
+    wait = int(os.environ.get('KANBAN_PROBE_WAIT_BUDGET', '300'))
     env.update(HOME=str(tmp_path / 'home'), USERPROFILE=str(tmp_path / 'home'), HERMES_HOME=str(tmp_path / 'state'), PYTHONPATH=str(repo), KANBAN_PROBE_MODE=mode,
                KANBAN_RECOVERY_BOOT_DEADLINE=str(boot),
                KANBAN_RECOVERY_HANDSHAKE_TIMEOUT=os.environ.get('KANBAN_RECOVERY_HANDSHAKE_TIMEOUT', '60'),
-               KANBAN_PROBE_WAIT_BUDGET=os.environ.get('KANBAN_PROBE_WAIT_BUDGET', '300'))
-    timeout = int(os.environ.get('KANBAN_PROBE_TIMEOUT', str(boot + 120)))
+               KANBAN_PROBE_WAIT_BUDGET=str(wait))
+    timeout = int(os.environ.get('KANBAN_PROBE_TIMEOUT', str(boot + 4 * wait + 360)))
     result = subprocess.run([sys.executable, str(Path(__file__).parent / 'fixtures' / 'kanban_owner_probe.py')],
         env=env, cwd=repo, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout, check=False)
     assert result.returncode == 0, result.stdout + result.stderr
