@@ -271,6 +271,84 @@ def test_t4_hermetic_temp_path_allowed(kanban_home, monkeypatch):
     assert tid
 
 
+# --- T5: gateway-adoption split (submitted worker vs bound interpreter) ------
+#
+# 5aeba055f2 splits the claim across two processes: the dispatcher spawns a
+# bare submitter (`hermes_cli.kanban_worker_client`, which holds
+# `tasks.worker_pid` for reclaim/kill) while the adopted interpreter
+# (`agent.managed_worker`, which runs the tools and evaluates this guard) is a
+# DIFFERENT gateway child, bound by `gateway.session_kanban.bind_worker_context`
+# via a durable `worker_bound` task event (its pid + process fingerprint). A
+# standalone probe launched from a worker shell is a THIRD process: it has no
+# `worker_bound` event binding its own pid+fingerprint, so it stays refused.
+
+def _worker_bound(conn, tid, run_id, pid, started_at):
+    kb._append_event(
+        conn, tid, "worker_bound", {"pid": int(pid), "claim_lock": f"{_hostname()}:0", "started_at": started_at},
+        run_id=int(run_id),
+    )
+
+
+def test_t5_adopted_interpreter_allowed(kanban_home, monkeypatch):
+    """The bound interpreter pid differs from tasks.worker_pid (the submitted
+    worker) yet the board binds THIS process => allow. This is the production
+    shape of every `kanban_*` tool call in a dispatched worker."""
+    from hermes_cli.kanban_db_dispatch import _process_fingerprint
+
+    bound_pid = os.getpid()
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="adopted", assignee="w1")
+        run_id = _claim_as_dispatcher(conn, tid, worker_pid=os.getpid() + 1)
+        _worker_bound(conn, tid, run_id, bound_pid, _process_fingerprint(bound_pid))
+    _arm_live_board(monkeypatch, kanban_home, in_test=False)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    before = _count_rows()
+    with kbc.connect() as conn:
+        assert kg.is_claimed_worker(conn=conn) is True
+        with kbc.write_txn(conn):
+            conn.execute("UPDATE tasks SET body=? WHERE id=?", ("interpreter ok", tid))
+    assert _count_rows() == before  # mutation only
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).body == "interpreter ok"
+
+
+def test_t5_adopted_interpreter_probe_without_binding_refused(kanban_home, monkeypatch):
+    """The split shape must NOT open the guard to the probe: a process with the
+    worker's pins and a mismatching worker_pid but NO worker_bound binding for
+    its own pid+fingerprint is still refused (T1c2 under 5aeba055f2)."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="split probe", assignee="w1")
+        _claim_as_dispatcher(conn, tid, worker_pid=os.getpid() + 1)
+    _arm_live_board(monkeypatch, kanban_home, in_test=False)
+    before = _count_rows()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    with pytest.raises(RuntimeError) as ei:
+        with kbc.connect() as conn:
+            kg.is_claimed_worker(conn=conn)
+            kb.create_task(conn, title="probe-t5b", assignee="w1")
+    assert kg.KANBAN_WRITE_GUARD_MARK in str(ei.value)
+    assert _count_rows() == before
+
+
+def test_t5_adopted_interpreter_recycled_fingerprint_refused(kanban_home, monkeypatch):
+    """A worker_bound event naming THIS pid but bound to a DIFFERENT process
+    instance (pid recycled after a crash; fingerprint never matches) is not
+    ownership: refuse."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="recycled bind", assignee="w1")
+        run_id = _claim_as_dispatcher(conn, tid, worker_pid=os.getpid() + 1)
+        _worker_bound(conn, tid, run_id, os.getpid(), "gone-boot-epoch|123")
+    _arm_live_board(monkeypatch, kanban_home, in_test=False)
+    before = _count_rows()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    with pytest.raises(RuntimeError) as ei:
+        with kbc.connect() as conn:
+            kg.is_claimed_worker(conn=conn)
+            kb.create_task(conn, title="probe-t5c", assignee="w1")
+    assert kg.KANBAN_WRITE_GUARD_MARK in str(ei.value)
+    assert _count_rows() == before
+
+
 # --- Wave-1/2 regression: bare pytest must still refuse the live board -------
 
 def test_regression_bare_pytest_live_board_refused(kanban_home, monkeypatch):

@@ -439,7 +439,13 @@ def is_claimed_worker(env: Optional[dict] = None, conn: Optional[sqlite3.Connect
 
     ``HERMES_KANBAN_TASK`` resolves to a task whose CURRENT run row (via
     ``tasks.current_run_id``) is ``status='running'``, has not expired, and is
-    OWNED by this process — meaning ``tasks.worker_pid == os.getpid()``.
+    OWNED by this process — meaning ``tasks.worker_pid == os.getpid()``, OR
+    (gateway-adoption dispatch, 5aeba055f2) the board binds this process as the
+    run's adopted interpreter via a ``worker_bound`` task event whose pid AND
+    process fingerprint (``kanban_db_dispatch._process_fingerprint``) match this
+    live process (:func:`_is_bound_interpreter`). The submitter-vs-interpreter
+    split keeps ``tasks.worker_pid`` on the reclaim/kill handle, so the
+    fingerprint match is the only admission for the tool-running interpreter.
 
     Ownership is keyed on ``tasks.worker_pid`` (NOT on ``claim_lock ==
     _claimer_id()``): the dispatcher's claim path writes ``claim_lock`` with the
@@ -486,7 +492,17 @@ def is_claimed_worker(env: Optional[dict] = None, conn: Optional[sqlite3.Connect
         if row["run_exp"] is not None and int(row["run_exp"]) < int(time.time()):
             return False  # Claim expired => stale => probe.
         if row["t_pid"] is not None and int(row["t_pid"]) != os.getpid():
-            return False  # Run is owned by a different pid => standalone probe.
+            # Under gateway-adoption dispatch (5aeba055f2) ``tasks.worker_pid`` names
+            # the dispatcher's spawned SUBMITTER (``kanban_worker_client`` — the
+            # reclaim/kill handle), while the adopted interpreter that runs the
+            # tools and evaluates this guard is a separate gateway child bound by
+            # ``gateway.session_kanban.bind_worker_context`` via a durable
+            # ``worker_bound`` task event (its pid + process fingerprint). A
+            # standalone probe launched from a worker shell is a THIRD process: it
+            # has no binding whose pid+fingerprint matches ITS OWN live process, so
+            # the fingerprint match below keeps the wave-3 vector closed.
+            if not _is_bound_interpreter(conn, task_pin, _row_get(row, "run_id")):
+                return False  # Run is owned by a different pid => standalone probe.
         # Validated worker claim: remember it so the post-completion window is
         # admissible. Recorded on BOTH allow paths (proven pid match, and the
         # loose `worker_pid IS NULL` case the dispatcher leaves behind when
@@ -499,6 +515,48 @@ def is_claimed_worker(env: Optional[dict] = None, conn: Optional[sqlite3.Connect
         return True
     except Exception:
         return True  # I5: fail-safe on any claim-read error.
+
+
+def _is_bound_interpreter(conn: sqlite3.Connection, task_pin: str, run_id: Any) -> bool:
+    """True when the board records THIS exact process as the run's adopted interpreter.
+
+    Gateway-adoption dispatch (5aeba055f2) splits the claim across two processes:
+    the dispatcher's spawned submitter (``kanban_worker_client``) keeps
+    ``tasks.worker_pid`` (reclaim / timeout / operator kills target it), while
+    ``gateway.session_kanban.bind_worker_context`` binds the adopted interpreter —
+    the process that runs the tools and evaluates this guard — with a durable
+    ``worker_bound`` task event carrying its pid AND its restart-stable process
+    fingerprint (``kanban_db_dispatch._process_fingerprint``).
+
+    The fingerprint is the discriminator that keeps the wave-3 vector closed: a
+    standalone probe launched from a worker shell has a different pid (no binding
+    names it) and, after any crash/pid-recycle, a matching pid alone is never
+    enough because ``started_at`` cannot equal a different process instance's
+    fingerprint. A probe could raw-SQL a fabricated event, but that is forgery —
+    this guard's threat model (accidental writes, not active adversaries) does not
+    extend to board-level forgeries. Fail-safe: unreadable fingerprint => False.
+    """
+    from hermes_cli.kanban_db_dispatch import UNVERIFIED_WORKER_FINGERPRINT, _process_fingerprint
+
+    try:
+        mine = _process_fingerprint(os.getpid())
+        if mine is None or mine == UNVERIFIED_WORKER_FINGERPRINT:
+            return False
+        rows = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND run_id = ? AND kind = 'worker_bound' ORDER BY id DESC",
+            (task_pin, run_id),
+        ).fetchall()
+    except Exception:
+        return False
+    for r in rows:
+        try:
+            payload = json.loads(_row_get(r, "payload") or "")
+        except (TypeError, ValueError):
+            continue
+        if payload.get("pid") == os.getpid() and payload.get("started_at") == mine:
+            return True
+    return False
 
 
 def _row_get(row: Any, key: str, default: Any = None) -> Any:
@@ -572,7 +630,8 @@ def _raise_guard(resolved: Path, op: str, *, test_context: bool) -> None:
         f"(HERMES_KANBAN_DB / HERMES_KANBAN_HOME) wins over HERMES_HOME, so "
         f"redirecting HERMES_HOME is NOT sufficient isolation. Fix: run via "
         f"scripts/run_tests.sh, ensure the write is made by the task's actual "
-        f"dispatched worker process (matching tasks.worker_pid), or scrub ALL "
+        f"dispatched worker process (matching tasks.worker_pid, or its "
+        f"worker_bound bound interpreter), or scrub ALL "
         f"HERMES_KANBAN_* pins before importing kanban_db. See #69283 / "
         f"QUEST t_2fd6e188."
     )
