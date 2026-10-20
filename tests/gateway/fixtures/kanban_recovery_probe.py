@@ -14,6 +14,7 @@ import time
 
 from kanban_owner_probe import Model as BaseModel
 from local_recovery_probe import daemon, websocket, rpc
+from probe_budgets import PROBE_WAIT_DEFAULT as RECOVERY_WAIT_DEFAULT, recovery_parent_cap as parent_cap
 
 
 class Model(BaseModel):
@@ -66,19 +67,56 @@ def main():
             clients.append(child)
             return child
         return original_popen(*args, **kwargs)
-    def wait_for(predicate):
+    def diagnostics(cause, started):
+        """Attribute an expired ceiling or a short-circuited discovery.
+
+        The sweep prints only the last 30 lines of a failed file and pytest deletes this
+        probe's temp root, so 'Owner failed to discover dispatcher board' has to carry its own
+        evidence: whether the spawned client exited early (and with what rc), what the board
+        booked for the run, what the client itself logged, and the daemon log tail. Without
+        this the recovery flake was unattributable from a sweep log (t_238f2d3f round 1).
+        """
+        def tail(path, lines=10):
+            try:
+                return '\n'.join(path.read_text(errors='replace').splitlines()[-lines:])
+            except OSError:
+                return '<no log>'
+        try:
+            row = kb.get_task(conn, tid)
+            if row is None:
+                raise LookupError('task row missing')
+            task_state = {'status': row.status, 'claim_lock': row.claim_lock, 'run_id': row.current_run_id,
+                          'worker_pid': row.worker_pid, 'failures': row.consecutive_failures,
+                          'worker_alive': kb._pid_alive(row.worker_pid) if row.worker_pid else None}
+        except Exception as exc:  # a diagnostic must never mask the failure it explains
+            task_state = {'error': repr(exc)}
+        logs = {path.name: tail(path) for path in sorted(kb.worker_logs_dir(board='owned').glob('*.log'))}
+        for name in ('first.log', 'restart.log'):
+            if (home / name).exists():
+                logs[name] = tail(home / name)
+        try:
+            admissions = admission()
+        except Exception as exc:
+            admissions = {'error': repr(exc)}
+        return {'cause': cause, 'mode': mode, 'elapsed_s': round(time.monotonic() - started, 1),
+                'budget_s': int(os.environ.get('KANBAN_RECOVERY_WAIT_BUDGET', str(RECOVERY_WAIT_DEFAULT))),
+                'client_rc': [p.poll() for p in clients], 'model_requests': len(peer.requests),
+                'task': task_state, 'admission': admissions,
+                'load1': [round(os.getloadavg()[0], 2)] if hasattr(os, 'getloadavg') else None,
+                'logs': logs}
+
+    def wait_for(predicate, what='predicate'):
         # A worker spawned from a borrowing data root finishes its per-process dependency prep
         # before it reaches the board (venv_sync design: 'preparing dependencies for this data
         # root'); on slow hosts that alone outlasts the 50 s this used to hardcode, so the
-        # budget is env-tunable like the boot deadline (t_97673f26 item 2). Defaults keep the
-        # old value: only a caller that measured a longer prep raises it.
-        until = time.monotonic() + int(os.environ.get('KANBAN_RECOVERY_WAIT_BUDGET', '50'))
+        # budget is env-tunable like the boot deadline (t_97673f26 item 2).
+        started = time.monotonic()
+        until = started + int(os.environ.get('KANBAN_RECOVERY_WAIT_BUDGET', str(RECOVERY_WAIT_DEFAULT)))
         while time.monotonic() < until:
             if predicate():
                 return
             time.sleep(.05)
-        raise AssertionError(('deadline', receipt, [p.poll() for p in clients],
-                              list((home / 'shared').rglob('*.log'))))
+        raise AssertionError(('deadline', what, diagnostics('deadline', started)))
     def admission():
         with closing(sqlite3.connect((owner / 'state.db').as_uri() + '?mode=ro', uri=True)) as db:
             db.row_factory = sqlite3.Row
@@ -120,8 +158,15 @@ def main():
                 task = kb.get_task(conn, tid)
                 params = dict(board='owned', task_id=tid, run_id=task.current_run_id, claim_lock=task.claim_lock,
                               db=str(board_path.resolve()))
-                wait_for(lambda: peer.blocked.is_set() or any(p.poll() is not None for p in clients))
-                assert peer.blocked.is_set(), 'Owner failed to discover dispatcher board'
+                discovery_at = time.monotonic()
+                wait_for(lambda: peer.blocked.is_set() or any(p.poll() is not None for p in clients),
+                         'dispatcher discovery')
+                if not peer.blocked.is_set():
+                    # The predicate short-circuits on a client that exited before its first model
+                    # call, so name the rc and the client's own log rather than the symptom.
+                    raise AssertionError(('Owner failed to discover dispatcher board',
+                                          diagnostics('early-client-exit', discovery_at)))
+                receipt['discovery_seconds'] = round(time.monotonic() - discovery_at, 1)
                 first = admission()
                 receipt.update(session_id=first['target_session_id'], run_id=task.current_run_id, claim_lock=task.claim_lock)
                 if mode == 'restart':
@@ -135,8 +180,8 @@ def main():
                     assert not swept.spawned and kb.get_task(conn, tid).current_run_id == task.current_run_id
                 else:
                     peer.release.set()
-                    wait_for(lambda: admission()['status'] == 'terminal')
-                    wait_for(lambda: kb.get_task(conn, tid).status == 'done')
+                    wait_for(lambda: admission()['status'] == 'terminal', 'admission terminal')
+                    wait_for(lambda: kb.get_task(conn, tid).status == 'done', 'task done')
                     assert asyncio.run(retry(desc, params))['session_id'] == first['target_session_id']
             if mode == 'restart':
                 cfg['model']['default'] = 'changed-default'
@@ -153,7 +198,7 @@ def main():
                         assert private['db'] == str(board_path.resolve()) and private['claim_lock'] == task.claim_lock
                     # The attempt's interpreter and its spawned worker are both gone: an ordinary crash,
                     # booked once and re-queued once (same as a killed one-shot worker), never duplicated.
-                    wait_for(lambda: all(p.poll() is not None for p in clients))
+                    wait_for(lambda: all(p.poll() is not None for p in clients), 'clients exited')
                     assert len(peer.requests) == 1, peer.requests  # the restart never replays the lost call
                     conn.execute('UPDATE tasks SET claim_expires=1,last_heartbeat_at=1,max_runtime_seconds=1 WHERE id=?', (tid,))
                     conn.execute('UPDATE task_runs SET started_at=1 WHERE id=?', (task.current_run_id,))
@@ -170,7 +215,7 @@ def main():
                 receipt['crash_requeued_once'] = True
             receipt.update(inference_calls=len(peer.requests), frozen_model=peer.requests[0]['model'])
             assert peer.requests[0]['model'] == 'frozen-model'
-            wait_for(lambda: all(p.poll() is not None for p in clients))
+            wait_for(lambda: all(p.poll() is not None for p in clients), 'clients exited')
             trace = (home / 'client.strace').read_text()
             writes = [line for line in trace.splitlines() if 'state.db' in line and ('O_RDWR' in line or 'O_WRONLY' in line)]
             assert not writes, writes

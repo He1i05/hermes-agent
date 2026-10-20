@@ -40,6 +40,24 @@ async def test_explicit_remote_failure_never_ensures_local(monkeypatch):
         assert "private-test-value" not in str(caught.value)
 
 
+def test_connect_ceiling_defaults_to_production_and_is_env_tunable(monkeypatch):
+    """A loaded host may raise the loopback ws open ceiling; production still dials with 10 s.
+
+    Measured on a 4-core Pi at load 10-11: this dial took 12-13 s and the kanban worker client
+    exited before its first model call, which read as a start failure in both gateway probes
+    (t_238f2d3f). The knob is the ceiling only — an unset, non-numeric, zero or negative value
+    must leave production exactly as it was.
+    """
+    from hermes_cli.gateway_client import _connect_timeout
+    monkeypatch.delenv("HERMES_GATEWAY_CONNECT_TIMEOUT", raising=False)
+    assert _connect_timeout() == 10.0
+    monkeypatch.setenv("HERMES_GATEWAY_CONNECT_TIMEOUT", "120")
+    assert _connect_timeout() == 120.0
+    for junk in ("", "garbage", "0", "-5"):
+        monkeypatch.setenv("HERMES_GATEWAY_CONNECT_TIMEOUT", junk)
+        assert _connect_timeout() == 10.0, junk
+
+
 @pytest.mark.asyncio
 async def test_oneshot_matches_own_terminal_receipt_not_neighbor(capsys):
     from hermes_cli.gateway_chat_view import GatewayChatView

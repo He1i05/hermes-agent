@@ -11,14 +11,13 @@ import threading
 import time
 
 from local_recovery_probe import daemon, websocket, rpc
+from probe_budgets import PROBE_WAIT_DEFAULT, owner_parent_cap as parent_cap
 
 
-def budget(default=300):
-    """This probe's wait ceilings — ceilings, not costs: a green run returns as soon as its
-    predicate holds. Under a loaded 4-worker sweep the dispatched worker's first model call
-    took >55 s, and the hardcoded waits reported 'model never reached' instead of an
-    assertion (t_97673f26 item 3). Env-tunable; the calling test republishes it here because
-    this child env is a whitelist."""
+def budget(default=PROBE_WAIT_DEFAULT):
+    """This probe's arrival/discovery ceiling. Ceiling, not cost: a green run returns as soon
+    as its predicate holds. The value and its measurement live in probe_budgets.py, which the
+    calling test also imports, so the test's outer cap cannot drift under this chain."""
     return max(1, int(os.environ.get('KANBAN_PROBE_WAIT_BUDGET', default)))
 
 
@@ -104,37 +103,100 @@ def main():
             workspace_kind='dir', workspace_path=str(workspace), skills=['owned-skill'],
             goal_mode=peer.mode == 'complete', goal_max_turns=2,
             max_runtime_seconds=3600 if peer.mode == 'timeout' else None)
+
+    def diagnostics(cause, started):
+        """Attribute an expired ceiling, not just report it.
+
+        A sweep log keeps the last 30 lines of a failed file and pytest deletes this probe's
+        temp root, so a budget that expires has to explain itself here: was the spawned client
+        alive or already dead (rc), did the board book the run (status/claim/run/pid), what did
+        the worker itself log, and how loaded was the host. Without it 'model never reached'
+        was unattributable from the sweep that hit it (t_238f2d3f round 1).
+        """
+        def tail(path, lines=8):
+            try:
+                return '\n'.join(path.read_text(errors='replace').splitlines()[-lines:])
+            except OSError:
+                return '<no log>'
+        try:
+            row = kb.get_task(conn, tid)
+            if row is None:
+                raise LookupError('task row missing')
+            task_state = {'status': row.status, 'claim_lock': row.claim_lock, 'run_id': row.current_run_id,
+                          'worker_pid': row.worker_pid, 'failures': row.consecutive_failures,
+                          'worker_alive': kb._pid_alive(row.worker_pid) if row.worker_pid else None}
+        except Exception as exc:  # a diagnostic must never mask the failure it explains
+            task_state = {'error': repr(exc)}
+        logs = {path.name: tail(path) for path in sorted(kb.worker_logs_dir(board='owned').glob('*.log'))}
+        for path in (home / 'restart.log', home / 'first.log'):
+            if path.exists():
+                logs[path.name] = tail(path)
+        return {'cause': cause, 'mode': peer.mode, 'elapsed_s': round(time.monotonic() - started, 1),
+                'budget_s': budget(), 'client_rc': [p.poll() for p in clients],
+                'model_requests': len(peer.requests), 'task': task_state,
+                'load1': [round(os.getloadavg()[0], 2)] if hasattr(os, 'getloadavg') else None,
+                'logs': logs}
+
     env = dict(os.environ)
     receipt, clients = {}, []
     original_popen = subprocess.Popen
+
+    def wait_arrival():
+        """Did the worker's first model call land? False as soon as the spawned client is dead.
+
+        Waiting out the ceiling for a client that has already exited cannot succeed — the only
+        thing it buys is minutes of sweep time before the same assertion fires. Measured on the
+        loaded Pi: a worker whose ws dial timed out exits rc=1 at ~12 s, and the probe then sat
+        on its full 300 s (1800 s in the measurement run) before reporting 'model never
+        reached' (t_238f2d3f round 2).
+        """
+        until = time.monotonic() + budget()
+        while time.monotonic() < until:
+            if peer.blocked.is_set():
+                return True
+            if any(p.poll() is not None for p in clients):
+                return False
+            time.sleep(.05)
+        return False
+
+    def arrival_cause():
+        return 'early-client-exit' if any(p.poll() is not None for p in clients) else 'arrival'
     def spawn(*args, **kwargs):
+        spawned_at = time.monotonic()
         child = original_popen(*args, **kwargs)
         if 'hermes_cli.kanban_worker_client' in args[0]:
             clients.append(child)
             if peer.mode == 'timeout':
-                assert peer.blocked.wait(budget()), 'managed worker did not reach loopback'
+                if not wait_arrival():
+                    raise AssertionError(('managed worker did not reach loopback',
+                                          diagnostics(arrival_cause(), spawned_at)))
                 with closing(connect(board='owned')) as snapshot:
                     bound = snapshot.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='worker_bound' "
                                              "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
                     receipt['managed_pid'] = json.loads(bound[0])['pid'] if bound else None
+                receipt['managed_arrival_seconds'] = round(time.monotonic() - spawned_at, 1)
         return child
-    def wait_for(predicate):
-        deadline = time.monotonic() + budget()
+    def wait_for(predicate, what='predicate'):
+        started = time.monotonic()
+        deadline = started + budget()
         while time.monotonic() < deadline:
             if predicate():
                 return
             time.sleep(.05)
-        raise AssertionError(('deadline', receipt))
+        raise AssertionError(('deadline', what, diagnostics('deadline', started)))
     try:
         with daemon(root, home, env, barrier=False) as (_proc, desc):
             subprocess.Popen = spawn
             try:
                 with closing(connect(board='owned')) as conn:
+                    dispatched = time.monotonic()
                     launched = dispatch.dispatch_once(conn, board='owned', max_spawn=1)
                     assert [s[0] for s in launched.spawned] == [tid], launched
                     task = kb.get_task(conn, tid)
                     params = dict(task_id=tid, board='owned', run_id=task.current_run_id, claim_lock=task.claim_lock)
-                    assert peer.blocked.wait(budget()), 'model never reached'
+                    if not wait_arrival():
+                        raise AssertionError(('model never reached', diagnostics(arrival_cause(), dispatched)))
+                    receipt['arrival_seconds'] = round(time.monotonic() - dispatched, 1)
                     active = kb.get_task(conn, tid)
                     receipt.update(client_pid=clients[0].pid, stored_pid=active.worker_pid, run_id=task.current_run_id)
                     if peer.mode == 'timeout':
@@ -145,7 +207,7 @@ def main():
                         conn.commit()
                         swept = dispatch.dispatch_once(conn, board='owned', max_spawn=0)
                         receipt['timed_out'] = swept.timed_out
-                        wait_for(lambda: not kb._pid_alive(receipt['managed_pid']))
+                        wait_for(lambda: not kb._pid_alive(receipt['managed_pid']), 'managed worker exit')
                         receipt['managed_dead'] = True
                         assert receipt['pid_preserved'] and receipt['managed_dead'], receipt
                     elif peer.mode == 'crash':
@@ -154,8 +216,8 @@ def main():
                         os.kill(active.worker_pid, getattr(signal, 'SIGKILL', signal.SIGTERM))
                     peer.release.set()
                     if peer.mode != 'timeout':
-                        wait_for(lambda: not kb._pid_alive(active.worker_pid))
-                    wait_for(lambda: not kb._pid_alive(clients[0].pid))
+                        wait_for(lambda: not kb._pid_alive(active.worker_pid), 'worker exit')
+                    wait_for(lambda: not kb._pid_alive(clients[0].pid), 'client exit')
                     dispatch.reap_worker_zombies()
                     receipt['client_exit'] = dispatch._classify_worker_exit(clients[0].pid)
                     dispatch._recent_worker_exits.clear()

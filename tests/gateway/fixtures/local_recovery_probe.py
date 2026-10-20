@@ -13,6 +13,10 @@ import threading
 import time
 
 from websockets.asyncio.client import connect
+try:  # this module is imported both as a script (by the probes) and as a package (by tests)
+    from probe_budgets import BOOT_DEADLINE_DEFAULT, CONNECT_CEILING_DEFAULT
+except ImportError:
+    from tests.gateway.fixtures.probe_budgets import BOOT_DEADLINE_DEFAULT, CONNECT_CEILING_DEFAULT
 from tests.gateway.test_normal_runtime_boot import control
 from tests.waiting import async_wait_until
 
@@ -69,6 +73,10 @@ def child_env():
     """
     env = {k: os.environ[k] for k in CHILD_ENV_KEYS if k in os.environ}
     env['HERMES_DISABLE_LAZY_INSTALLS'] = '1'
+    # A loaded host's loopback ws dial outlasts the product's 10 s production ceiling and the
+    # worker client exits before its first model call (t_238f2d3f round 2). Ceiling, not cost.
+    env['HERMES_GATEWAY_CONNECT_TIMEOUT'] = os.environ.get(
+        'HERMES_GATEWAY_CONNECT_TIMEOUT', str(CONNECT_CEILING_DEFAULT))
     return env
 
 
@@ -101,7 +109,7 @@ def daemon(root, home, env, *, barrier, fixture='local_recovery_daemon.py'):
             # A borrowing data root syncs its own venv on first boot (venv_sync
             # design); that costs minutes on slow hosts, so the budget is
             # env-tunable instead of hardcoded (t_97673f26).
-            deadline = time.monotonic() + int(os.environ.get('KANBAN_RECOVERY_BOOT_DEADLINE', '420'))
+            deadline = time.monotonic() + int(os.environ.get('KANBAN_RECOVERY_BOOT_DEADLINE', str(BOOT_DEADLINE_DEFAULT)))
             desc = {}
             while proc.poll() is None and time.monotonic() < deadline:
                 try:

@@ -42,7 +42,12 @@ scripts/run_tests.sh -v --tb=long                       # pytest flags pass thro
   CLI bootstraps rather than test count: `test_durations.json` is gitignored, so a fresh checkout
   and every CI runner start with no cached duration and would SIGKILL such a file before it
   collected, which the summary then reports as "no tests ran". Put the measured clean wall in the
-  trailing comment; the number must come from a run, not from a wish.
+  trailing comment; the number must come from a run, not from a wish. A declaration is a module
+  constant, not an env knob: the tunable is the runner-wide `--file-timeout` /
+  `HERMES_TEST_FILE_TIMEOUT` (it can only raise), so a host that needs more than the declared floor
+  passes that flag rather than editing the file. Keep the declaration above the slowest ceiling the
+  file's own subprocesses can legitimately burn — a floor under that ceiling re-creates the
+  SIGKILL/no-tests-ran miscount this mechanism exists to remove.
 - **Placement mirrors the source tree.** A test lives in `tests/<top-level source dir>/` (`tests/hermes_cli/`,
   `tests/agent/`, `tests/hermes_state/`, `tests/gateway/relay/`, ...); installer/updater script tests
   under `tests/scripts/{install,desktop_update}/`. Only tests of root-level modules (`batch_runner`,

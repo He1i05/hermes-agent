@@ -7,12 +7,16 @@ import pytest
 
 
 # Eight tests, five of which boot a real gateway daemon, dispatcher and worker. Measured on the
-# 4-core Pi: 642 s under a two-file parallel run, >300 s solo once the lazy-install opt-out is in
-# (one green probe alone is ~56 s). Under the flat 300 s cap the file was SIGKILL'd before it
-# collected and the sweep reported "no tests ran" — the miscount this declaration removes. A
-# ceiling, not a cost: a green probe returns as soon as its predicate holds, and
-# KANBAN_PROBE_TIMEOUT (boot + 4 × wait + 360) is what bounds a real hang.
-FILE_TIMEOUT_MIN_SECONDS = 2400
+# 4-core Pi: 251.1 s for the five probes sequentially at load 1.2-5.0; 797.5 s for the whole file
+# with three gateway files in flight at load 9.2-15.2; and 1217.9 s for one attempt (2098.6 s with
+# its runner retry) in the review's loaded run. Under the flat 300 s cap the file was SIGKILL'd
+# before it collected and the sweep reported "no tests ran" — the miscount this declaration
+# removes. A ceiling, not a cost: a green probe returns as soon as its predicate holds, and the
+# probe's own chain (boot + 4 × wait + tail, fixtures/probe_budgets.owner_parent_cap = 4380 s at
+# the current defaults) is what bounds a real hang. This floor must stay above that per-param cap
+# or the runner kills the file while the probe still has ceilings ahead of it — 4800 is 6x the
+# worst single attempt measured and 2.3x the worst attempt+retry.
+FILE_TIMEOUT_MIN_SECONDS = 4800
 
 
 def test_claim_freezes_task_policy_and_rejects_forgery(tmp_path, monkeypatch):
@@ -71,25 +75,24 @@ def test_real_dispatcher_lifecycle(tmp_path, mode):
     repo = Path(__file__).resolve().parents[2]
     from tests.gateway.fixtures.local_recovery_probe import child_env
     env = child_env()
-    # The probe boots a real daemon out of a borrowing data root (its first boot syncs a
-    # venv) and then drives one full dispatch lifecycle: a green run takes ~153 s on a
-    # loaded 4-core host, so the old hardcoded 150 s cap cut it short by three seconds
-    # (t_97673f26 item 3). Ceilings, not costs — a green run returns as soon as its
-    # predicate holds. The parent cap is derived from the probe's OWN ceiling chain so it
-    # outlasts it: boot (local_recovery_probe.daemon) + the four budget() waits in
-    # kanban_owner_probe.py (release at :36, timeout-mode arrival at :115, wait_for at
-    # :122, arrival at :137) + the lifecycle tail. Deriving it from boot alone was wrong:
-    # at boot + 120 s (540 s) it fired on mode=billing while the probe's own chain still
-    # had ceilings ahead of it (3600 s sweep at c6b00422ea, t_97673f26 round 3). The
-    # budgets are forwarded explicitly because the probe env is a whitelist (an inherited
-    # value could not reach it).
-    boot = int(os.environ.get('KANBAN_RECOVERY_BOOT_DEADLINE', '420'))
-    wait = int(os.environ.get('KANBAN_PROBE_WAIT_BUDGET', '300'))
+    # The probe boots a real daemon out of a borrowing data root and then drives one full
+    # dispatch lifecycle. Ceilings, not costs — a green run returns as soon as its predicate
+    # holds. The parent cap is derived from the probe's OWN ceiling chain so it outlasts it:
+    # boot (local_recovery_probe.daemon) + the four budget() waits in kanban_owner_probe.py
+    # (release, timeout-mode managed arrival, the post-release wait_for, the arrival) + the
+    # lifecycle tail. Both numbers come from fixtures/probe_budgets.py, which the probe imports
+    # too, so the cap cannot drift under the chain. Deriving it from boot alone was wrong: at
+    # boot + 120 s (540 s) it fired on mode=billing while the probe still had 1200 s of ceilings
+    # ahead of it (3600 s sweep at c6b00422ea, t_97673f26 round 3). The budgets are forwarded
+    # explicitly because the probe env is a whitelist (an inherited value could not reach it).
+    from tests.gateway.fixtures.probe_budgets import BOOT_DEADLINE_DEFAULT, PROBE_WAIT_DEFAULT, owner_parent_cap
+    boot = int(os.environ.get('KANBAN_RECOVERY_BOOT_DEADLINE', str(BOOT_DEADLINE_DEFAULT)))
+    wait = int(os.environ.get('KANBAN_PROBE_WAIT_BUDGET', str(PROBE_WAIT_DEFAULT)))
     env.update(HOME=str(tmp_path / 'home'), USERPROFILE=str(tmp_path / 'home'), HERMES_HOME=str(tmp_path / 'state'), PYTHONPATH=str(repo), KANBAN_PROBE_MODE=mode,
                KANBAN_RECOVERY_BOOT_DEADLINE=str(boot),
                KANBAN_RECOVERY_HANDSHAKE_TIMEOUT=os.environ.get('KANBAN_RECOVERY_HANDSHAKE_TIMEOUT', '60'),
                KANBAN_PROBE_WAIT_BUDGET=str(wait))
-    timeout = int(os.environ.get('KANBAN_PROBE_TIMEOUT', str(boot + 4 * wait + 360)))
+    timeout = int(os.environ.get('KANBAN_PROBE_TIMEOUT', str(owner_parent_cap(boot, wait))))
     result = subprocess.run([sys.executable, str(Path(__file__).parent / 'fixtures' / 'kanban_owner_probe.py')],
         env=env, cwd=repo, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout, check=False)
     assert result.returncode == 0, result.stdout + result.stderr

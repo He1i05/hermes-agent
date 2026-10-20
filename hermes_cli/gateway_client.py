@@ -181,6 +181,22 @@ def _session_ticket(home: Path, endpoint, *, purpose="interactive", scope=None) 
     return grant["ticket"]
 
 
+def _connect_timeout() -> float:
+    """Ceiling for the loopback websocket open.
+
+    10 s is what production dials with. A deliberately loaded host measured 12-13 s for this
+    dial (4-core Pi at load 10-11 with three gateway test files in flight): the worker client
+    then exited rc=1 "Gateway connection failed; no local fallback" before its first model call,
+    which reads as a start failure rather than a connect timeout. Env-tunable so such a host can
+    raise the ceiling without changing what production dials with.
+    """
+    try:
+        value = float(os.environ.get("HERMES_GATEWAY_CONNECT_TIMEOUT", "") or 10)
+    except ValueError:
+        return 10.0
+    return value if value > 0 else 10.0
+
+
 @asynccontextmanager
 async def connect_gateway(endpoint=None):
     """Attach to this home's owner. ``endpoint``: an already-discovered ready owner to dial as-is
@@ -220,8 +236,8 @@ async def connect_gateway(endpoint=None):
         # The gateway is a loopback (or explicitly named) peer, never something to route through the
         # user's HTTP(S) proxy; websockets>=14 reads HTTP_PROXY/HTTPS_PROXY by default and a proxy that
         # cannot reach 127.0.0.1 turns every launch into a 10 s open timeout.
-        async with connect(url, subprotocols=protocols, open_timeout=10, max_size=8 * 1024 * 1024,
-                           proxy=None) as ws:
+        async with connect(url, subprotocols=protocols, open_timeout=_connect_timeout(),
+                           max_size=8 * 1024 * 1024, proxy=None) as ws:
             if protocols and ws.subprotocol != GATEWAY_WS_PROTOCOL:
                 raise GatewayClientError("Gateway protocol mismatch; update/restart required")
             async with GatewayClient(ws) as client:

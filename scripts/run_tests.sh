@@ -159,6 +159,9 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
 #     class for the CLI-ingress tests (tests/tools/test_kanban_descendant_scope.py,
 #     tests/hermes_cli/test_kanban_cli_exit_status.py): ceilings for one spawned
 #     `python -m hermes_cli.main`, measured at ~11 s warm on the 4-core Pi.
+#   * HERMES_GATEWAY_CONNECT_TIMEOUT is the ceiling for the worker client's loopback
+#     websocket dial (production: 10 s). The gateway probes set it for their own children;
+#     forwarding it here lets a loaded host raise it for every probe in the sweep.
 #   * HERMES_DISABLE_LAZY_INSTALLS is forwarded so a child that reaches the
 #     hermes_bootstrap launch path before pytest's conftest sets the switch
 #     (tests/conftest.py) still skips the per-data-root dependency sync. Under a
@@ -183,7 +186,7 @@ for _test_var in HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
   HERMES_TEST_SSH_KEY HERMES_TEST_DOCKER_IMAGE \
   KANBAN_PROBE_TIMEOUT KANBAN_PROBE_WAIT_BUDGET KANBAN_RECOVERY_BOOT_DEADLINE KANBAN_RECOVERY_WAIT_BUDGET \
   KANBAN_RECOVERY_HANDSHAKE_TIMEOUT KANBAN_DESCENDANT_CLI_DEADLINE KANBAN_CLI_SPAWN_TIMEOUT \
-  HERMES_DISABLE_LAZY_INSTALLS; do
+  HERMES_GATEWAY_CONNECT_TIMEOUT HERMES_DISABLE_LAZY_INSTALLS; do
   if [ -n "${!_test_var:-}" ]; then
     TEST_ENV+=("$_test_var=${!_test_var}")
   fi
