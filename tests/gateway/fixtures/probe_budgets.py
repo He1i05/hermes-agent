@@ -51,11 +51,25 @@ def owner_parent_cap(boot, wait):
     return boot + 4 * wait + LIFECYCLE_TAIL_SECONDS
 
 
+# Ceiling chains for kanban_recovery_probe.py, one entry per mode as (boots, waits). Counting
+# only the slowest mode under-derives the cap for the others: ``restart`` boots the owner twice
+# (the first attempt is killed, the second is the recovery) and needs three waits (discovery,
+# clients exited after the second boot, clients exited at the end), while ``custom`` and
+# ``cross_profile`` boot once and need four (discovery, admission terminal, task done, clients
+# exited). Deriving the cap from ``restart`` alone put those two modes' parent
+# subprocess.run() 120 s inside their own chain, so it killed the probe before its last wait
+# could assert (t_238f2d3f round 2).
+RECOVERY_CHAINS = {'custom': (1, 4), 'cross_profile': (1, 4), 'restart': (2, 3)}
+
+
 def recovery_parent_cap(boot, wait):
     """Outer cap a caller must put on kanban_recovery_probe.py.
 
-    ``restart`` boots the owner twice (the first attempt is killed, the second is the recovery)
-    and three ``wait_for`` ceilings can elapse before the receipts are complete, so the chain is
-    two boots + three waits + the tail.
+    The cap is the largest of the per-mode chains in ``RECOVERY_CHAINS`` plus the lifecycle
+    tail, so it outlasts whichever mode is running. At the current defaults that is
+    ``custom``/``cross_profile``: 420 + 4 * 900 + 360 = 4380 s, against ``restart``'s
+    2 * 420 + 3 * 900 + 360 = 3900 s.
     """
-    return 2 * boot + 3 * wait + LIFECYCLE_TAIL_SECONDS
+    return max(boots * boot + waits * wait
+               for boots, waits in RECOVERY_CHAINS.values()) + LIFECYCLE_TAIL_SECONDS
+

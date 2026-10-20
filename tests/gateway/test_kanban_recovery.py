@@ -17,9 +17,10 @@ import pytest
 # 1117-1284 s under a 4-way sweep.
 # A ceiling, not a cost: the probe returns as soon as its predicate holds, and the probe's own
 # ceilings are what bound a real hang — recovery_parent_cap(boot, wait) in
-# fixtures/probe_budgets.py = 3900 s at the current defaults for the slowest mode (restart boots
-# the owner twice). This floor sits above that cap, and 3.3x the worst file wall measured.
-FILE_TIMEOUT_MIN_SECONDS = 4200
+# fixtures/probe_budgets.py = 4380 s at the current defaults, the largest per-mode chain
+# (custom/cross_profile boot once and wait four times; restart boots twice and waits three
+# times). This floor sits above that cap, and 3.7x the worst file wall measured (1284 s).
+FILE_TIMEOUT_MIN_SECONDS = 4800
 
 
 # The probe traces the transport client's opens with strace (Linux-only tool, Linux openat
@@ -54,8 +55,8 @@ def test_owner_board_recovery(tmp_path, mode):
     # The parent's cap must outlast the probe's own chain, or a loaded host reports
     # TimeoutExpired where the probe would have asserted: in the 145-file sweep [custom] was
     # killed at the old cap == boot exactly (420 s) while its siblings passed in the same run
-    # (t_97673f26 item 2). recovery_parent_cap() derives it from that chain (two boots for
-    # restart mode + three waits + tail).
+    # (t_97673f26 item 2). recovery_parent_cap() takes the largest mode chain: custom and
+    # cross_profile boot once and wait four times, restart boots twice and waits three times.
     timeout = int(os.environ.get('KANBAN_PROBE_TIMEOUT', str(recovery_parent_cap(boot, wait))))
     result = subprocess.run([sys.executable, str(repo / 'tests/gateway/fixtures/kanban_recovery_probe.py')],
                             cwd=repo, env=env, stdin=subprocess.DEVNULL,
