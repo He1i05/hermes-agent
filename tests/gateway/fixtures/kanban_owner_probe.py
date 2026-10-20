@@ -11,7 +11,24 @@ import threading
 import time
 
 from local_recovery_probe import daemon, websocket, rpc
-from probe_budgets import PROBE_WAIT_DEFAULT, owner_parent_cap as parent_cap
+from probe_budgets import PROBE_WAIT_DEFAULT
+
+
+# Test-only fault injection: kills the first N worker clients the dispatcher spawns, right
+# after their Popen returns, so the bounded start retry below has a real transient failure to
+# recover from (tests/gateway/test_session_kanban.py drives it with 1). Zero — the default —
+# injects nothing.
+FAULT_START_EXITS_ENV = 'KANBAN_PROBE_FAULT_START_EXITS'
+
+# One re-dispatch, never a retry loop. A worker that dies before its first model call costs
+# exactly one crash the *product* books and re-queues (the booking ``mode=crash`` asserts), so
+# the probe tolerates exactly that one and lets the surviving attempt carry every assertion.
+# A second death is not a start flake — it fails with its cause, as before.
+MAX_START_ATTEMPTS = 2
+
+
+def fault_start_exits():
+    return max(0, int(os.environ.get(FAULT_START_EXITS_ENV, '0') or 0))
 
 
 def budget(default=PROBE_WAIT_DEFAULT):
@@ -104,14 +121,23 @@ def main():
             goal_mode=peer.mode == 'complete', goal_max_turns=2,
             max_runtime_seconds=3600 if peer.mode == 'timeout' else None)
 
-    def diagnostics(cause, started):
-        """Attribute an expired ceiling, not just report it.
+    def diagnostics(cause, started, tick=None):
+        """Attribute an expired ceiling, a short-circuited start or an empty dispatch tick.
 
         A sweep log keeps the last 30 lines of a failed file and pytest deletes this probe's
-        temp root, so a budget that expires has to explain itself here: was the spawned client
-        alive or already dead (rc), did the board book the run (status/claim/run/pid), what did
-        the worker itself log, and how loaded was the host. Without it 'model never reached'
-        was unattributable from the sweep that hit it (t_238f2d3f round 1).
+        temp root, so a failed predicate has to explain itself here: was the spawned client
+        alive or already dead (rc), did the board book the run (status/claim/expiry/run/pid),
+        what do the task's own event and run rows say, what did the worker log, and how loaded
+        was the host. Without it 'model never reached' was unattributable from the sweep that
+        hit it (t_238f2d3f round 1).
+
+        ``tick`` carries the DispatchResult of a tick that returned no spawn. Its skip buckets
+        cannot explain that shape: a spawn that raises inside ``dispatch_once`` is swallowed by
+        ``_dispatch_lane_task`` as a ``spawn_failed`` run with the claim released, so the caller
+        sees ``spawned=[]`` with every skip list empty and ``skipped_locked=False`` — identical
+        to "the ready lane was empty" (reproduced from primary evidence in t_6c3e6f7f: the row
+        was ``ready`` with ``claim_lock`` NULL, ``failures=1``, event ``spawn_failed``, and the
+        probe's own exception text in ``last_failure_error``).
         """
         def tail(path, lines=8):
             try:
@@ -122,24 +148,45 @@ def main():
             row = kb.get_task(conn, tid)
             if row is None:
                 raise LookupError('task row missing')
-            task_state = {'status': row.status, 'claim_lock': row.claim_lock, 'run_id': row.current_run_id,
+            task_state = {'status': row.status, 'claim_lock': row.claim_lock,
+                          'claim_expires': row.claim_expires, 'run_id': row.current_run_id,
                           'worker_pid': row.worker_pid, 'failures': row.consecutive_failures,
+                          'error': (row.last_failure_error or '')[:300],
                           'worker_alive': kb._pid_alive(row.worker_pid) if row.worker_pid else None}
         except Exception as exc:  # a diagnostic must never mask the failure it explains
             task_state = {'error': repr(exc)}
+        try:
+            # Newest first: the interesting rows are the last events before the predicate gave up.
+            events = [{'kind': event[0], 'payload': (event[1] or '')[:300]} for event in conn.execute(
+                'SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 8', (tid,))]
+            runs = [{'id': run[0], 'outcome': run[1]} for run in conn.execute(
+                'SELECT id, outcome FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 3', (tid,))]
+        except Exception as exc:
+            events = runs = [{'error': repr(exc)}]
         logs = {path.name: tail(path) for path in sorted(kb.worker_logs_dir(board='owned').glob('*.log'))}
         for path in (home / 'restart.log', home / 'first.log'):
             if path.exists():
                 logs[path.name] = tail(path)
-        return {'cause': cause, 'mode': peer.mode, 'elapsed_s': round(time.monotonic() - started, 1),
-                'budget_s': budget(), 'client_rc': [p.poll() for p in clients],
-                'model_requests': len(peer.requests), 'task': task_state,
-                'load1': [round(os.getloadavg()[0], 2)] if hasattr(os, 'getloadavg') else None,
-                'logs': logs}
+        state = {'cause': cause, 'mode': peer.mode, 'elapsed_s': round(time.monotonic() - started, 1),
+                 'budget_s': budget(), 'client_rc': [p.poll() for p in clients],
+                 'model_requests': len(peer.requests), 'task': task_state,
+                 'events': events, 'runs': runs,
+                 'load1': [round(os.getloadavg()[0], 2)] if hasattr(os, 'getloadavg') else None,
+                 'logs': logs}
+        if tick is not None:
+            state['tick'] = {'spawned': tick.spawned, 'reclaimed': tick.reclaimed,
+                             'promoted': tick.promoted, 'crashed': tick.crashed,
+                             'respawn_guarded': tick.respawn_guarded, 'auto_blocked': tick.auto_blocked,
+                             'rate_limited': tick.rate_limited, 'skipped_locked': tick.skipped_locked,
+                             'memory_pressure': tick.memory_pressure}
+        return state
 
     env = dict(os.environ)
-    receipt, clients = {}, []
+    receipt, clients = {'task_id': tid}, []
     original_popen = subprocess.Popen
+
+    def client_alive():
+        return bool(clients) and clients[-1].poll() is None
 
     def wait_arrival():
         """Did the worker's first model call land? False as soon as the spawned client is dead.
@@ -154,27 +201,26 @@ def main():
         while time.monotonic() < until:
             if peer.blocked.is_set():
                 return True
-            if any(p.poll() is not None for p in clients):
+            if not client_alive():
                 return False
             time.sleep(.05)
         return False
 
     def arrival_cause():
-        return 'early-client-exit' if any(p.poll() is not None for p in clients) else 'arrival'
+        return 'arrival' if client_alive() else 'early-client-exit'
+    fault_exits = fault_start_exits()
     def spawn(*args, **kwargs):
-        spawned_at = time.monotonic()
+        nonlocal fault_exits
         child = original_popen(*args, **kwargs)
         if 'hermes_cli.kanban_worker_client' in args[0]:
             clients.append(child)
-            if peer.mode == 'timeout':
-                if not wait_arrival():
-                    raise AssertionError(('managed worker did not reach loopback',
-                                          diagnostics(arrival_cause(), spawned_at)))
-                with closing(connect(board='owned')) as snapshot:
-                    bound = snapshot.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='worker_bound' "
-                                             "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
-                    receipt['managed_pid'] = json.loads(bound[0])['pid'] if bound else None
-                receipt['managed_arrival_seconds'] = round(time.monotonic() - spawned_at, 1)
+            if fault_exits > 0:
+                # Test-only injected transient: the client dies before its first model call, so
+                # the product books the attempt as a crash and re-queues it — the same booking
+                # mode=crash asserts. Nothing in the product is bypassed; the recovery below is
+                # an ordinary next dispatcher tick.
+                fault_exits -= 1
+                child.kill()
         return child
     def wait_for(predicate, what='predicate'):
         started = time.monotonic()
@@ -190,18 +236,53 @@ def main():
             try:
                 with closing(connect(board='owned')) as conn:
                     dispatched = time.monotonic()
-                    launched = dispatch.dispatch_once(conn, board='owned', max_spawn=1)
-                    assert [s[0] for s in launched.spawned] == [tid], launched
-                    task = kb.get_task(conn, tid)
-                    params = dict(task_id=tid, board='owned', run_id=task.current_run_id, claim_lock=task.claim_lock)
-                    if not wait_arrival():
-                        raise AssertionError(('model never reached', diagnostics(arrival_cause(), dispatched)))
+                    retries = 0
+                    while True:
+                        spawned_at = time.monotonic()
+                        launched = dispatch.dispatch_once(conn, board='owned', max_spawn=1)
+                        if retries:
+                            # What the product booked for the attempt that died: the reclaim
+                            # phase names the crash and the same tick re-spawns the card.
+                            receipt.setdefault('start_recovery', []).append(
+                                {'crashed': launched.crashed, 'reclaimed': launched.reclaimed,
+                                 'rate_limited': launched.rate_limited,
+                                 'reconciled_orphans': launched.reconciled_orphans,
+                                 'spawned': [s[0] for s in launched.spawned]})
+                        if [s[0] for s in launched.spawned] != [tid]:
+                            raise AssertionError(('dispatcher did not spawn the owned card',
+                                                  diagnostics('no-spawn', spawned_at, launched)))
+                        task = kb.get_task(conn, tid)
+                        params = dict(task_id=tid, board='owned', run_id=task.current_run_id, claim_lock=task.claim_lock)
+                        if wait_arrival():
+                            break
+                        cause = arrival_cause()
+                        if cause != 'early-client-exit' or retries >= MAX_START_ATTEMPTS - 1:
+                            raise AssertionError(('model never reached', diagnostics(cause, spawned_at)))
+                        # Bounded recovery for a worker that died before its first model call. The
+                        # product has already booked that attempt a crash and re-queued it (the
+                        # booking mode=crash asserts), so the next tick is an ordinary dispatch —
+                        # no assertion is bypassed; the surviving attempt carries them all, and
+                        # the retry is recorded in the receipt so it can never be silent.
+                        retries += 1
+                        receipt.setdefault('start_failures', []).append(diagnostics(cause, spawned_at))
                     receipt['arrival_seconds'] = round(time.monotonic() - dispatched, 1)
+                    receipt['start_retries'] = retries
                     active = kb.get_task(conn, tid)
-                    receipt.update(client_pid=clients[0].pid, stored_pid=active.worker_pid, run_id=task.current_run_id)
+                    attempt_client = clients[-1]
+                    if peer.mode == 'timeout':
+                        # The spawned client only submits the turn: the daemon binds the interpreter
+                        # that runs it, and that pid (worker_bound) is the attempt's real worker,
+                        # while the dispatcher's spawn stays the run's kill handle.
+                        with closing(connect(board='owned')) as snapshot:
+                            bound = snapshot.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+                                                     "AND kind='worker_bound' ORDER BY id DESC LIMIT 1",
+                                                     (tid, params['run_id'])).fetchone()
+                        receipt['managed_pid'] = json.loads(bound[0])['pid'] if bound else None
+                        receipt['managed_arrival_seconds'] = receipt['arrival_seconds']
+                    receipt.update(client_pid=attempt_client.pid, stored_pid=active.worker_pid, run_id=task.current_run_id)
                     if peer.mode == 'timeout':
                         # The spawned worker stays the run's handle; the owner's interpreter dies with it.
-                        receipt['pid_preserved'] = active.worker_pid == clients[0].pid != receipt['managed_pid']
+                        receipt['pid_preserved'] = active.worker_pid == attempt_client.pid != receipt['managed_pid']
                         # Deterministically elapse this owned attempt; keep real timeout/kill logic.
                         conn.execute('UPDATE task_runs SET started_at=? WHERE id=?', (int(time.time()) - 3601, task.current_run_id))
                         conn.commit()
@@ -217,9 +298,9 @@ def main():
                     peer.release.set()
                     if peer.mode != 'timeout':
                         wait_for(lambda: not kb._pid_alive(active.worker_pid), 'worker exit')
-                    wait_for(lambda: not kb._pid_alive(clients[0].pid), 'client exit')
+                    wait_for(lambda: not kb._pid_alive(attempt_client.pid), 'client exit')
                     dispatch.reap_worker_zombies()
-                    receipt['client_exit'] = dispatch._classify_worker_exit(clients[0].pid)
+                    receipt['client_exit'] = dispatch._classify_worker_exit(attempt_client.pid)
                     dispatch._recent_worker_exits.clear()
                     swept = dispatch.dispatch_once(conn, board='owned', max_spawn=0)
                     task = kb.get_task(conn, tid)
@@ -230,14 +311,17 @@ def main():
                         run_metadata=kb._json_dict(run['metadata']), rate_limited=swept.rate_limited,
                         cooldown=dispatch.check_respawn_guard(conn, tid))
                     if peer.mode in {'rate_limit', 'billing'}:
-                        assert task.status == 'ready' and task.consecutive_failures == 0 and run['outcome'] == 'rate_limited', receipt
+                        # consecutive_failures counts crashes only (a quota exit is booked without
+                        # one), so the bounded start retry's crashes are exactly what this run
+                        # spent: an exact equality, zero in the normal path.
+                        assert task.status == 'ready' and task.consecutive_failures == retries and run['outcome'] == 'rate_limited', receipt
                         assert receipt['client_exit'] == ('rate_limited', kb.KANBAN_RATE_LIMIT_EXIT_CODE), receipt
                         assert receipt['cooldown'] == 'rate_limit_cooldown', receipt
                     elif peer.mode == 'crash':
                         # Killing the spawned worker ends the attempt: one crash, re-queued, as before the owner.
-                        assert task.status == 'ready' and task.consecutive_failures == 1 and run['outcome'] == 'crashed', receipt
+                        assert task.status == 'ready' and task.consecutive_failures == 1 + retries and run['outcome'] == 'crashed', receipt
                     elif peer.mode == 'timeout':
-                        assert task.status == 'ready' and task.consecutive_failures == 1 and run['outcome'] == 'timed_out', receipt
+                        assert task.status == 'ready' and task.consecutive_failures == 1 + retries and run['outcome'] == 'timed_out', receipt
             finally:
                 subprocess.Popen = original_popen
             if peer.mode != 'complete':

@@ -14,7 +14,7 @@ import time
 
 from kanban_owner_probe import Model as BaseModel
 from local_recovery_probe import daemon, websocket, rpc
-from probe_budgets import PROBE_WAIT_DEFAULT as RECOVERY_WAIT_DEFAULT, recovery_parent_cap as parent_cap
+from probe_budgets import PROBE_WAIT_DEFAULT as RECOVERY_WAIT_DEFAULT
 
 
 class Model(BaseModel):
@@ -67,14 +67,20 @@ def main():
             clients.append(child)
             return child
         return original_popen(*args, **kwargs)
-    def diagnostics(cause, started):
-        """Attribute an expired ceiling or a short-circuited discovery.
+    def diagnostics(cause, started, tick=None):
+        """Attribute an expired ceiling, a short-circuited discovery or an empty dispatch tick.
 
         The sweep prints only the last 30 lines of a failed file and pytest deletes this
-        probe's temp root, so 'Owner failed to discover dispatcher board' has to carry its own
-        evidence: whether the spawned client exited early (and with what rc), what the board
-        booked for the run, what the client itself logged, and the daemon log tail. Without
-        this the recovery flake was unattributable from a sweep log (t_238f2d3f round 1).
+        probe's temp root, so a failed predicate has to carry its own evidence: whether the
+        spawned client exited early (and with what rc), what the board booked for the run
+        (status/claim/expiry/run/pid), the task's own event and run rows, what the client
+        itself logged, and the daemon log tail. Without this the recovery flake was
+        unattributable from a sweep log (t_238f2d3f round 1).
+
+        ``tick`` carries the DispatchResult of a tick that returned no spawn: the skip buckets
+        cannot explain that shape, because a spawn that raises inside ``dispatch_once`` is
+        swallowed as a ``spawn_failed`` run (claim released) and looks exactly like an empty
+        ready lane (t_6c3e6f7f).
         """
         def tail(path, lines=10):
             try:
@@ -85,11 +91,21 @@ def main():
             row = kb.get_task(conn, tid)
             if row is None:
                 raise LookupError('task row missing')
-            task_state = {'status': row.status, 'claim_lock': row.claim_lock, 'run_id': row.current_run_id,
+            task_state = {'status': row.status, 'claim_lock': row.claim_lock,
+                          'claim_expires': row.claim_expires, 'run_id': row.current_run_id,
                           'worker_pid': row.worker_pid, 'failures': row.consecutive_failures,
+                          'error': (row.last_failure_error or '')[:300],
                           'worker_alive': kb._pid_alive(row.worker_pid) if row.worker_pid else None}
         except Exception as exc:  # a diagnostic must never mask the failure it explains
             task_state = {'error': repr(exc)}
+        try:
+            # Newest first: the interesting rows are the last events before the predicate gave up.
+            events = [{'kind': event[0], 'payload': (event[1] or '')[:300]} for event in conn.execute(
+                'SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 8', (tid,))]
+            runs = [{'id': run[0], 'outcome': run[1]} for run in conn.execute(
+                'SELECT id, outcome FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 3', (tid,))]
+        except Exception as exc:
+            events = runs = [{'error': repr(exc)}]
         logs = {path.name: tail(path) for path in sorted(kb.worker_logs_dir(board='owned').glob('*.log'))}
         for name in ('first.log', 'restart.log'):
             if (home / name).exists():
@@ -98,12 +114,19 @@ def main():
             admissions = admission()
         except Exception as exc:
             admissions = {'error': repr(exc)}
-        return {'cause': cause, 'mode': mode, 'elapsed_s': round(time.monotonic() - started, 1),
-                'budget_s': int(os.environ.get('KANBAN_RECOVERY_WAIT_BUDGET', str(RECOVERY_WAIT_DEFAULT))),
-                'client_rc': [p.poll() for p in clients], 'model_requests': len(peer.requests),
-                'task': task_state, 'admission': admissions,
-                'load1': [round(os.getloadavg()[0], 2)] if hasattr(os, 'getloadavg') else None,
-                'logs': logs}
+        state = {'cause': cause, 'mode': mode, 'elapsed_s': round(time.monotonic() - started, 1),
+                 'budget_s': int(os.environ.get('KANBAN_RECOVERY_WAIT_BUDGET', str(RECOVERY_WAIT_DEFAULT))),
+                 'client_rc': [p.poll() for p in clients], 'model_requests': len(peer.requests),
+                 'task': task_state, 'events': events, 'runs': runs, 'admission': admissions,
+                 'load1': [round(os.getloadavg()[0], 2)] if hasattr(os, 'getloadavg') else None,
+                 'logs': logs}
+        if tick is not None:
+            state['tick'] = {'spawned': tick.spawned, 'reclaimed': tick.reclaimed,
+                             'promoted': tick.promoted, 'crashed': tick.crashed,
+                             'respawn_guarded': tick.respawn_guarded, 'auto_blocked': tick.auto_blocked,
+                             'rate_limited': tick.rate_limited, 'skipped_locked': tick.skipped_locked,
+                             'memory_pressure': tick.memory_pressure}
+        return state
 
     def wait_for(predicate, what='predicate'):
         # A worker spawned from a borrowing data root finishes its per-process dependency prep
@@ -154,7 +177,12 @@ def main():
                     launched = dispatch.dispatch_once(conn, board='owned', max_spawn=1)
                 finally:
                     subprocess.Popen = original_popen
-                assert [s[0] for s in launched.spawned] == [tid], launched
+                if [s[0] for s in launched.spawned] != [tid]:
+                    # Same attribution as the owner probe: an all-empty DispatchResult is what a
+                    # spawn that raised inside dispatch_once looks like, not an empty ready lane
+                    # (t_6c3e6f7f reproduced both shapes from primary evidence).
+                    raise AssertionError(('dispatcher did not spawn the recovery card',
+                                          diagnostics('no-spawn', time.monotonic(), launched)))
                 task = kb.get_task(conn, tid)
                 params = dict(board='owned', task_id=tid, run_id=task.current_run_id, claim_lock=task.claim_lock,
                               db=str(board_path.resolve()))
@@ -164,6 +192,13 @@ def main():
                 if not peer.blocked.is_set():
                     # The predicate short-circuits on a client that exited before its first model
                     # call, so name the rc and the client's own log rather than the symptom.
+                    # Deliberately no bounded re-dispatch here (unlike the owner probe): every
+                    # mode's assertions are single-attempt by construction — restart proves the
+                    # attempt is booked once and never replayed (`len(peer.requests) == 1`,
+                    # requeue-once), and custom/cross_profile pin the FIRST admission's session
+                    # and its frozen policy. A retry would have to relax those predicates, which
+                    # is the one thing these probes must not do. The dial ceiling the worker uses
+                    # is what keeps this from firing (probe_budgets.CONNECT_CEILING_DEFAULT).
                     raise AssertionError(('Owner failed to discover dispatcher board',
                                           diagnostics('early-client-exit', discovery_at)))
                 receipt['discovery_seconds'] = round(time.monotonic() - discovery_at, 1)

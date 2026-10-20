@@ -43,12 +43,17 @@ CONNECT_CEILING_DEFAULT = 120
 def owner_parent_cap(boot, wait):
     """Outer cap a caller must put on kanban_owner_probe.py.
 
-    The probe's own chain is the boot deadline plus four ``budget()`` waits (release, timeout
-    mode's managed arrival, the post-release wait_for, and the arrival itself) plus the
-    lifecycle tail. Deriving the cap from the boot alone is what fired at 540 s inside a chain
-    that still had 1200 s of waits ahead of it.
+    The probe's own chain is the boot deadline plus four ``budget()`` waits (release, the
+    arrival, the timeout mode's managed-worker exit, and the post-release wait_for), plus one
+    more arrival wait for the bounded start retry: ``MAX_START_ATTEMPTS`` attempts each own a
+    full ``budget()``, and the pathological case — the second client alive but never reaching
+    the model — sits out the ceiling too. Counting the retry at zero would put the caller's
+    kill inside a chain that still has a ceiling ahead of it, which is the failure class this
+    function exists to remove (t_238f2d3f round 2); the retry adds one wait, so the cap grows
+    by one (t_6c3e6f7f). Deriving the cap from the boot alone is what fired at 540 s inside a
+    chain that still had 1200 s of waits ahead of it.
     """
-    return boot + 4 * wait + LIFECYCLE_TAIL_SECONDS
+    return boot + 5 * wait + LIFECYCLE_TAIL_SECONDS
 
 
 # Ceiling chains for kanban_recovery_probe.py, one entry per mode as (boots, waits). Counting
