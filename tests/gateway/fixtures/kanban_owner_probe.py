@@ -13,6 +13,15 @@ import time
 from local_recovery_probe import daemon, websocket, rpc
 
 
+def budget(default=300):
+    """This probe's wait ceilings — ceilings, not costs: a green run returns as soon as its
+    predicate holds. Under a loaded 4-worker sweep the dispatched worker's first model call
+    took >55 s, and the hardcoded waits reported 'model never reached' instead of an
+    assertion (t_97673f26 item 3). Env-tunable; the calling test republishes it here because
+    this child env is a whitelist."""
+    return max(1, int(os.environ.get('KANBAN_PROBE_WAIT_BUDGET', default)))
+
+
 class Model(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -24,7 +33,7 @@ class Model(BaseHTTPRequestHandler):
             self.server.requests.append(body)
         if messages and not self.server.blocked.is_set():
             self.server.blocked.set()
-            assert self.server.release.wait(65)
+            assert self.server.release.wait(budget())
         if messages and self.server.mode in {'rate_limit', 'billing'}:
             payload = json.dumps({'error': {'message': 'Rate limit exceeded' if self.server.mode == 'rate_limit' else 'Insufficient quota',
                 'type': 'rate_limit_error' if self.server.mode == 'rate_limit' else 'insufficient_quota',
@@ -103,14 +112,14 @@ def main():
         if 'hermes_cli.kanban_worker_client' in args[0]:
             clients.append(child)
             if peer.mode == 'timeout':
-                assert peer.blocked.wait(55), 'managed worker did not reach loopback'
+                assert peer.blocked.wait(budget()), 'managed worker did not reach loopback'
                 with closing(connect(board='owned')) as snapshot:
                     bound = snapshot.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='worker_bound' "
                                              "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
                     receipt['managed_pid'] = json.loads(bound[0])['pid'] if bound else None
         return child
     def wait_for(predicate):
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + budget()
         while time.monotonic() < deadline:
             if predicate():
                 return
@@ -125,7 +134,7 @@ def main():
                     assert [s[0] for s in launched.spawned] == [tid], launched
                     task = kb.get_task(conn, tid)
                     params = dict(task_id=tid, board='owned', run_id=task.current_run_id, claim_lock=task.claim_lock)
-                    assert peer.blocked.wait(55), 'model never reached'
+                    assert peer.blocked.wait(budget()), 'model never reached'
                     active = kb.get_task(conn, tid)
                     receipt.update(client_pid=clients[0].pid, stored_pid=active.worker_pid, run_id=task.current_run_id)
                     if peer.mode == 'timeout':

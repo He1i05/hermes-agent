@@ -72,7 +72,8 @@ def test_real_dispatcher_lifecycle(tmp_path, mode):
     boot = int(os.environ.get('KANBAN_RECOVERY_BOOT_DEADLINE', '420'))
     env.update(HOME=str(tmp_path / 'home'), USERPROFILE=str(tmp_path / 'home'), HERMES_HOME=str(tmp_path / 'state'), PYTHONPATH=str(repo), KANBAN_PROBE_MODE=mode,
                KANBAN_RECOVERY_BOOT_DEADLINE=str(boot),
-               KANBAN_RECOVERY_HANDSHAKE_TIMEOUT=os.environ.get('KANBAN_RECOVERY_HANDSHAKE_TIMEOUT', '60'))
+               KANBAN_RECOVERY_HANDSHAKE_TIMEOUT=os.environ.get('KANBAN_RECOVERY_HANDSHAKE_TIMEOUT', '60'),
+               KANBAN_PROBE_WAIT_BUDGET=os.environ.get('KANBAN_PROBE_WAIT_BUDGET', '300'))
     timeout = int(os.environ.get('KANBAN_PROBE_TIMEOUT', str(boot + 120)))
     result = subprocess.run([sys.executable, str(Path(__file__).parent / 'fixtures' / 'kanban_owner_probe.py')],
         env=env, cwd=repo, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout, check=False)
