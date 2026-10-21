@@ -4541,6 +4541,30 @@ def _route_block(
     incoming one means blocked -> unblocked -> re-block for the same cause
     (un-typed None compares equal to a prior un-typed block). At
     ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+
+    Why ``triage`` is safe again: it is deliberately INERT. No dispatch lane
+    claims a triage card (``_lane_rows`` reads ``ready``/``review`` only) and
+    ``recompute_ready`` never promotes one (its scan tuple is
+    ``todo``/``blocked``/``scheduled``), so the breaker genuinely terminates the
+    block loop instead of respawning the card at full cost every cycle —
+    ``_has_sticky_block`` is FALSE for these cards, so the sticky-block guard
+    that protects a worker-initiated block does not protect this one. Two
+    mechanisms keep a stranded card from being silent, and neither of them moves
+    it: ``kanban-release-watchdog.py``'s notify-only ``P_triage_stranded``
+    predicate alerts on a triage card with no live claim whose newest
+    ``block_loop_detected`` event is older than ``TRIAGE_STRANDED_SECONDS``, and
+    the only two automatic movers out of ``triage`` are the decomposer's own
+    branches (``decompose_triage_task`` / ``specify_triage_task``), both gated by
+    the content-addressed ``fanout_refusal`` ledger so recovery fans out once per
+    body content instead of duplicating the graph.
+
+    Do NOT "fix" a stranded card by clearing its ``decomposed`` marker or by
+    giving ``triage`` a dispatch lane: the first re-fans the SAME body into
+    duplicate children (measured), the second re-opens the block -> recover ->
+    respawn loop this fallback exists to close. A status-only flip to
+    ``blocked`` stays invisible to both block-bucket predicates on purpose —
+    they read ``blocked``/``unblocked`` events, and the breaker wrote
+    ``block_loop_detected``.
     """
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":

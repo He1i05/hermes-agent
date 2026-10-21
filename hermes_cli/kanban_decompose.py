@@ -29,7 +29,15 @@ from hermes_cli import kanban_discovery as discovery
 from hermes_cli import kanban_m2 as m2
 from hermes_cli import kanban_streams as streams
 from hermes_cli import kanban_wiki_landing as wiki_landing
-from hermes_cli.kanban_db_graph import decompose_triage_task
+from hermes_cli.kanban_db_graph import (
+    REFUSAL_ALREADY_FANNED_OUT,
+    REFUSAL_LEGACY_DIGESTLESS,
+    REFUSAL_NOT_IN_TRIAGE,
+    SPENT_REFUSALS,
+    body_sha,
+    decompose_triage_task,
+    fanout_refusal,
+)
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import profiles as profiles_mod
 from hermes_cli.kanban_phases import CHAIN_ARROW, cascade_violations, normalize_phase, parse_phase
@@ -594,7 +602,51 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
     return children, ""
 
 
-def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) -> DecomposeOutcome:
+#: Operator-facing text for every fan-out refusal, one per code. Each names the
+#: ONLY next action that can work for that class, so a stranded `triage` card is
+#: never reported as "already decomposed or moved out of triage" (true of neither
+#: an unchanged stranded card nor a genuinely re-specified one).
+_FANOUT_REFUSAL_TEXT = {
+    REFUSAL_ALREADY_FANNED_OUT: (
+        "already fanned out for this body — a fan-out of the same bytes would "
+        "duplicate the children, so it is refused. Recover with a NEW body "
+        "(`hermes kanban specify {tid}` or `hermes kanban edit {tid} --body ...`), "
+        "which fans out again exactly once per body content, or archive + "
+        "re-create the card to re-run the SAME body."
+    ),
+    REFUSAL_LEGACY_DIGESTLESS: (
+        "a `decomposed` marker predates body digests, so the body that fanned out "
+        "is unknowable — fan-out refused (fail closed). Archive + re-create; no "
+        "verb can open a digest that was never recorded."
+    ),
+    REFUSAL_NOT_IN_TRIAGE: "task is no longer in triage — nothing to fan out",
+}
+_BODY_CHANGED_TEXT = (
+    "body changed while it was being decomposed — no child was written and no "
+    "fan-out was recorded; retry against the current body"
+)
+
+
+def _fanout_refusal_text(task_id: str, code: Optional[str]) -> str:
+    """Render the refusal a caller must report.
+
+    ``code is None`` is the residual case D6 item 5's re-classification cannot
+    see: the commit-time digest check aborted, so the current body is NOT in the
+    ledger yet. Both reads returning ``None`` therefore means ``body-changed``.
+    """
+    if code is None:
+        return f"{_BODY_CHANGED_TEXT}: {task_id}"
+    return _FANOUT_REFUSAL_TEXT.get(code, code).format(tid=task_id)
+
+
+def _apply_fanout(
+    task_id: str,
+    parsed: dict,
+    routing: _Routing,
+    author: str,
+    *,
+    expected_body_sha: Optional[str] = None,
+) -> DecomposeOutcome:
     raw_tasks = parsed.get("tasks") or []
     if not isinstance(raw_tasks, list) or not raw_tasks:
         return DecomposeOutcome(task_id, False, "decomposer returned fanout=true with empty tasks list")
@@ -622,6 +674,10 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
                 children=children,
                 author=author,
                 auto_promote=routing.auto_promote,
+                # The digest of the body that went into the decomposer's prompt:
+                # the commit aborts if `tasks.body` moved since, so no children
+                # describe a body nobody has and no digest is recorded for it.
+                expected_body_sha=expected_body_sha,
             )
     except ValueError as exc:
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
@@ -629,7 +685,19 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
         logger.exception("decompose: DB error on task %s", task_id)
         return DecomposeOutcome(task_id, False, f"DB error: {type(exc).__name__}")
     if child_ids is None:
-        return DecomposeOutcome(task_id, False, "task already decomposed or moved out of triage")
+        # `decompose_triage_task` returns None for every refusal, so re-classify
+        # through the SAME guard the pre-checks use, and report one of four
+        # codes instead of one vague sentence. `None` from both reads is the
+        # commit-time digest abort (body-changed), which the guard cannot see
+        # from the outside because the new body is not in the ledger yet.
+        code: Optional[str] = None
+        try:
+            with kbc.connect_closing() as conn:
+                code = fanout_refusal(conn, task_id)
+        except Exception:
+            logger.exception("decompose: refusal re-classification failed on task %s", task_id)
+        logger.info("decompose: fan-out refused on %s (%s)", task_id, code or "body-changed")
+        return DecomposeOutcome(task_id, False, _fanout_refusal_text(task_id, code))
     # B2 / C1: post-commit, post-recompute advisories. Gate extraction runs
     # only after the graph committed (a gate failure must never fail a
     # committed fan-out, same pattern as the M3 audits below); an
@@ -717,6 +785,29 @@ def decompose_task(
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
 
+    # Fan-out ledger pre-check (BEFORE the aux call): a card whose current body
+    # already fanned out is refused here, so it never spends an LLM call — this
+    # is a NEW read, not a moved classification, because the refusal was
+    # previously only discovered after `_call_aux` had already paid for the
+    # prompt (a stranded triage card burned one decomposer slot every tick).
+    # Only a SPENT card is refused here: any other verdict (and any read error)
+    # falls through, so this pre-check can only save work, never change the
+    # outcome — the commit-time guard in `decompose_triage_task` is authoritative.
+    try:
+        with kbc.connect_closing() as conn:
+            refusal = fanout_refusal(conn, task_id)
+    except Exception:
+        logger.exception("decompose: fan-out pre-check failed on task %s", task_id)
+        refusal = None  # never block a legitimate fan-out on a pre-check error
+    if refusal in SPENT_REFUSALS:
+        logger.info("decompose: %s refused before the aux call (%s)", task_id, refusal)
+        return DecomposeOutcome(task_id, False, _fanout_refusal_text(task_id, refusal))
+
+    # Digest of the body going into the prompt. The commit compares against it,
+    # so a body edited mid-flight aborts `body-changed` instead of recording a
+    # digest the children were never derived from.
+    prompt_body_sha = body_sha(task.body)
+
     # Hand-merge at the pin: upstream added ``root_assignee=task.assignee`` (#114294);
     # our commit only INSERTED the phase derivation below and left the routing call alone.
     # Keep both — they are independent.
@@ -746,7 +837,8 @@ def decompose_task(
     audit_author = author or _profile_author()
     if not parsed.get("fanout"):
         return _apply_single(task, parsed, routing, audit_author)
-    return _apply_fanout(task_id, parsed, routing, audit_author)
+    return _apply_fanout(task_id, parsed, routing, audit_author,
+                         expected_body_sha=prompt_body_sha)
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:

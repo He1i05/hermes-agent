@@ -27,6 +27,34 @@ def _kbd():
     from hermes_cli import kanban_db_dispatch
     return kanban_db_dispatch
 
+
+#: Task ids already logged at INFO for a fan-out refusal (see
+#: :func:`_log_fanout_refusal`). Bounded: card ids are cheap but this must not
+#: grow without limit in a long-lived gateway process.
+_FANOUT_REFUSAL_LOGGED: set[str] = set()
+_FANOUT_REFUSAL_LOGGED_CAP = 512
+
+
+def _log_fanout_refusal(slug: str, tid: str, refusal: str) -> None:
+    """One INFO line per card, then DEBUG for repeats.
+
+    A spent triage card is not news every 60 s, but it must be VISIBLE at the
+    default log level: before this pre-check it quietly consumed one of the
+    ``auto_decompose_per_tick`` slots on every tick and only ever said so at
+    DEBUG.
+    """
+    if tid in _FANOUT_REFUSAL_LOGGED:
+        logger.debug("kanban auto-decompose [%s]: %s still refused (%s)", slug, tid, refusal)
+        return
+    if len(_FANOUT_REFUSAL_LOGGED) >= _FANOUT_REFUSAL_LOGGED_CAP:
+        _FANOUT_REFUSAL_LOGGED.clear()
+    _FANOUT_REFUSAL_LOGGED.add(tid)
+    logger.info(
+        "kanban auto-decompose [%s]: %s refused before the aux call (%s); "
+        "not charged to auto_decompose_per_tick", slug, tid, refusal,
+    )
+
+
 _CORRUPT_DB_MARKERS = ("file is not a database", "database disk image is malformed")
 
 
@@ -258,6 +286,7 @@ class _KanbanDispatcher:
         attempted = 0
         successes = 0
         from hermes_cli import kanban_db as _kb
+        from hermes_cli.kanban_db_graph import SPENT_REFUSALS
         with _default_profile_secret_scope(), _kb.pin_first_board_resolution():
             for slug in self._board_slugs():
                 if attempted >= auto_decompose_per_tick:
@@ -272,17 +301,69 @@ class _KanbanDispatcher:
                     except Exception as exc:
                         logger.debug("kanban auto-decompose: list_triage_ids failed on board %s (%s)", slug, exc)
                         triage_ids = []
-                    for tid in triage_ids:
-                        if attempted >= auto_decompose_per_tick:
-                            break
-                        attempted += 1
-                        successes += self._decompose_one(_decomp, slug, tid)
+                    # One connection for the whole board's pre-check pass (not one
+                    # per card). A failure here is non-fatal: `_fanout_refusal_code`
+                    # returns None for a missing connection and every card falls
+                    # through to `decompose_task`, exactly as before this guard.
+                    conn = None
+                    if triage_ids:
+                        try:
+                            conn = _kbc().connect(board=slug)
+                        except Exception as exc:
+                            logger.debug(
+                                "kanban auto-decompose: fan-out pre-check unavailable on board %s (%s)",
+                                slug, exc,
+                            )
+                            conn = None
+                    try:
+                        for tid in triage_ids:
+                            if attempted >= auto_decompose_per_tick:
+                                break
+                            # Fan-out ledger pre-check BEFORE the slot is charged
+                            # and before `decompose_task` can spend an aux LLM
+                            # call: a spent triage card (its current body already
+                            # fanned out, or a digest-less legacy marker) used to
+                            # consume one of the `auto_decompose_per_tick` slots
+                            # on every 60 s tick, forever, at DEBUG only. Skipping
+                            # it here costs one read. Only a SPENT card is
+                            # skipped: every other verdict falls through, because
+                            # a pre-check must never change behaviour.
+                            refusal = self._fanout_refusal_code(conn, tid)
+                            if refusal in SPENT_REFUSALS:
+                                _log_fanout_refusal(slug, tid, refusal)
+                                continue
+                            attempted += 1
+                            successes += self._decompose_one(_decomp, slug, tid)
+                    finally:
+                        if conn is not None:
+                            with contextlib.suppress(Exception):
+                                conn.close()
                 finally:
                     if prev_env is None:
                         os.environ.pop("HERMES_KANBAN_BOARD", None)
                     else:
                         os.environ["HERMES_KANBAN_BOARD"] = prev_env
         return successes
+
+    @staticmethod
+    def _fanout_refusal_code(conn: Any, tid: str) -> Optional[str]:
+        """The fan-out ledger's verdict for one triage card; ``None`` = proceed.
+
+        This is a NEW read, not a relocated classification: the refusal used to
+        be discovered only after ``decompose_task`` had already spent the aux
+        LLM call. A missing connection or a read failure returns ``None``
+        (proceed) because the commit-time guard inside
+        ``decompose_triage_task`` is the authoritative one — a pre-check must
+        never block a legitimate fan-out.
+        """
+        if conn is None:
+            return None
+        try:
+            from hermes_cli.kanban_db_graph import fanout_refusal
+            return fanout_refusal(conn, tid)
+        except Exception as exc:
+            logger.debug("kanban auto-decompose: fan-out pre-check failed on %s (%s)", tid, exc)
+            return None
 
     @staticmethod
     def _decompose_one(_decomp: Any, slug: str, tid: str) -> int:

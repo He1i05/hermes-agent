@@ -1,6 +1,8 @@
 """Task graph initialization and atomic decomposition persistence."""
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import time
 from typing import Any, Optional
@@ -87,9 +89,119 @@ def _validate_children_graph(children: list) -> None:
         raise ValueError("cyclic dependency detected in decomposed children list")
 
 
+# ── Fan-out ledger guard ────────────────────────────────────────────────────
+#
+# `decomposed` events are the durable proof that a card's body was fanned out;
+# they are never cleared and never deleted, and each payload carries `body_sha`.
+# The guard refuses a fan-out iff the card's CURRENT body digest is already in
+# that ledger:
+#
+#   already-fanned-out   these exact bytes fanned out before -> refuse
+#   legacy-digestless    a `decomposed` event predates the digest -> fail closed
+#   not-in-triage        the card left triage -> nothing to fan out
+#   None                 a body that has never fanned out -> proceed
+#
+# CONTENT decides, never an event. `specify_triage_task` appends `specified`
+# unconditionally — payload NULL when nothing changed (kanban_db.py:5303-5306) —
+# and `edit_task` records `edited {"fields": ["body"]}` WITHOUT comparing bytes
+# (kanban_db.py:4291-4320). An event-keyed guard is therefore wrong in both
+# directions (a no-op specify opened it into a duplicate fan-out of the same
+# body; a real `edit --body` left it shut). Both were measured before this
+# form was chosen.
+#
+# Also deliberately NOT done here: clearing the marker so a re-entered triage
+# card "recovers". That re-fans the SAME body — measured on the incident shape,
+# a 2-child root became 6 board rows with 5 parents and duplicate child titles —
+# which on side-effecting children is a duplicated real-world action. The
+# recoverable class is a card whose body CHANGED; that one fans out again,
+# exactly once per body content, through this same guard.
+REFUSAL_ALREADY_FANNED_OUT = "already-fanned-out"
+REFUSAL_LEGACY_DIGESTLESS = "legacy-digestless"
+REFUSAL_NOT_IN_TRIAGE = "not-in-triage"
+
+#: The refusal codes that mean "the fan-out budget for this card's CURRENT body is
+#: spent". A PRE-check — the cheap read before an aux LLM call or before a
+#: per-tick decomposer slot is charged — short-circuits ONLY on these. Every other
+#: verdict falls through to the caller's own load/report path, because a
+#: pre-check is an OPTIMISATION: it may save work, it may never change behaviour.
+#: (``not-in-triage`` is exactly that case — a pre-check can see it for a card
+#: that moved a millisecond ago, and refusing there would replace the caller's
+#: precise message with a guess.)
+SPENT_REFUSALS = (REFUSAL_ALREADY_FANNED_OUT, REFUSAL_LEGACY_DIGESTLESS)
+
+
+def body_sha(body: Optional[str]) -> str:
+    """The fan-out ledger's only input: sha256 hex of the task body's bytes."""
+    return hashlib.sha256((body or "").encode("utf-8")).hexdigest()
+
+
+def fanout_ledger(conn: sqlite3.Connection, task_id: str) -> list[tuple[int, Optional[str]]]:
+    """``[(event_id, body_sha | None)]`` for every `decomposed` event, oldest first.
+
+    Read-only: the ledger is append-only and no decision rewrites or hides an
+    event. A payload that cannot be parsed yields ``None`` for its digest, which
+    :func:`_refuse` treats as digest-less (fail closed) rather than as "never
+    fanned out".
+    """
+    out: list[tuple[int, Optional[str]]] = []
+    for row in conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'decomposed' "
+        "ORDER BY id",
+        (task_id,),
+    ):
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        digest = payload.get("body_sha") if isinstance(payload, dict) else None
+        out.append((row["id"], digest if isinstance(digest, str) and digest else None))
+    return out
+
+
+def _refuse(*, status: str, body: Optional[str], ledger: list[tuple[int, Optional[str]]]) -> Optional[str]:
+    """The guard's decision over an already-read row + ledger (no I/O)."""
+    if status != "triage":
+        return REFUSAL_NOT_IN_TRIAGE
+    if not ledger:
+        return None  # never fanned out: nothing to protect
+    if any(digest is None for _, digest in ledger):
+        # A pre-digest `decomposed` marker: the fanned-out body is unknowable, so
+        # no comparison can be trusted. Fail CLOSED — the operator message must
+        # say archive + re-create, because no verb can open a digest that was
+        # never recorded. (No backfill: the body is not recoverable.)
+        return REFUSAL_LEGACY_DIGESTLESS
+    current = body_sha(body)
+    if any(digest == current for _, digest in ledger):
+        return REFUSAL_ALREADY_FANNED_OUT
+    return None
+
+
+def fanout_refusal(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Would a fan-out of this card duplicate work? ``None`` means "fan out".
+
+    The single guard shared by every layer that can start a fan-out:
+    ``kanban_decompose.decompose_task`` (before spending the aux LLM call),
+    ``gateway.kanban_watchers_dispatcher.auto_decompose_tick`` (before spending
+    one of the ``auto_decompose_per_tick`` slots) and
+    :func:`decompose_triage_task`'s own commit (inside the write transaction).
+
+    Advisory for the pre-checks, authoritative at the commit: only the commit
+    runs inside the same IMMEDIATE transaction as the write, so a body edited
+    between a pre-check and the commit is caught there.
+    """
+    row = conn.execute(
+        "SELECT id, status, body FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return REFUSAL_NOT_IN_TRIAGE
+    return _refuse(status=row["status"], body=row["body"],
+                   ledger=fanout_ledger(conn, task_id))
+
+
 def decompose_triage_task(
     conn: sqlite3.Connection, task_id: str, *, root_assignee: Optional[str], children: list[dict],
     author: Optional[str] = None, auto_promote: bool = True,
+    expected_body_sha: Optional[str] = None,
 ) -> Optional[list[str]]:
     """Fan a triage task out into children and move the root to ``todo``; the root
     waits on every child and wakes (``ready``) when all are done.
@@ -97,7 +209,17 @@ def decompose_triage_task(
     ``children``: dicts of ``title`` (required), ``body``, ``assignee``,
     ``parents`` (indices into this list), optional workspace overrides.
     Returns child ids in input order, or None when the root is missing / not
-    in triage, or has already decomposed. Atomic: malformed entries abort fan-out.
+    in triage, when :func:`fanout_refusal` refuses the fan-out, or when the
+    body changed after the children were derived (see ``expected_body_sha``).
+    Atomic: malformed entries abort fan-out.
+
+    ``expected_body_sha`` is the digest of the body the CALLER put in the
+    decomposer's prompt. When given, the commit re-reads ``tasks.body`` and
+    aborts (returns None, writes nothing) if it no longer matches — otherwise a
+    mid-flight ``edit --body`` would pin a body the children were never derived
+    from, silently blocking that body forever. The ``decomposed`` event records
+    the digest of the body that actually committed, which is what
+    :func:`fanout_refusal` compares against on the next attempt.
     """
     from hermes_cli.kanban_db import (
         _canonical_assignee, _link, _append_event, _insert_comment,
@@ -115,17 +237,22 @@ def decompose_triage_task(
     now = int(time.time())
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, body "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if root_row is None or root_row["status"] != "triage":
             return None
-        # Dependency links alone do not imply lineage. The completion event is
-        # committed with the graph, and survives re-triage or unlinking.
-        if conn.execute(
-            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'decomposed' LIMIT 1",
-            (task_id,),
-        ).fetchone():
+        # Dependency links alone do not imply lineage: the `decomposed` event is
+        # committed with the graph and survives re-triage or unlinking, so the
+        # LEDGER of those events is the lineage record. Decide on CONTENT, in the
+        # same transaction as the write — never on the `specified`/`edited`
+        # events, which fire without a byte changing (see `fanout_refusal`).
+        if _refuse(status=root_row["status"], body=root_row["body"],
+                   ledger=fanout_ledger(conn, task_id)) is not None:
+            return None
+        if expected_body_sha is not None and body_sha(root_row["body"]) != expected_body_sha:
+            # The body moved after the children were derived: commit nothing so
+            # no `decomposed` digest is recorded for a body nobody has children for.
             return None
         child_ids = [
             _insert_decomposed_child(conn, task_id, root_row, child, author, now)
@@ -171,7 +298,15 @@ def decompose_triage_task(
                 now,
             )
         _append_event(
-            conn, task_id, "decomposed", {"child_ids": child_ids, "root_assignee": root_assignee},
+            conn, task_id, "decomposed",
+            {
+                "child_ids": child_ids,
+                "root_assignee": root_assignee,
+                # The fan-out ledger: what `fanout_refusal` compares a later
+                # body against. Recorded from the row read INSIDE this txn, so
+                # it is exactly the body these children were committed for.
+                "body_sha": body_sha(root_row["body"]),
+            },
         )
     # Outside the txn (own IMMEDIATE txn). ``auto_promote=False`` leaves the
     # children in ``todo`` for manual-review-first workflows.
