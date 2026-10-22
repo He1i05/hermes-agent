@@ -459,6 +459,13 @@ def _prepare_borrowed_launch(root: Path, owner: Path, *, current: bool) -> Path 
     owner's own update markers. None of it is armed, run or published from here, so a
     borrowing launch cannot rebind the shared launchers, rebuild products another root is
     serving, or race the owner's tail under a lock that lives in a different home.
+
+    A generation pool entry keyed by this root's expected stamp is hardlinked into this
+    root's OWN install state instead of paying the build (``pm.install.seed_from_generation_pool``).
+    The seed certifies its own write in-process: the delegated probe below cannot, because a
+    borrowing home has no PM runtime to answer it, so re-probing would discard a correct seed
+    and still pay the full sync. A pool miss, a broken pool or a kill switch leaves today's
+    path byte-for-byte unchanged.
     """
     import os
     import sys
@@ -466,6 +473,15 @@ def _prepare_borrowed_launch(root: Path, owner: Path, *, current: bool) -> Path 
     from hermes_cli._launchers import resolve_store_python
     from hermes_cli.update_lock import UpdateLock
 
+    if not current:
+        try:
+            from pm.install import seed_from_generation_pool
+
+            if seed_from_generation_pool(root, owner=owner):
+                current = True  # certified by the seed's own in-process verification
+                collect_superseded_generations(root)
+        except Exception:
+            pass  # a broken pool may never fail a launch: build exactly as today
     if not current:
         lock = UpdateLock(install_root=root, checkout_first=False)  # R6, as in prepare_launch
         if not lock.acquire():
@@ -580,6 +596,15 @@ def _sync_source_dependencies(root: Path, *, arm: bool, borrowed_from: Path | No
     pm.sync_venv(extras, explicit=True, project_root=root, evict_incompatible_plugins=True)
     collect_superseded_generations(root)
     if borrowed_from is not None:
+        # This root just paid for a generation every other borrowing root of this checkout
+        # wants; offer it to the pool so the next fresh home links it instead of building it.
+        # Opportunistic by contract: publish never raises, and the guard also covers its import.
+        try:
+            from pm.install import publish_generation_to_pool
+
+            publish_generation_to_pool(project_root=root)
+        except Exception:
+            pass
         return  # The checkout's markers describe the owner's environment, not this one.
     # These can predate the swap. Once PM commits the replacement they
     # must not make early recovery immediately rebuild it a second time.

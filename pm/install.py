@@ -671,6 +671,609 @@ def venv_is_current(*, extras: list[str] | None = None, plugins: Members | Candi
     return _runtime_state_matches(fact, stamp, project_root=root)
 
 
+# --- the generation pool ------------------------------------------------------------
+# A borrowing data root (a test's temporary HERMES_HOME, a per-task home) builds its
+# dependency environment from nothing: a full ``uv sync`` over pyproject.toml + uv.lock,
+# minutes and hundreds of megabytes, for a generation whose content the recorded stamp
+# already determines. The pool is a read-only cache of finished generations keyed by that
+# stamp; a borrower HARDLINKS one into its own install state instead of building it, and
+# records it exactly as a sync would. Nothing here may ever fail a launch: every anomaly
+# on the launch path is a miss, because a slow launch is a launch (plan §6, IV5).
+
+POOL_ENV = "HERMES_GENERATION_POOL"                      # absolute pool root override
+POOL_DISABLE_ENV = "HERMES_DISABLE_GENERATION_POOL"      # kill switch: today's behaviour
+POOL_MAX_BYTES_ENV = "HERMES_GENERATION_POOL_MAX_BYTES"  # retention budget
+_POOL_DEFAULT_MAX_BYTES = 4 * 1024**3
+_POOL_MANIFEST = "manifest.json"
+_POOL_INCOMPLETE = ".incomplete"
+_POOL_SUSPECT_DIR = ".suspect"
+_POOL_LOCKS_DIR = ".locks"
+_POOL_TMP_DIR = "tmp"
+_POOL_TMP_MAX_AGE = 3600.0
+_POOL_SEED_LOCK_TIMEOUT = 2.0
+
+
+def _pool_truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _pool_enabled(project_root: Path, *, owner: Path | None) -> bool:
+    """Cheap pre-check: env flags and owning-root identity only. Never touches the disk."""
+    if _pool_truthy(os.environ.get(POOL_DISABLE_ENV)):
+        return False
+    if owner is None:
+        return False  # the owner root IS the source of truth: it never seeds from itself
+    try:
+        return Path(project_root).resolve() != Path(owner).resolve()
+    except OSError:
+        return False
+
+
+def generation_pool_root(project_root: Path, *, owner: Path | None = None) -> Path | None:
+    """The pool this launch may use, or ``None`` (kill switch, owner root, bad override).
+
+    Resolution order: ``HERMES_GENERATION_POOL`` (absolute) -> ``<owner>/generation-pool``.
+    Never creates the pool: a read does not provision state, and a launch that finds no
+    pool simply builds as it always did.
+    """
+    if not _pool_enabled(project_root, owner=owner):
+        return None
+    override = os.environ.get(POOL_ENV)
+    if override:
+        candidate = Path(override).expanduser()
+        return candidate if candidate.is_absolute() else None
+    return Path(owner).resolve() / "generation-pool"
+
+
+def _pool_device(path: Path) -> int | None:
+    """``st_dev`` of *path* or of its nearest existing ancestor; ``None`` when unreadable."""
+    for candidate in (Path(path), *Path(path).parents):
+        try:
+            return os.stat(candidate).st_dev
+        except OSError:
+            continue
+    return None
+
+
+def _pool_same_device(pool: Path, target: Path) -> bool:
+    """``st_dev`` equality: cross-device hardlinks raise EXDEV, so the pool must be disabled."""
+    pool_device, target_device = _pool_device(pool), _pool_device(target)
+    return pool_device is not None and pool_device == target_device
+
+
+def _pool_safe_name(name: str) -> str:
+    return "".join(character if character.isalnum() or character in "-_" else "_" for character in name)[:120]
+
+
+@contextmanager
+def _pool_lock(pool: Path, name: str, *, exclusive: bool):
+    """flock a pool-scoped lock file (``<pool>/.locks/<name>.lock``); yield False, never wait.
+
+    Lock files live at the pool root because a published entry directory is 0555 and cannot
+    hold a created file. A platform without ``fcntl`` (Windows) yields True: entries are
+    content-addressed and published by rename, so the remaining race is benign, while the
+    retention budget and the 0555 modes still bound the damage.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        yield True
+        return
+    try:
+        locks = Path(pool) / _POOL_LOCKS_DIR
+        locks.mkdir(parents=True, exist_ok=True)
+        fd = os.open(locks / f"{_pool_safe_name(name)}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        yield False
+        return
+    try:
+        try:
+            fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        os.close(fd)
+
+
+def read_pool_manifest(pool: Path, stamp: str) -> dict | None:
+    """The validated manifest for *stamp*, or ``None`` — never raises.
+
+    Absent, unreadable, malformed, still-incomplete, marked suspect, carrying a foreign
+    field type, or a directory without the three markers a managed generation always has
+    all answer ``None`` (a pool miss). A broken pool may not break a launch.
+    """
+    if not isinstance(stamp, str) or not stamp or not stamp.isalnum():
+        return None
+    try:
+        entry = Path(pool) / stamp
+        if (not entry.is_dir() or (entry / _POOL_INCOMPLETE).exists()
+                or (Path(pool) / _POOL_SUSPECT_DIR / stamp).exists()):
+            return None
+        if not _managed_generation(entry):
+            return None
+        manifest = json.loads((entry / _POOL_MANIFEST).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(manifest, dict) or manifest.get("schema") != 1 or manifest.get("stamp") != stamp:
+        return None
+    extras = manifest.get("extras")
+    if (not isinstance(extras, list) or any(not isinstance(extra, str) for extra in extras)
+            or not isinstance(manifest.get("members_stamp"), str)
+            or not isinstance(manifest.get("target"), str)
+            or not isinstance(manifest.get("python"), str)
+            or not isinstance(manifest.get("files"), int)
+            or not isinstance(manifest.get("bytes"), int)):
+        return None
+    return manifest
+
+
+def _managed_generation(generation: Path) -> bool:
+    """A generation PM built and finished: lease marker, interpreter, resolved lock.
+
+    ``selected_venv`` falls back to the in-tree ``venv/`` for an install PM has never
+    touched; a seed must never clone that (measured: 417,380 files, no ``workspace/uv.lock``).
+    """
+    try:
+        generation = Path(generation)
+        return ((generation / ".lease-managed").is_file()
+                and (generation / "venv" / "pyvenv.cfg").is_file()
+                and (generation / "workspace" / "uv.lock").is_file())
+    except OSError:
+        return False
+
+
+def _generation_of(fact: dict) -> Path | None:
+    """The managed generation a recorded ``venv`` fact names, or ``None`` (C5 guard)."""
+    if not isinstance(fact, dict):
+        return None
+    environment, resolved = fact.get("environment"), fact.get("resolved_lock")
+    if not isinstance(environment, str) or not isinstance(resolved, str):
+        return None
+    try:
+        generation = Path(environment).resolve().parent
+        if not _managed_generation(generation):
+            return None
+        if Path(resolved).resolve() != generation / "workspace" / "uv.lock":
+            return None
+    except (OSError, ValueError):
+        return None
+    return generation
+
+
+def _pool_discard(path: Path) -> None:
+    """Remove a clone or an entry, softening directory modes first (a 0555 tree raises EACCES)."""
+    _soften_dirs(path)
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _soften_dirs(path: Path) -> None:
+    """chmod every directory under *path* 0755, bottom-up.
+
+    ``copytree`` preserves the entry's 0555 directory mode, and ``rmtree`` of a 0555 tree
+    raises PermissionError — an unremovable generation, i.e. the orphan bug class. Files
+    stay as they are: a writable parent directory is all that removal needs.
+    """
+    try:
+        walker = os.walk(path, topdown=False, followlinks=False)
+        for current, _dirs, _files in walker:
+            try:
+                Path(current).chmod(0o755)
+            except OSError:
+                continue
+    except OSError:
+        return
+
+
+def _harden(entry: Path, *, root: bool = True) -> None:
+    """Files 0444 (0555 when executable), directories 0555, bottom-up. Publish-time only.
+
+    ``root=False`` leaves the tree's own top directory writable: ``rename(2)`` of a 0555
+    directory raises EACCES on Linux (measured), and publish makes the entry visible by
+    renaming its staging tree into place. The caller seals the root straight after.
+    """
+    import stat as statmod
+
+    for current, dirs, files in os.walk(entry, topdown=False, followlinks=False):
+        for name in files:
+            path = Path(current) / name
+            try:
+                mode = path.lstat().st_mode
+                if statmod.S_ISLNK(mode):
+                    continue
+                path.chmod(0o555 if mode & 0o111 else 0o444)
+            except OSError:
+                continue
+        for name in dirs:
+            path = Path(current) / name
+            try:
+                if not path.is_symlink():
+                    path.chmod(0o555)
+            except OSError:
+                continue
+    if not root:
+        return
+    try:
+        Path(entry).chmod(0o555)
+    except OSError:
+        pass
+
+
+def _clone(source: Path, destination: Path) -> None:
+    """Materialize *source* at *destination* as hardlinks (zero additional data blocks)."""
+    shutil.copytree(source, destination, symlinks=True, copy_function=os.link, dirs_exist_ok=True)
+    _soften_dirs(destination)
+
+
+def _verify_clone(generation: Path) -> str | None:
+    """``None`` when the clone is usable, else a reason string.
+
+    The interpreter probe imports the packages a launch actually needs; ``yaml`` is NOT
+    installed (YAML is the vendored ``hermes_yaml``), so probing it would fail every clone.
+    """
+    import subprocess
+
+    from pm.environments import venv_python
+
+    venv = Path(generation) / "venv"
+    config = venv / "pyvenv.cfg"
+    try:
+        lines = config.read_text(encoding="utf-8-sig").splitlines()
+    except OSError:
+        return "seeded environment has no readable pyvenv.cfg"
+    home = None
+    for line in lines:
+        key, _, value = line.partition("=")
+        if key.strip() == "home" and value.strip():
+            home = Path(value.strip())
+    if home is not None and not home.is_dir():
+        return f"seeded environment's interpreter home is missing: {home}"
+    python = venv_python(venv)
+    if not python.exists():
+        return f"seeded environment has no interpreter: {python}"
+    probe = "import sys, ruamel.yaml, hermes_yaml, hermes_cli; print(sys.prefix)"
+    try:
+        result = subprocess.run([str(python), "-I", "-c", probe], capture_output=True, text=True,
+                                timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"seeded environment cannot start its interpreter: {exc}"
+    if result.returncode != 0:
+        tail = (result.stderr or "").strip().splitlines()
+        return "seeded environment failed its import probe" + (f": {tail[-1]}" if tail else "")
+    printed = [line.strip() for line in (result.stdout or "").strip().splitlines() if line.strip()]
+    prefix = printed[-1] if printed else ""
+    try:
+        matches = bool(prefix) and Path(prefix).resolve() == venv.resolve()
+    except OSError:
+        matches = False
+    return None if matches else f"seeded interpreter reports {prefix!r}, not {venv}"
+
+
+def _manifest(generation: Path, *, stamp: str, extras: list[str], members: str,
+              target: str, python: str) -> dict:
+    """The entry's provenance record: one rglob pass for ``files``/``bytes``."""
+    import time
+
+    files = total = 0
+    for item in Path(generation).rglob("*"):
+        try:
+            if item.is_symlink() or item.is_dir():
+                continue
+            total += item.stat().st_size
+        except OSError:
+            continue
+        files += 1
+    return {"schema": 1, "stamp": stamp, "extras": list(extras), "members_stamp": members,
+            "target": target, "python": python, "files": files, "bytes": total,
+            "created_at": int(time.time())}
+
+
+def _pool_manifest_fields() -> tuple[str, str, str]:
+    """``(members_stamp, target, python pin)`` as far as a pre-venv process can tell.
+
+    Diagnostic only — the stamp is the key and the seed re-derives it. Each field is
+    best-effort because this runs in the bootstrap interpreter, where the config readers
+    that plugin discovery needs are not installed yet.
+    """
+    members = target = python = ""
+    try:
+        from pm.workspace import enabled_member_dirs, members_stamp
+
+        members = members_stamp(enabled_member_dirs())
+    except Exception:
+        pass
+    try:
+        from pm.store import current_target
+
+        target = current_target()
+    except Exception:
+        pass
+    try:
+        from pm.lock import Lockfile
+        from pm.paths import lockfile_path
+
+        python = Lockfile(lockfile_path()).version("python") or ""
+    except Exception:
+        pass
+    return members, target, python
+
+
+def _pool_note(message: str) -> None:
+    """One stderr line: the launch continues, the operator can see why the pool was skipped."""
+    import sys
+
+    try:
+        print(f"hermes: generation pool: {message}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+def _pool_max_bytes() -> int:
+    try:
+        return int(os.environ.get(POOL_MAX_BYTES_ENV, "") or _POOL_DEFAULT_MAX_BYTES)
+    except ValueError:
+        return _POOL_DEFAULT_MAX_BYTES
+
+
+def _sweep_pool_tmp(pool: Path) -> None:
+    """Drop abandoned staging trees; the caller holds the entry lock."""
+    import time
+
+    tmp_root = Path(pool) / _POOL_TMP_DIR
+    try:
+        items = list(tmp_root.iterdir())
+    except OSError:
+        return
+    for item in items:
+        try:
+            if time.time() - item.stat().st_mtime < _POOL_TMP_MAX_AGE:
+                continue
+        except OSError:
+            continue
+        _pool_discard(item)
+
+
+def _evict(pool: Path, *, keep: str) -> None:
+    """Enforce the retention budget, oldest first, never touching *keep* or a busy entry.
+
+    Safe by construction: clones are hardlinks, so removing an entry never invalidates one.
+    """
+    budget = _pool_max_bytes()
+    if budget <= 0:
+        return
+    entries = []
+    total = 0
+    try:
+        items = list(Path(pool).iterdir())
+    except OSError:
+        return
+    for item in items:
+        if item.name.startswith(".") or not item.is_dir():
+            continue
+        manifest = read_pool_manifest(pool, item.name)
+        if manifest is None:
+            continue
+        try:
+            entries.append((item.stat().st_mtime, item, int(manifest.get("bytes") or 0)))
+        except OSError:
+            continue
+        total += entries[-1][2]
+    if total <= budget:
+        return
+    for _mtime, item, size in sorted(entries, key=lambda row: row[0]):
+        if total <= budget:
+            break
+        if item.name == keep:
+            continue
+        with _pool_lock(pool, item.name, exclusive=True) as held:
+            if not held:
+                continue
+            _pool_discard(item)
+            total -= size
+
+
+def publish_generation_to_pool(project_root: Path, *, owner: Path | None = None,
+                               pool: Path | None = None) -> Path | None:
+    """Publish the generation this root just committed, keyed by its recorded stamp.
+
+    Returns the published entry path, or ``None`` when there is nothing to publish (owner
+    root, kill switch, no record, already published, cross-device, lock busy, any error).
+    Never raises. Atomic by rename: readers only ever see a complete, hardened entry.
+    """
+    import errno
+    import uuid
+
+    try:
+        from pm.environments import install_state_dir, runtime_facts_path
+
+        if _pool_truthy(os.environ.get(POOL_DISABLE_ENV)):
+            return None  # the kill switch is the rollback contract: today's behaviour, exactly
+        root = Path(project_root).absolute()
+        pool = Path(pool) if pool is not None else generation_pool_root(root, owner=owner)
+        if pool is None:
+            return None
+        fact = Facts(runtime_facts_path(root)).get("venv")
+        stamp, extras = (fact.get("stamp"), fact.get("extras")) if isinstance(fact, dict) else (None, None)
+        if (not isinstance(stamp, str) or not stamp
+                or not isinstance(extras, list) or any(not isinstance(extra, str) for extra in extras)):
+            return None
+        generation = _generation_of(fact)
+        if generation is None:
+            return None
+        entry = pool / stamp
+        if entry.is_dir():
+            return None
+        if not _pool_same_device(pool, install_state_dir(root)):
+            _pool_note(f"{pool} is on another filesystem from this data root; not publishing")
+            return None
+        pool.mkdir(parents=True, exist_ok=True)
+        with _pool_lock(pool, stamp, exclusive=True) as held:
+            if not held or entry.is_dir():
+                return None
+            _sweep_pool_tmp(pool)
+            staged = pool / _POOL_TMP_DIR / uuid.uuid4().hex
+            try:
+                staged.parent.mkdir(parents=True, exist_ok=True)
+                staged.mkdir()
+                (staged / _POOL_INCOMPLETE).touch()
+                _clone(generation, staged)
+                members, target, python = _pool_manifest_fields()
+                manifest = _manifest(generation, stamp=stamp, extras=sorted(extras),
+                                     members=members, target=target, python=python)
+                (staged / _POOL_MANIFEST).write_text(
+                    json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                (staged / _POOL_INCOMPLETE).unlink()
+                _harden(staged, root=False)
+            except BaseException as exc:
+                _pool_discard(staged)
+                if not isinstance(exc, Exception):
+                    raise
+                if isinstance(exc, OSError) and exc.errno == errno.EXDEV:
+                    _pool_note(f"{pool} is on another filesystem; not publishing")
+                return None
+            try:
+                os.replace(staged, entry)
+            except OSError as exc:
+                # ENOTEMPTY/EEXIST: a concurrent publish won — the desired state, not an error.
+                _pool_discard(staged)
+                if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+                    return None
+                return entry
+            try:
+                entry.chmod(0o555)
+            except OSError:
+                pass  # the entry is complete and read-only below its root; sealing is best effort
+            _evict(pool, keep=stamp)
+            return entry
+    except Exception:
+        return None
+
+
+def _seed_expected(package, fact: dict | None) -> tuple[list[str], str]:
+    """``(enabled extras, expected stamp)`` exactly as a sync would derive them."""
+    shipped, _frozen = _feature_policy(None, repair=False)
+    recorded = fact.get("extras") if isinstance(fact, dict) else None
+    if not isinstance(recorded, list) or any(not isinstance(extra, str) for extra in recorded):
+        recorded = []
+    enabled = sorted(set(_still_declared(package, recorded)) | set(shipped or []))
+    return enabled, package.expected_stamp(enabled, **_member_inputs(None))
+
+
+def _mark_pool_suspect(pool: Path, stamp: str) -> None:
+    """Record a failed clone at the pool ROOT: a hardened entry cannot hold a created file."""
+    try:
+        suspects = Path(pool) / _POOL_SUSPECT_DIR
+        suspects.mkdir(parents=True, exist_ok=True)
+        (suspects / stamp).write_text("clone verification failed\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _seeded_state_ok(root: Path, stamp: str, generation: Path) -> bool:
+    """The in-process verification the caller turns into ``current`` (plan §2.2).
+
+    The delegated probe cannot certify a borrowing home (it has no PM runtime to answer
+    it), so the seed certifies its own write: the record names this stamp, the environment
+    sits inside this root's own install state, and its ``pyvenv.cfg`` is present.
+    """
+    from pm.environments import install_state_dir, runtime_facts_path
+
+    try:
+        fact = Facts(runtime_facts_path(root), strict=True).get("venv")
+        if not isinstance(fact, dict) or fact.get("stamp") != stamp:
+            return False
+        environment = Path(str(fact.get("environment") or "")).resolve()
+        generations = (install_state_dir(root) / "environments").resolve()
+        return (environment == (Path(generation) / "venv").resolve()
+                and environment.is_relative_to(generations)
+                and (environment / "pyvenv.cfg").is_file())
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def seed_from_generation_pool(project_root: Path, *, owner: Path | None = None,
+                              pool: Path | None = None) -> bool:
+    """Materialize this root's expected-stamp entry into its OWN install state.
+
+    ``True`` only when the seed is complete and verified in-process; ``False`` on every
+    anomaly, so the caller falls back to building exactly as it does today. The clone and
+    the record both land inside ``<this home>/installs/<key>/``: a pool path is never
+    selected, so ``_recorded_venv``'s containment guard keeps holding.
+    """
+    import uuid
+
+    try:
+        from hermes_cli.runtime_state import runtime_lock
+        from pm.environments import flush_before_selecting, install_state_dir, runtime_facts_path
+        from pm.packages import Venv
+
+        if _pool_truthy(os.environ.get(POOL_DISABLE_ENV)):
+            return False  # the kill switch is the rollback contract: today's behaviour, exactly
+        root = Path(project_root).absolute()
+        pool = Path(pool) if pool is not None else generation_pool_root(root, owner=owner)
+        if pool is None:
+            return False
+        state = install_state_dir(root)
+        if not _pool_same_device(pool, state):
+            return False  # a copy would move 752 MB of data blocks; build instead
+        with runtime_lock(root, timeout=_POOL_SEED_LOCK_TIMEOUT) as held:
+            if not held:
+                return False  # a build owns this install; the next launch will seed
+            package = Venv(root)
+            fact = Facts(runtime_facts_path(root)).get("venv") or Facts(paths.facts_path()).get("venv")
+            enabled, stamp = _seed_expected(package, fact)
+            if read_pool_manifest(pool, stamp) is None:
+                return False
+            entry = pool / stamp
+            with _pool_lock(pool, stamp, exclusive=False) as shared:
+                if not shared:
+                    return False
+                generations = state / "environments"
+                generations.mkdir(parents=True, exist_ok=True)
+                generation = generations / uuid.uuid4().hex
+                try:
+                    _clone(entry, generation)
+                except BaseException as exc:
+                    _pool_discard(generation)
+                    if not isinstance(exc, Exception):
+                        raise
+                    _pool_note(f"could not clone the cached environment: {exc}")
+                    return False
+                try:
+                    reason = _verify_clone(generation)
+                    if reason is not None:
+                        _mark_pool_suspect(pool, stamp)
+                        _pool_discard(generation)
+                        _pool_note(reason)
+                        return False
+                    flush_before_selecting()
+                    Facts(runtime_facts_path(root)).record_state(
+                        "venv", stamp, enabled,
+                        environment=generation / "venv",
+                        resolved_lock=generation / "workspace" / "uv.lock",
+                    )
+                except BaseException as exc:
+                    _pool_discard(generation)
+                    if not isinstance(exc, Exception):
+                        raise
+                    _pool_note(f"could not record the cached environment: {exc}")
+                    return False
+                if _seeded_state_ok(root, stamp, generation):
+                    return True
+                _pool_discard(generation)
+                return False
+    except Exception as exc:
+        _pool_note(f"seed skipped: {exc}")
+        return False
+
+
 def _feature_policy(extras: Optional[list[str]], *, repair: bool) -> tuple[list[str] | None, list[str] | None]:
     """Refuse extras this platform or a frozen bundle cannot carry; return (shipped, frozen)."""
     from pm.features import read_features

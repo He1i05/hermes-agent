@@ -8,6 +8,9 @@ following symlinks would treat a venv interpreter as the store interpreter.
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -62,3 +65,28 @@ def test_venv_python_symlinked_to_the_store_binary_still_relaunches(launch):
     target, published = run(store_spelling=store_python, executable=venv_python)
     assert target == store_python
     assert published == [(tmp_path / "checkout").resolve()]
+
+
+def test_relaunch_env_contract_knobs_survive_pythonpath_does_not(tmp_path):
+    """The relaunch contract for a test author whose driver patches modules.
+
+    ``relaunch_command`` keeps every variable in ``os.environ`` and re-enters under ``-I``.
+    So a knob re-read from the environment survives the fresh interpreter, while
+    ``PYTHONPATH`` is inherited-but-inert: import-path stub injection cannot cross the
+    relaunch, monkeypatching an env-read value can.
+    """
+    env = dict(os.environ, HERMES_TEST_KNOB="on", PYTHONPATH=str(tmp_path / "stub"))
+    script = (
+        "import json, os, sys\n"
+        "print(json.dumps({'knob': os.environ.get('HERMES_TEST_KNOB'),\n"
+        "                  'env_pythonpath': os.environ.get('PYTHONPATH'),\n"
+        "                  'on_sys_path': any('stub' in entry for entry in sys.path),\n"
+        "                  'isolated': bool(sys.flags.isolated)}))\n"
+    )
+    result = subprocess.run([sys.executable, "-I", "-c", script], env=env,
+                            capture_output=True, text=True, check=True, timeout=60)
+    observed = json.loads(result.stdout.strip().splitlines()[-1])
+    assert observed["isolated"] is True
+    assert observed["knob"] == "on"
+    assert observed["env_pythonpath"].endswith("stub")
+    assert observed["on_sys_path"] is False

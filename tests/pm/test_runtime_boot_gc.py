@@ -53,3 +53,45 @@ sys.stdin.readline()
     assert not first.exists()
     assert (state / "environments" / "second").is_dir()
     assert legacy.is_dir()
+
+
+def test_gc_max_age_is_the_operators_way_out_of_a_young_orphan(tmp_path, monkeypatch):
+    """`hermes pm gc --max-age 0` reclaims a crash orphan; the launch path keeps its 24h guard.
+
+    A half-built generation is indistinguishable from an orphan until its facts record
+    lands, so lowering the guard on the launch path is forbidden (plan W6/C10).
+    """
+    import argparse
+
+    from hermes_cli.runtime_state import collect_generations
+    from pm import cli
+    from pm.environments import install_state_dir
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    state = install_state_dir(repo)
+    young = state / "environments" / "young" / "venv"
+    young.mkdir(parents=True)
+    (young / "pyvenv.cfg").write_text("version = 3.11", encoding="utf-8")
+    (young.parent / ".lease-managed").touch()
+
+    assert collect_generations(repo) == []  # the launch path refuses a young generation
+    assert young.parent.is_dir()
+
+    forwarded = {}
+
+    def record(project, **kwargs):
+        forwarded.clear()
+        forwarded.update(kwargs)
+        return []
+
+    monkeypatch.setattr("hermes_cli.runtime_state.collect_generations", record)
+    monkeypatch.setattr("pm.runtime.collect_runtime_generations", lambda root: [])
+    monkeypatch.setattr("pm.install_states.collect_orphan_install_states", lambda root: [])
+    monkeypatch.setattr(cli, "_gc_store", lambda store, facts: (0, 0))
+
+    assert cli.cmd_gc(argparse.Namespace(max_age=0.0)) == 0
+    assert forwarded == {"min_age_seconds": 0.0}
+    assert cli.cmd_gc(argparse.Namespace(max_age=None)) == 0
+    assert forwarded == {}  # the default stays collect_generations' own 86400 s

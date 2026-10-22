@@ -519,7 +519,12 @@ def cmd_gc(args) -> int:
     from pm.environments import install_state_dir
     from pm.paths import repo_root
     from pm.runtime import collect_runtime_generations
-    generations = collect_generations(repo_root())
+    # The launch path keeps its 24h guard: a half-built generation is indistinguishable from
+    # an orphan until its facts record lands, so only an explicit operator/test run may go
+    # below it (--max-age 0 reclaims a crash orphan immediately, under the runtime lock).
+    max_age = getattr(args, "max_age", None)
+    generations = collect_generations(repo_root(), **({} if max_age is None
+                                                      else {"min_age_seconds": max(0.0, max_age)}))
     runtimes = collect_runtime_generations(install_state_dir(repo_root()) / "pm-runtime")
     from pm.environments import installs_root
     from pm.install_states import collect_orphan_install_states
@@ -853,6 +858,9 @@ def main(argv=None) -> int:
     p.set_defaults(func=cmd_repair)
 
     p = sub.add_parser("gc", help="remove store entries nothing references")
+    p.add_argument("--max-age", type=float, default=None, metavar="SECONDS",
+                   help="reclaim unselected dependency generations younger than the launch "
+                        "path's 24h guard (0 = any unleased one); the launch path keeps its guard")
     p.set_defaults(func=cmd_gc)
 
     p = sub.add_parser("bundle", help="stage a payload (repo+store+facts+relocatable venv) into --out")
