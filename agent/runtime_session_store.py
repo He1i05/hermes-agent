@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import threading
+import time
 
 
 _worker_process = False
@@ -37,6 +38,22 @@ def apply_row_annotations(messages, annotations):
 
 class WorkerPersistenceError(RuntimeError):
     pass
+
+
+# The owner is a local process on a shared, sometimes saturated host. A discovery handshake
+# that loses the socket race is TRANSIENT, not a verdict on the attempt: treating it as a
+# permanent sticky failure killed the worker's whole store after one 5 s miss, and with it
+# work that had already landed (root cause card t_ae2c07f0; design t_681b33d2 Option C).
+# Bounded retry only; a real failure (permission, scope, outbox) still fails closed at once.
+PERSIST_RETRY_DELAYS = (0.5, 1.0, 2.0, 3.0)
+_TRANSIENT_PERSIST_MESSAGES = frozenset({'owner_unavailable', 'worker_receipt_timeout'})
+
+
+def _is_transient_persistence_error(exc):
+    """True when retrying could plausibly succeed: an owner miss, not a contract violation."""
+    if isinstance(exc, WorkerPersistenceError):
+        return str(exc) in _TRANSIENT_PERSIST_MESSAGES
+    return isinstance(exc, (TimeoutError, ConnectionError, OSError))
 
 
 class WorkerRPC:
@@ -201,9 +218,15 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
     def _apply(self, operation, payload):
         with self.lock:
             if self.failure:
-                raise WorkerPersistenceError(self.failure)
+                if self.failure not in _TRANSIENT_PERSIST_MESSAGES:
+                    raise WorkerPersistenceError(self.failure)
+                # A transient owner miss is recoverable: clear it and let the pending replay
+                # (idempotent per sequence) decide, instead of failing the whole turn.
+                self.failure = None
             if self.journal['pending']:
-                raise WorkerPersistenceError('pending_receipt')
+                # Absorb a previous transient miss here; the entry is already journaled, so the
+                # replay resolves its original receipt rather than creating a second one.
+                self._retry_pending_locked()
             entry = {'sequence': self.journal['next_sequence'], 'operation': operation, 'payload': payload}
             candidate = json.loads(json.dumps(self.journal))
             candidate['pending'].append(json.loads(json.dumps(entry, allow_nan=False)))
@@ -218,22 +241,45 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
 
     def retry_pending(self):
         with self.lock:
-            results = []
+            return self._retry_pending_locked()
+
+    def _rpc_with_retry(self, **kwargs):
+        """Bounded retry on transient owner misses; every other failure stays fail-closed."""
+        attempt = 0
+        while True:
             try:
-                while self.journal['pending']:
-                    entry = self.journal['pending'][0]
-                    result = self.rpc('worker.persist', **self.scope, **entry)
-                    candidate = dict(self.journal, pending=self.journal['pending'][1:])
-                    candidate = self._compression_receipt_journal(candidate, result)
-                    self._save(candidate)
-                    self.scope = candidate['scope']
-                    self.journal = candidate
-                    results.append(result)
-            except Exception as exc:
-                self.failure = str(exc)
-                raise
-            self.failure = None
-            return results
+                return self.rpc('worker.persist', **kwargs)
+            except Exception as exc:  # noqa: BLE001 - classification decides, not the type alone
+                if attempt >= len(PERSIST_RETRY_DELAYS) or not _is_transient_persistence_error(exc):
+                    raise
+                delay = PERSIST_RETRY_DELAYS[attempt]
+                attempt += 1
+                # Log at INFO so a saturated host is diagnosable, not silent.
+                try:
+                    from utils import logger as _logger
+                    _logger.info('worker persistence: transient %s, retry %d/%d in %.1fs',
+                                 exc, attempt, len(PERSIST_RETRY_DELAYS), delay)
+                except Exception:  # pragma: no cover - logging must never affect the retry
+                    pass
+                time.sleep(delay)
+
+    def _retry_pending_locked(self):
+        results = []
+        try:
+            while self.journal['pending']:
+                entry = self.journal['pending'][0]
+                result = self._rpc_with_retry(**self.scope, **entry)
+                candidate = dict(self.journal, pending=self.journal['pending'][1:])
+                candidate = self._compression_receipt_journal(candidate, result)
+                self._save(candidate)
+                self.scope = candidate['scope']
+                self.journal = candidate
+                results.append(result)
+        except Exception as exc:
+            self.failure = str(exc)
+            raise
+        self.failure = None
+        return results
 
     def adopt(self, epoch):
         """Install only a separately verified worker.adopt result; never self-adopt."""

@@ -45,14 +45,22 @@ async def _submit_claim(client, params, board_db):
     while receipt['status'] not in {'terminal', 'unknown'}:
         await asyncio.sleep(.2)
         receipt = await client.rpc('prompt.receipt', session_id=sid, admission_id=receipt['admission_id'])
-    if receipt['status'] == 'unknown':
-        raise GatewayClientError('Kanban execution unknown; retained by owner')
+    # Evidence before branch (design: t_681b33d2 D6 / Option B-prime): read THIS attempt's own
+    # claim_lock-gated result before trusting or refusing on the receipt. The owner writes
+    # 'unknown' when it cannot project a result, but the board may still hold a durable one --
+    # branching on the receipt first discarded hours of landed work per attempt.
     from gateway.session_kanban import worker_result
     result = worker_result(board_db, params)
-    # The attempt's reply ends the log, as a one-shot worker's did: crash diagnostics quote it.
-    if result.get('last_output'):
+    if result and result.get('last_output'):
         print(result['last_output'])
-    return result.get('exit_code', 1)
+    if result:
+        return result.get('exit_code', 1)
+    if receipt['status'] == 'unknown':
+        # A fence, not a refusal: say so, and never pretend a verdict exists without evidence.
+        print('Kanban execution fenced unknown by the owner (worker lost; no recorded result '
+              f"for run {params['run_id']}); this attempt is not a refusal", file=sys.stderr)
+        return 1
+    return 1
 
 
 def main():
