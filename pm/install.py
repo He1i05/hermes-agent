@@ -873,7 +873,19 @@ def _soften_dirs(path: Path) -> None:
 
 
 def _harden(entry: Path, *, root: bool = True) -> None:
-    """Files 0444 (0555 when executable), directories 0555, bottom-up. Publish-time only.
+    """Seal what this tree owns: directories 0555, publish-written files 0444/0555.
+
+    ``chmod`` is per-inode and ``_clone`` hardlinks, so a cloned file IS the source
+    generation's file. Sealing cloned files read-only would seal the *publishing* root's
+    own selected environment with them (same inode), and the two can never be separated
+    again — restoring the source's modes would unseal the entry, because the mode lives on
+    the shared inode. It would also buy nothing: the source's owner can chmod it back. So
+    only inodes this tree owns are sealed: the directories (``copytree`` creates those
+    fresh) and files publish wrote itself (``st_nlink == 1``, i.e. ``manifest.json``).
+    Structural immutability is what the mode can actually deliver here — a 0555 directory
+    can neither gain, lose nor rename an entry, and a 0555 entry root cannot be swapped by
+    a publishing race. File *content* immutability rests on the generation invariant
+    instead: nothing writes into a committed generation in place.
 
     ``root=False`` leaves the tree's own top directory writable: ``rename(2)`` of a 0555
     directory raises EACCES on Linux (measured), and publish makes the entry visible by
@@ -885,10 +897,10 @@ def _harden(entry: Path, *, root: bool = True) -> None:
         for name in files:
             path = Path(current) / name
             try:
-                mode = path.lstat().st_mode
-                if statmod.S_ISLNK(mode):
-                    continue
-                path.chmod(0o555 if mode & 0o111 else 0o444)
+                info = path.lstat()
+                if statmod.S_ISLNK(info.st_mode) or info.st_nlink > 1:
+                    continue  # a symlink, or an inode shared with the source generation
+                path.chmod(0o555 if info.st_mode & 0o111 else 0o444)
             except OSError:
                 continue
         for name in dirs:

@@ -602,7 +602,10 @@ def _sync_source_dependencies(root: Path, *, arm: bool, borrowed_from: Path | No
         try:
             from pm.install import publish_generation_to_pool
 
-            publish_generation_to_pool(project_root=root)
+            # The owner is the pool's identity: `generation_pool_root(root, owner=None)`
+            # answers None by design (the owner root never pools with itself), so omitting
+            # it makes this hook a silent no-op and every borrowing launch a permanent miss.
+            publish_generation_to_pool(project_root=root, owner=borrowed_from)
         except Exception:
             pass
         return  # The checkout's markers describe the owner's environment, not this one.

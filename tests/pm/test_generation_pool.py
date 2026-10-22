@@ -214,10 +214,16 @@ def test_publish_hardlinks_a_hardened_entry_and_leaves_facts_alone(sandbox, tmp_
     assert manifest["files"] >= 6 and manifest["bytes"] > 0
     # no data blocks were copied: the entry shares the generation's inodes
     assert os.stat(entry / "venv" / "bin" / "python").st_nlink >= 2
-    # the pool is read-only for everyone, including us
+    # the pool's structure is read-only for everyone, including us: directories (fresh
+    # inodes) and the manifest publish wrote itself
     assert stat.S_IMODE(os.stat(entry).st_mode) == 0o555
+    assert stat.S_IMODE(os.stat(entry / "venv" / "bin").st_mode) == 0o555
     assert stat.S_IMODE(os.stat(entry / "manifest.json").st_mode) == 0o444
-    assert stat.S_IMODE(os.stat(entry / "venv" / "bin" / "python").st_mode) & 0o200 == 0
+    # a cloned file keeps the publishing generation's mode: its inode IS that file (chmod is
+    # per-inode), so sealing it here would seal the borrower's own selected environment too
+    assert (os.stat(entry / "venv" / "bin" / "python").st_ino
+            == os.stat(generation / "venv" / "bin" / "python").st_ino)
+    assert stat.S_IMODE(os.stat(generation / "venv" / "bin" / "python").st_mode) == 0o755
     # relocation: no shim carries its own generation path (A10)
     for path in (entry / "venv" / "bin").iterdir():
         assert str(generation) not in path.read_text(encoding="utf-8")
@@ -292,6 +298,50 @@ def test_hardened_tree_is_removable_only_after_softening(tmp_path):
     install._soften_dirs(entry)
     shutil.rmtree(entry)
     assert not entry.exists()
+
+
+def test_publish_never_seals_the_publishing_generation(sandbox, tmp_path):
+    """A hardlink clone shares inodes, so a file-level chmod cannot be one-sided.
+
+    Round-1 review, non-blocking: publish used to chmod the sealed tree's FILES, which are
+    the borrower's own committed generation (same inode), leaving that generation's files
+    0444 -- and no later chmod can separate them again, because the mode lives on the shared
+    inode. Publish now seals only what the tree owns: directories (fresh inodes) and its own
+    manifest. This pins that the source generation comes out byte- and mode-identical, that
+    the entry still launches, and that entry removal is still only possible after softening.
+    """
+    root, _home = sandbox
+    stamp = _stamp(root)
+    generation = _generation(install_state_dir(root))
+    _record(root, generation, stamp)
+    watched = [generation, generation / "venv", generation / "venv" / "bin",
+               generation / "venv" / "pyvenv.cfg", generation / "venv" / "bin" / "python",
+               generation / "venv" / "bin" / "shim0", generation / "workspace" / "uv.lock",
+               generation / ".lease-managed"]
+    before = {path: (os.stat(path).st_mode, os.stat(path).st_ino) for path in watched}
+
+    entry = install.publish_generation_to_pool(root, owner=tmp_path / "owner", pool=tmp_path / "pool")
+
+    assert entry is not None
+    for path, (mode, inode) in before.items():
+        assert os.stat(path).st_mode == mode, path
+        assert os.stat(path).st_ino == inode, path
+    # the source generation stays writable and runnable: nothing sealed it behind its back
+    shim = generation / "venv" / "bin" / "shim0"
+    assert stat.S_IMODE(os.stat(shim).st_mode) & 0o200
+    python = generation / "venv" / "bin" / "python"
+    assert stat.S_IMODE(os.stat(python).st_mode) & 0o100  # still executable
+    # the entry is that same inode, and it still certifies as a launchable environment
+    assert os.stat(entry / "venv" / "bin" / "shim0").st_ino == before[shim][1]
+    assert install._verify_clone(entry) is None
+    # structural seal holds without a file chmod: rmtree of the entry still needs softening
+    with pytest.raises(PermissionError):
+        shutil.rmtree(entry)
+    install._soften_dirs(entry)
+    shutil.rmtree(entry)
+    assert not entry.exists()
+    # discarding the entry (an eviction) never harms the generation that published it
+    assert python.is_file() and not (entry / "venv").exists()
 
 
 # --- W3: seed ------------------------------------------------------------------------------
