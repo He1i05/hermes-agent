@@ -573,8 +573,16 @@ That final terminal board call (`kanban_complete` / `kanban_request_review` /
 `kanban_block`; reviewers end with `kanban_complete` or `kanban_request_changes`)
 is part of the worker
 protocol. If the worker process exits with status 0 while the task is still
-`running`, the dispatcher treats that as a protocol violation and emits a
-`protocol_violation` event. A dispatcher-spawned worker whose turn failed
+`running`, the dispatcher does not assume the worst — it consults the cause
+first. A provider quota/usage abort that exits `0` is booked `rate_limited`; a
+run that left artifacts inside its run window without a landed terminal call is
+booked `work_present` (the work exists, the handoff does not, so the retry
+worker is told to verify those files before redoing them); only a clean exit
+with neither a wall nor evidence is a protocol violation (`protocol_violation`
+event). A **refused** terminal call is not a handoff either: the turn-end guard
+reads the tool *result*, not the tool *name* — `{"ok": true, …}` moved the card
+and ends the turn, while `{"error": "…"}` or `Error executing tool …` did not,
+and the worker gets a bounded nudge to re-file. A dispatcher-spawned worker whose turn failed
 therefore exits non-zero: `1` for an ordinary failure, `75`
 (`EX_TEMPFAIL`) when the provider was rate-limited, overloaded, returning
 5xx or timing out, or the account hit a billing/quota wall — the dispatcher records that run as `rate_limited` and
@@ -600,11 +608,16 @@ dispatcher does; a worker killed before it reaches that line is a plain
 `crashed` (`pid <n> not alive`).
 
 **Agent-side prevention:** Before the worker exits, Hermes injects up to two
-synthetic nudges when it detects the model is about to stop without a terminal
-board tool call. This catches the common case where the model narrates the next
-step ("Let me write the report") and stops with `finish_reason=stop`. The nudge
-reminds the model to call `kanban_complete`, `kanban_request_review` or `kanban_block`
-immediately. A worker that already handed its card off (`kanban_request_review`, or
+synthetic nudges when no terminal board call **landed** in the turn. Terminality
+is a landed call, not an attempted one: the guard inspects the tool result, and
+exactly two shapes count as a refusal — the executor's `Error executing tool …`
+prefix, and a JSON object carrying a top-level `error` key (how the board refuses
+a handoff). A refused `kanban_complete` / `kanban_request_review` /
+`kanban_block` therefore no longer suppresses the nudge. This catches the common
+case where the model narrates the next step ("Let me write the report") and stops
+with `finish_reason=stop`. The nudge reminds the model to call one of the five
+terminal tools (`kanban_complete`, `kanban_block`, `kanban_schedule`,
+`kanban_request_review`, `kanban_request_changes`) immediately. A worker that already handed its card off (`kanban_request_review`, or
 `kanban_request_changes` from a reviewer) is never nudged — the handoff is its terminal
 call, and the nudge never asks it to `kanban_complete` a card that is under review. This
 guard is active only for the dispatcher-spawned worker itself (`HERMES_KANBAN_TASK` is
@@ -1361,7 +1374,7 @@ complete or block the card; unblock a blocked card only when a new attempt is
 intended. Confirmed timeouts and provider rate-limit results retain their ordinary
 retry/failure-accounting behavior.
 
-A task is a logical unit of work; a **run** is one attempt to execute it. When the dispatcher claims a ready task it creates a row in `task_runs` and points `tasks.current_run_id` at it. When that attempt ends — completed, blocked, crashed, timed out, spawn-failed, reclaimed — the run row closes with an `outcome` and the task's pointer clears. A task that's been attempted three times has three `task_runs` rows.
+A task is a logical unit of work; a **run** is one attempt to execute it. When the dispatcher claims a ready task it creates a row in `task_runs` and points `tasks.current_run_id` at it. When that attempt ends — completed, blocked, crashed, timed out, spawn-failed, reclaimed, rate-limited, work-present — the run row closes with an `outcome` and the task's pointer clears. A task that's been attempted three times has three `task_runs` rows. `work_present` is a run-level signal, never a card status: it says the attempt left work behind (or hit a provider wall, for `rate_limited`) and is requeued, not that the card is finished or failed.
 
 Why two tables instead of just mutating the task: you need **full attempt history** for real-world postmortems ("the second reviewer attempt got to approve, the third merged"), and you need a clean place to hang per-attempt metadata — which files changed, which tests ran, which findings a reviewer noted. Those are run facts, not task facts.
 
@@ -1459,7 +1472,8 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `respawn_guarded` | `{reason}` | Dispatcher refused to re-spawn this ready task this tick. Reasons: `infrastructure_cooldown` (the host refused the last spawn — no restart-safe systemd scope — and the cooldown has not elapsed; never counted against the card), `rate_limit_cooldown` (the last run hit a quota wall; same cooldown, never counted), `blocker_auth` (last failure was a quota/auth/429 error — wait for the rate window to reset), `recent_success` (a completed run happened in the last hour — wait for review before re-running), `active_pr` (a GitHub PR URL appears in a recent comment — a prior worker already opened a PR). The task stays in `ready`; the next tick gets another chance to spawn. If the underlying condition persists, the normal `consecutive_failures` circuit breaker will auto-block via `gave_up` after `failure_limit` failures. |
 | `spawn_failed` | `{error, failures}` | One spawn attempt failed (missing PATH, workspace unmountable, …). Counter increments; task returns to `ready` for retry. |
 | `skipped_nonspawnable` | `{assignee}` | Dispatcher refused to spawn because the assignee profile does not exist in this home (or is not in `kanban.dispatch_profiles`). Written once per card — repeated only when another event landed in between — so `show`/`tail` name the missing profile without a row per tick. The card stays in `ready`; reassign it or install the profile. |
-| `protocol_violation` | `{pid, claimer, exit_code, protocol_violation, worker_output?}` | Worker exited successfully while the task was still `running`, usually because it answered without a terminal board call (`kanban_complete`, `kanban_request_review` or `kanban_block`). Emitted on every violation (the payload's `protocol_violation: true` marker is copied into the run metadata and feeds the violation-only retry budget). Below the budget — up to `_PROTOCOL_VIOLATION_FAILURE_LIMIT` (default 3) *consecutive* violations, per-task `max_retries` overriding — the task simply returns to `ready` for another attempt; when the streak reaches the bound the dispatcher also emits `gave_up` and auto-blocks. `worker_output` carries the worker's own last printed text (usually its explanation of why it stopped), also folded into `last_failure_error` and shown to the retry worker as the prior-attempt error. |
+| `protocol_violation` | `{pid, claimer, exit_code, protocol_violation, worker_output?}` | A clean exit (`rc=0`) while the task was still `running` with **no** cause and **no** evidence: the dispatcher books a provider quota wall as `rate_limited` and a run that left artifacts in its workspace as `work_present` first, so this row means neither was found. The message names all five terminal tools (`kanban_complete`, `kanban_block`, `kanban_schedule`, `kanban_request_review`, `kanban_request_changes`). Emitted on every violation (the payload's `protocol_violation: true` marker is copied into the run metadata and feeds the violation-only retry budget). Below the budget — up to `_PROTOCOL_VIOLATION_FAILURE_LIMIT` (default 3) *consecutive* violations, per-task `max_retries` overriding — the task simply returns to `ready` for another attempt; when the streak reaches the bound the dispatcher also emits `gave_up` and auto-blocks. `worker_output` carries the worker's own last printed text (usually its explanation of why it stopped), also folded into `last_failure_error` and shown to the retry worker as the prior-attempt error. |
+| `work_present` | `{pid, claimer, exit_code, work_present, evidence[], retry_status}` | The worker exited cleanly (`rc=0`) after leaving artifacts **inside its run window** but filed no landed terminal call. The run closes with `outcome=work_present` (not `crashed`), the card returns to its source phase (`ready`, or `review` for a reviewer run), `consecutive_failures` is untouched, and the violation-only streak still counts it +1 — so a card that keeps landing work and never files still reaches `gave_up`, with a message telling the operator to inspect the workspace. `evidence` lists up to five workspace-relative paths (a dirty worktree through `git status`, a scratch workspace through a bounded mtime walk) and is also folded into `last_failure_error`, so the retry verifies those files instead of redoing the work. |
 | `gave_up` | `{failures, effective_limit, limit_source, error, terminal_provider?}` | Circuit breaker fired after N consecutive non-successful attempts. Task auto-blocks with the last error. The effective limit resolves as task `max_retries`, then dispatcher `failure_limit` / `kanban.failure_limit`, then the built-in default. `terminal_provider: true` means the worker exited `78` on a provider error a retry cannot fix (credential revoked, model gone) — including a startup credential failure that explicitly requires re-login (`hermes auth` / `setup`), which exits `78` before the first turn; other startup failures exit `1` — and the breaker fired on that first attempt, sticky, regardless of the limit. |
 
 `hermes kanban tail <id>` shows these for a single task. `hermes kanban watch` streams them board-wide.

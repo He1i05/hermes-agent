@@ -142,6 +142,11 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    work_present: list[str] = field(default_factory=list)
+    """Task ids whose worker exited cleanly (rc=0) after leaving artifacts in its
+    workspace but without a landed terminal board call. Booked as the run outcome
+    ``work_present``, requeued WITHOUT counting a failure, and NOT a crash: the
+    work exists and the retry worker is told to verify it before redoing it."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -942,11 +947,13 @@ _PROTOCOL_VIOLATION_SCAN_LIMIT = 50
 
 
 def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
-    """Count the task's trailing run of clean-exit protocol violations.
+    """Count the task's trailing run of clean exits that filed no handoff.
 
     Walks closed runs newest-first (including the one ``detect_crashed_workers``
     just closed). ``rate_limited`` runs are neutral and skipped (a quota wall
-    says nothing about the task); any other closed run breaks the streak, so
+    says nothing about the task); ``work_present`` rows count like violations
+    (work landed, paperwork did not — a card that keeps producing output and never
+    files must still reach ``gave_up``); any other closed run breaks the streak, so
     the budget counts ONLY protocol violations. Violations are recognized by the
     ``protocol_violation`` run-metadata marker, with the error text as fallback
     for runs recorded before the marker existed.
@@ -962,6 +969,9 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
         outcome = row["outcome"] or ""
         if outcome == "rate_limited":
             continue
+        if outcome == "work_present":
+            streak += 1
+            continue
         if outcome == "crashed" and (
             _kb._json_dict(row["metadata"]).get("protocol_violation")
             or "protocol violation" in (row["error"] or "")
@@ -972,21 +982,25 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
-_PROTOCOL_VIOLATION_ERROR = (
-    # Worker subprocess returned 0 but its task is still ``running`` in the DB — it exited without calling
-    # ``kanban_complete`` / ``kanban_block`` / ``kanban_request_review``. Overwhelmingly the work itself succeeded and only the
-    # paperwork was skipped, so a retry usually completes; the corrective sentence below is surfaced to the
-    # retry worker via the prior-attempt error in ``build_worker_context`` (guidance approach from #61817).
-    # Keep this short: ``_record_task_failure`` caps the stored error at 500 chars and the worker's own
-    # last output (``_worker_final_output``, up to 400 chars) is appended after it — a longer preamble
-    # truncates away the worker's explanation, which is the part the board and the retry worker need.
-    "worker exited cleanly (rc=0) without kanban_complete, kanban_block "
-    "or kanban_request_review — protocol violation. "
-    "If the prior run already did the work, verify it and "
-    "report it via kanban_complete (or kanban_request_review); "
-    "a run without a terminal kanban call counts as failed no "
-    "matter what it did."
-)
+def _protocol_violation_error() -> str:
+    """The retry worker's corrective sentence, naming every terminal tool.
+
+    Derived from ``agent.kanban_stop._TERMINAL_KANBAN_TOOLS`` (lazily, so import
+    order stays free) instead of hand-listing three of the five: this text is what
+    the retry worker reads, and a hand-written list already under-described the
+    contract once (``kanban_request_changes`` / ``kanban_schedule`` omitted).
+    """
+    from agent.kanban_stop import _TERMINAL_KANBAN_TOOLS
+
+    tools = ", ".join(sorted(_TERMINAL_KANBAN_TOOLS))
+    # Keep this short: the stored error is capped at 500 chars and the worker's own last output
+    # (up to 400 chars) is appended after it — a longer preamble truncates away the worker's
+    # explanation, which is the part the board and the retry worker need.
+    return (
+        f"worker exited cleanly (rc=0) without a terminal kanban call ({tools}) "
+        "— protocol violation. If the prior run already did the work, verify it and file "
+        "the handoff."
+    )
 
 
 # Rich panel/rule chrome around the rendered response, and the CLI's own preamble lines.
@@ -1004,7 +1018,9 @@ def _log_noise_prefixes() -> tuple[str, ...]:
     return ("session_id:", "Query:", t("cli.chat.initializing_agent"))
 
 
-def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
+def _worker_final_output(
+    task_id: str, board: Optional[str] = None, *, log_text: Optional[str] = None,
+) -> str:
     """Best-effort read of a dead worker's last printed text, for the board diagnostic.
 
     A ``chat -q`` worker's stdout/stderr are redirected to its per-task log
@@ -1017,10 +1033,12 @@ def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
 
     ``board`` must come from the dispatching tick: ambient current-board resolution
     is wrong for every board but the one the dispatcher thread happens to call
-    "current", so the log would silently not be found.
+    "current", so the log would silently not be found. ``log_text`` lets a caller
+    that already read the log (the clean-exit verdict needs the run segment) pass
+    it in instead of paying a second read.
     """
     try:
-        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
+        raw = log_text if log_text is not None else _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
     except Exception:
         return ""
     if not raw:
@@ -1037,6 +1055,190 @@ def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
     return " ".join(lines)[-400:]
 
 
+# --- Clean-exit verdict: evidence, not a bare rc=0 -------------------------------------
+#
+# ``_exit_code_kind`` has no cause parameter: 0 -> ``clean_exit``, full stop, and that branch
+# used to book ``protocol_violation`` unconditionally. A provider quota abort exits rc=0, and a
+# worker that did the work but never filed the handoff exits rc=0 with the artifacts sitting in
+# its workspace. Both were booked as the same crash. The cascade below tests cause first
+# (provider wall -> ``rate_limited``), then evidence (-> ``work_present``), then the violation.
+
+# Provider-wall signatures in the run-scoped log segment (the audit's measured causes).
+_PROVIDER_WALL_RE = re.compile(
+    r"HTTP 429|session usage limit|out of credits|Non-retryable client error", re.IGNORECASE
+)
+
+# The submitter prints ``Session: <id>`` to stderr at claim
+# (``kanban_worker_client._submit_claim``), the audit's own join key; the CLI's exit summary
+# prints the same label with an aligned column (``Session:        <id>``). A generous tail keeps
+# a whole run block inside the window while staying bounded.
+_CLAIM_SESSION_RE = re.compile(r"^Session: \S+[ \t]*$", re.MULTILINE)
+_SUMMARY_SESSION_RE = re.compile(r"^Session:[ \t]{2,}\S+[ \t]*$", re.MULTILINE)
+_RUN_SEGMENT_TAIL_BYTES = 200_000
+# Tail used for the worker-output diagnostic when the log carries no attributable run block.
+_WORKER_OUTPUT_TAIL_BYTES = 8000
+
+# Bounded artifact probe. Scratch workspaces are small by construction, so the caps are a
+# safety net, not the mechanism; the probe runs OUTSIDE the board write transaction.
+_EVIDENCE_MAX_ENTRIES = 5000
+_EVIDENCE_MAX_SECONDS = 0.25
+_EVIDENCE_MAX_DEPTH = 6
+_EVIDENCE_LIMIT = 5
+_EVIDENCE_SKIP_DIRS = frozenset({".git", "node_modules", "__pycache__"})
+_GIT_PROBE_TIMEOUT_SECONDS = 3
+
+
+def _run_scoped_log_segment(log_text: Optional[str]) -> Optional[str]:
+    """Log text belonging to this run; None when the log cannot be attributed to it.
+
+    Two shapes exist, both in the audit's population:
+
+    * a managed submitter prints ``Session: <id>`` at claim
+      (``kanban_worker_client._submit_claim``), so the run body follows the **last** such
+      marker (the CLI's exit summary, ``Session:        <id>`` with an aligned column, is not
+      a claim marker and comes after it);
+    * a one-shot worker prints only the exit summary, so consecutive runs in one append-mode
+      log are separated by those summary lines and this run's body is what sits between the
+      last two of them (the whole log when there is only one).
+
+    None is fail-closed: an owner that refused before submitting leaves no run block, so there
+    is no cause to read and no artifact window to trust — the verdict falls back to the protocol
+    violation rather than guessing from a previous attempt's output.
+    """
+    if not log_text:
+        return None
+    claims = list(_CLAIM_SESSION_RE.finditer(log_text))
+    if claims:
+        return log_text[claims[-1].end():]
+    summaries = list(_SUMMARY_SESSION_RE.finditer(log_text))
+    if not summaries:
+        return None
+    start = summaries[-2].end() if len(summaries) >= 2 else 0
+    return log_text[start:summaries[-1].start()]
+
+
+def _git_probe(workspace: Path, *args: str) -> Optional[str]:
+    """Bounded ``git -C <ws> <args>`` stdout; None on any failure (never raises)."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(workspace), *args],
+            capture_output=True, text=True, timeout=_GIT_PROBE_TIMEOUT_SECONDS, check=False,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def _relative(path: Path, workspace: Path) -> str:
+    """Path relative to the workspace: no absolute home paths in ``last_failure_error``."""
+    try:
+        return str(path.relative_to(workspace))
+    except ValueError:
+        return path.name
+
+
+def _worktree_evidence(workspace: Path, since: float) -> list[str]:
+    """Dirty paths edited during the run, else a HEAD commit made during the run.
+
+    ``git status`` is authoritative for "edited but not filed" and immune to any entry cap.
+    Each reported path is time-windowed where it still exists, so old dirt carried over from an
+    earlier attempt is not booked as this run's work; a path that no longer exists counts as
+    this run's (deleted work is still work).
+    """
+    status = _git_probe(workspace, "status", "--porcelain", "--untracked-files=normal")
+    hits: list[str] = []
+    for line in (status or "").splitlines():
+        entry = line[3:].strip() if len(line) > 3 else ""
+        if not entry:
+            continue
+        path = workspace / entry.split(" -> ")[-1]
+        try:
+            if path.stat().st_mtime < since:
+                continue
+        except OSError:
+            pass
+        hits.append(_relative(path, workspace))
+        if len(hits) >= _EVIDENCE_LIMIT:
+            return hits
+    if hits:
+        return hits
+    head = _git_probe(workspace, "log", "-1", "--format=%ct")
+    try:
+        if head and int(head.strip()) >= int(since):
+            return ["HEAD committed during this run"]
+    except (TypeError, ValueError):
+        return []
+    return []
+
+
+def _scratch_evidence(workspace: Path, since: float) -> list[str]:
+    """Non-empty regular files in a scratch workspace whose mtime is inside the run window."""
+    deadline = time.monotonic() + _EVIDENCE_MAX_SECONDS
+    hits: list[str] = []
+    seen = 0
+    stack: list[tuple[Path, int]] = [(workspace, 0)]
+    while stack and seen < _EVIDENCE_MAX_ENTRIES and time.monotonic() < deadline:
+        current, depth = stack.pop()
+        try:
+            it = os.scandir(current)
+        except OSError:
+            continue
+        with it:
+            for entry in it:
+                seen += 1
+                if seen >= _EVIDENCE_MAX_ENTRIES or time.monotonic() >= deadline:
+                    break
+                try:
+                    if entry.is_symlink():
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        if entry.name not in _EVIDENCE_SKIP_DIRS and depth + 1 <= _EVIDENCE_MAX_DEPTH:
+                            stack.append((Path(entry.path), depth + 1))
+                        continue
+                    stat = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.st_size > 0 and stat.st_mtime >= since:
+                    hits.append(_relative(Path(entry.path), workspace))
+                    if len(hits) >= _EVIDENCE_LIMIT:
+                        return hits
+    return hits
+
+
+def _workspace_evidence(
+    workspace_path: Optional[str], kind: Optional[str], since: Optional[float],
+) -> list[str]:
+    """Relative paths of work this run left in its workspace; ``[]`` on any doubt.
+
+    Kind-aware: a git worktree is probed through ``git status`` / ``git log -1`` (an mtime walk
+    measured 142 ms and 5 000 capped entries without a hit on a real worktree), a scratch
+    workspace through a bounded walk. Every failure path returns ``[]``, so a doubtful probe
+    books the protocol violation rather than a false ``work_present``.
+    """
+    if not workspace_path or since is None:
+        return []
+    try:
+        workspace = Path(workspace_path)
+        if not workspace.is_dir():
+            return []
+        since_epoch = float(since)
+        if kind == "worktree":
+            return _worktree_evidence(workspace, since_epoch)
+        return _scratch_evidence(workspace, since_epoch)
+    except (OSError, ValueError):
+        return []
+
+
+def _work_present_error(evidence: list[str]) -> str:
+    """The retry worker's instruction for a run that landed work but filed no handoff."""
+    return (
+        "worker exited cleanly (rc=0) after landing work but without a terminal kanban "
+        "call — recorded as work_present, not a crash. Evidence in the task workspace: "
+        f"{', '.join(evidence)}. Verify these files before redoing the work, then file "
+        "the handoff."
+    )
+
+
 @dataclass
 class _DeadWorker:
     """How ``detect_crashed_workers`` should book one dead worker."""
@@ -1051,17 +1253,29 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
+    work_present: bool = False
+    """A clean exit with artifact evidence in the run window but no landed terminal call:
+    the work exists, the paperwork is missing."""
+    evidence: list[str] = field(default_factory=list)
+    """Workspace-relative paths that carry the evidence for ``work_present``."""
 
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
-        # doesn't show a phantom crash for a quota wall.
-        return "rate_limited" if self.rate_limited else "crashed"
+        # doesn't show a phantom crash for a quota wall; landed work without a
+        # handoff is ``work_present`` so it isn't shown as one either.
+        if self.rate_limited:
+            return "rate_limited"
+        if self.work_present:
+            return "work_present"
+        return "crashed"
 
 
 def _classify_dead_worker(
     pid: int, claimer: Optional[str], exit_code=None, *, task_id: Optional[str] = None,
-    board: Optional[str] = None,
+    board: Optional[str] = None, workspace_kind: Optional[str] = None,
+    workspace_path: Optional[str] = None, run_started_at: Optional[float] = None,
+    log_text: Optional[str] = None,
 ) -> _DeadWorker:
     """Map a dead worker's reaped exit status to its reclaim bookkeeping.
 
@@ -1069,13 +1283,76 @@ def _classify_dead_worker(
     in the event payload, appended to the error text) so the board and the retry
     worker see WHY instead of a bare label; a rate-limited requeue does not need it.
     """
-    dead = _classify_dead_worker_exit(pid, claimer, exit_code, task_id=task_id, board=board)
+    dead = _classify_dead_worker_exit(
+        pid, claimer, exit_code, task_id=task_id, board=board,
+        workspace_kind=workspace_kind, workspace_path=workspace_path,
+        run_started_at=run_started_at, log_text=log_text,
+    )
     if task_id and not dead.rate_limited:
-        worker_output = _worker_final_output(task_id, board=board)
+        # Quote only THIS run's text: the whole 200 KB log may hold earlier attempts whose
+        # exit summary would otherwise be mistaken for this one (and whose prose would surface
+        # on the board as if this worker had said it). No attributable run block -> the bounded
+        # tail, exactly what the diagnostic read before.
+        source = _run_scoped_log_segment(log_text)
+        if source is None and log_text:
+            source = log_text[-_WORKER_OUTPUT_TAIL_BYTES:]
+        worker_output = _worker_final_output(task_id, board=board, log_text=source)
         if worker_output:
             dead.error_text += f" Worker's last output: {worker_output!r}"
             dead.event_payload["worker_output"] = worker_output
     return dead
+
+
+def _classify_clean_exit(
+    pid: int,
+    claimer: Optional[str],
+    code: int,
+    *,
+    workspace_kind: Optional[str] = None,
+    workspace_path: Optional[str] = None,
+    run_started_at: Optional[float] = None,
+    log_text: Optional[str] = None,
+) -> _DeadWorker:
+    """``rc=0`` with the card still ``running``: cause first, evidence second, violation last.
+
+    A provider wall is tested BEFORE artifact evidence on purpose: in the audited runs the 429
+    landed after the work, so booking ``work_present`` first would requeue the card straight
+    into a proven-exhausted provider. ``rate_limited`` takes the cooldown and hands the evidence
+    to the retry worker through metadata instead.
+    """
+    segment = _run_scoped_log_segment(log_text)
+    if segment is not None and _PROVIDER_WALL_RE.search(segment):
+        payload: dict = {"pid": pid, "claimer": claimer, "exit_code": code}
+        evidence = _workspace_evidence(workspace_path, workspace_kind, run_started_at)
+        if evidence:
+            payload["evidence"] = evidence
+        return _DeadWorker(
+            "clean_exit", code,
+            f"pid {pid} exited cleanly on a provider quota/usage wall (rc=0) — requeued as "
+            "rate_limited without counting a failure",
+            "rate_limited", payload, rate_limited=True, evidence=evidence,
+        )
+    if segment is not None:
+        evidence = _workspace_evidence(workspace_path, workspace_kind, run_started_at)
+        if evidence:
+            return _DeadWorker(
+                "clean_exit", code, _work_present_error(evidence), "work_present",
+                {
+                    "pid": pid, "claimer": claimer, "exit_code": code,
+                    "work_present": True, "evidence": evidence,
+                },
+                work_present=True, evidence=evidence,
+            )
+    # rc=0 with nothing landed and nothing left behind: today's verdict, with text that
+    # names every terminal tool (derived from the guard's own set).
+    return _DeadWorker(
+        "clean_exit", code, _protocol_violation_error(), "protocol_violation",
+        # ``protocol_violation`` is the durable marker for
+        # _protocol_violation_streak: _end_run copies this payload into the
+        # run metadata.
+        {"pid": pid, "claimer": claimer, "exit_code": code, "protocol_violation": True},
+        protocol_violation=True,
+    )
 
 
 def _classify_dead_worker_exit(
@@ -1085,6 +1362,10 @@ def _classify_dead_worker_exit(
     *,
     task_id: Optional[str] = None,
     board: Optional[str] = None,
+    workspace_kind: Optional[str] = None,
+    workspace_path: Optional[str] = None,
+    run_started_at: Optional[float] = None,
+    log_text: Optional[str] = None,
 ) -> _DeadWorker:
     """Exit status -> reclaim bookkeeping, before the worker's own words are folded in.
 
@@ -1094,6 +1375,9 @@ def _classify_dead_worker_exit(
     the worker left in its log instead, so the same death gets the same booking (protocol
     violation / rate-limit requeue / crash) as under the gateway-embedded dispatcher. A worker
     that never reached its exit epilogue (killed, OOM) leaves no trailer and stays a plain crash.
+
+    ``workspace_kind`` / ``workspace_path`` / ``run_started_at`` feed the clean-exit evidence
+    probe only; they are read from the task row and the current run by the sweep.
     """
     kind, code = _classify_worker_exit(pid)
     if exit_code is not None:
@@ -1106,13 +1390,10 @@ def _classify_dead_worker_exit(
         # rc=0 while still ``running``: usually the work succeeded and only the
         # paperwork was skipped; the corrective sentence reaches the retry
         # worker via ``build_worker_context``.
-        return _DeadWorker(
-            kind, code, _PROTOCOL_VIOLATION_ERROR, "protocol_violation",
-            # ``protocol_violation`` is the durable marker for
-            # _protocol_violation_streak: _end_run copies this payload into the
-            # run metadata.
-            {"pid": pid, "claimer": claimer, "exit_code": code, "protocol_violation": True},
-            protocol_violation=True,
+        return _classify_clean_exit(
+            pid, claimer, code,
+            workspace_kind=workspace_kind, workspace_path=workspace_path,
+            run_started_at=run_started_at, log_text=log_text,
         )
     if kind == "rate_limited":
         # Quota wall — NOT a task failure. Release to the source phase and do
@@ -1150,25 +1431,80 @@ def _classify_dead_worker_exit(
 
 
 @dataclass
+class _ReclaimCandidate:
+    """One dead worker selected in phase 1, classified in phase 2, booked in phase 3."""
+
+    task_id: str
+    assignee: Optional[str]
+    pid: int
+    claim_lock: str
+    workspace_kind: Optional[str]
+    workspace_path: Optional[str]
+    run_started_at: Optional[float]
+    exit_code: Optional[int]
+
+
+@dataclass
 class _CrashSweep:
     """Everything ``detect_crashed_workers`` collects inside its reclaim txn."""
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
+    # Booked ``work_present``: landed work, missing handoff. NOT crashes (the work
+    # exists); they are requeued like a protocol violation and counted by the
+    # violation-only streak so a card that never files still reaches ``gave_up``.
+    work_present: list[str] = field(default_factory=list)
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
-    # ``_record_task_failure`` (needs its own write_txn).
+    # ``_record_task_failure`` (needs its own write_txn). ``work_present`` entries
+    # ride here too: they are accounting work, not crash reporting.
     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
     # Worker-exit observer payloads, fired only after every reclaim/accounting
     # txn has committed.
     exited_hook_payloads: list[dict] = field(default_factory=list)
 
 
+def _run_window_start(conn: sqlite3.Connection, row) -> Optional[float]:
+    """Epoch start of the task's current run, falling back to its claim start.
+
+    Every artifact timestamp must fall inside this window. The run row is the attempt's
+    own clock (``tasks.started_at`` only says when the claim began, which for a retried
+    card is the same thing — but the run row survives a re-claim ordering accident).
+    """
+    run_id = _kb._row_get(row, "current_run_id")
+    if run_id is not None:
+        try:
+            run_row = conn.execute(
+                "SELECT started_at FROM task_runs WHERE id = ?", (int(run_id),)
+            ).fetchone()
+        except (sqlite3.Error, TypeError, ValueError):
+            run_row = None
+        started = _kb._to_epoch(_kb._row_get(run_row, "started_at"))
+        if started is not None:
+            return started
+    return _kb._to_epoch(_kb._row_get(row, "started_at"))
+
+
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
-    """Release every host-local ``running`` task whose worker PID is dead."""
+    """Release every host-local ``running`` task whose worker PID is dead.
+
+    Three phases, because the artifact probe is filesystem/git work and must not run under the
+    board write lock — a capped mtime walk inside ``write_txn`` measured 142 ms on a real
+    worktree and still false-negatived on a deep edit:
+
+    1. select + the liveness/ownership gates (same txn shape as before);
+    2. classify with NO transaction: exit kind, run-scoped log segment, workspace evidence;
+    3. re-take the write txn and book through the existing conditional UPDATE, which already
+       tolerates a lost race (``rowcount != 1``).
+
+    Only the filesystem/git work moved out. ``_worker_alive`` and ``owner_reclaim_blocked`` stay
+    on the connection that owns the claim decision, so no new locking primitive is introduced.
+    """
     sweep = _CrashSweep()
+    candidates: list[_ReclaimCandidate] = []
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee, "
+            "workspace_kind, workspace_path, current_run_id "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -1193,50 +1529,83 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             pid = int(row["worker_pid"])
             # A managed run's authority-recorded exit (its bound interpreter's, under this claim).
             exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
-            dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
-            retry_status = _kb._retry_status_for_run(conn, row["id"])
+            candidates.append(_ReclaimCandidate(
+                task_id=row["id"],
+                assignee=_kb._row_get(row, "assignee"),
+                pid=pid,
+                claim_lock=row["claim_lock"],
+                workspace_kind=_kb._row_get(row, "workspace_kind"),
+                workspace_path=_kb._row_get(row, "workspace_path"),
+                run_started_at=_run_window_start(conn, row),
+                exit_code=exit_code,
+            ))
+
+    # Phase 2 — outside every transaction: reading the worker log and probing the workspace
+    # (git subprocess / mtime walk) must never extend the board lock's hold time.
+    bookings: list[tuple[_ReclaimCandidate, _DeadWorker]] = []
+    for cand in candidates:
+        try:
+            log_text = _kb.read_worker_log(
+                cand.task_id, tail_bytes=_RUN_SEGMENT_TAIL_BYTES, board=board,
+            )
+        except Exception:
+            log_text = None
+        dead = _classify_dead_worker(
+            cand.pid, cand.claim_lock, cand.exit_code, task_id=cand.task_id, board=board,
+            workspace_kind=cand.workspace_kind, workspace_path=cand.workspace_path,
+            run_started_at=cand.run_started_at, log_text=log_text,
+        )
+        bookings.append((cand, dead))
+
+    # Phase 3 — book, re-checking the claim this decision was made for.
+    with _kb.write_txn(conn):
+        for cand, dead in bookings:
+            retry_status = _kb._retry_status_for_run(conn, cand.task_id)
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, row["id"], pid, row["claim_lock"]),
+                (retry_status, cand.task_id, cand.pid, cand.claim_lock),
             )
             if cur.rowcount != 1:
                 continue
             run_id = _kb._end_run(
-                conn, row["id"],
+                conn, cand.task_id,
                 outcome=dead.run_outcome, status=dead.run_outcome,
                 error=dead.error_text,
                 metadata=dict(dead.event_payload),
             )
-            _kb._append_event(conn, row["id"], dead.event_kind, dead.event_payload, run_id=run_id)
+            _kb._append_event(conn, cand.task_id, dead.event_kind, dead.event_payload, run_id=run_id)
             sweep.exited_hook_payloads.append({
-                "task_id": row["id"],
-                "assignee": row["assignee"],
+                "task_id": cand.task_id,
+                "assignee": cand.assignee,
                 "run_id": run_id,
-                "worker_pid": pid,
+                "worker_pid": cand.pid,
                 "exit_kind": dead.kind,
                 "exit_code": dead.code,
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation:
+            if dead.rate_limited or dead.protocol_violation or dead.work_present:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
-                # blocker; a below-budget protocol violation never reaches
-                # ``_record_task_failure`` (which stamps this column), yet the
+                # blocker; a below-budget protocol violation or ``work_present`` never
+                # reaches ``_record_task_failure`` (which stamps this column), yet the
                 # board UI and retry worker need the corrective message.
                 conn.execute(
                     "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
-                    (dead.error_text[:500], row["id"]),
+                    (dead.error_text[:500], cand.task_id),
                 )
             if dead.rate_limited:
-                sweep.rate_limited.append(row["id"])
+                sweep.rate_limited.append(cand.task_id)
+            elif dead.work_present:
+                sweep.work_present.append(cand.task_id)
+                sweep.crash_details.append((cand.task_id, cand.pid, cand.claim_lock, dead))
             else:
-                sweep.crashed.append(row["id"])
-                sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
+                sweep.crashed.append(cand.task_id)
+                sweep.crash_details.append((cand.task_id, cand.pid, cand.claim_lock, dead))
     return sweep
 
 
@@ -1256,7 +1625,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
     for tid, pid, claimer, dead in crash_details:
         error_text = dead.error_text
-        if dead.protocol_violation:
+        if dead.protocol_violation or dead.work_present:
             streak = _protocol_violation_streak(conn, tid)
             trow = conn.execute("SELECT max_retries FROM tasks WHERE id = ?", (tid,)).fetchone()
             if trow is None:
@@ -1269,11 +1638,19 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 # Below budget: already back at ``ready`` with the error stamped.
                 # No ``_record_task_failure`` — must not consume the unified budget.
                 continue
+            trip_error = error_text
+            if dead.work_present:
+                # A retry cannot clear this: the card keeps landing work and never filing the
+                # handoff, so the operator has to look at the workspace, not just press retry.
+                trip_error = (
+                    f"{error_text} The card keeps producing work without a handoff — "
+                    "an operator must inspect the workspace."
+                )
             # ``force_trip``: the decision (incl. per-task ``max_retries``) was
             # already made against the violation streak above.
             tripped = _record_task_failure(
                 conn, tid,
-                error=error_text,
+                error=trip_error,
                 outcome="crashed",
                 failure_limit=violation_limit,
                 force_trip=True,
@@ -1284,6 +1661,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                     "claimer": claimer,
                     "protocol_violations": streak,
                     "protocol_violation_limit": violation_limit,
+                    **({"work_present": True} if dead.work_present else {}),
                 },
             )
         elif dead.terminal_provider:
@@ -1325,8 +1703,11 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
 
     Restores the source phase immediately (no waiting for the claim TTL), for
     tasks claimed by *this host* only — other hosts' PIDs are meaningless.
-    Clean exit while ``running`` is a protocol violation with a bounded
-    violation-only retry budget; ``KANBAN_RATE_LIMIT_EXIT_CODE`` is a quota
+    A clean exit while ``running`` is classified by cause: provider wall ->
+    ``rate_limited`` (quota, no failure counted), artifact evidence inside the run
+    window -> ``work_present`` (the work exists, the handoff does not; no failure
+    counted, but the violation streak advances), otherwise a protocol violation with
+    a bounded violation-only retry budget. ``KANBAN_RATE_LIMIT_EXIT_CODE`` is a quota
     wall, released WITHOUT counting a failure and surfaced via the
     ``_last_rate_limited`` attribute (the return stays crashed-only).
     """
@@ -1335,9 +1716,11 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
     # Side-channel attributes keep the public ``list[str]`` return stable;
     # ``dispatch_once`` reads them to populate ``DispatchResult``. Rate-limited
-    # requeues did NOT count a failure and are NOT crashes.
+    # requeues did NOT count a failure and are NOT crashes; ``work_present`` runs
+    # left real work behind and are not crashes either.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_work_present = sweep.work_present  # type: ignore[attr-defined]
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -2229,6 +2612,7 @@ def _run_reclaim_phase(
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+    result.work_present.extend(getattr(detect_crashed_workers, "_last_work_present", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
