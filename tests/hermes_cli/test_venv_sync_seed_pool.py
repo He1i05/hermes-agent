@@ -6,6 +6,7 @@ leave today's path byte-for-byte, and the owner root must never touch pool code 
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
 from pathlib import Path
@@ -255,9 +256,15 @@ def test_owner_launch_calls_no_pool_code(tmp_path, monkeypatch):
     root = tmp_path / "owner-checkout"
     (root / ".git").mkdir(parents=True)
     (root / "pyproject.toml").write_text("[project]\nname = 'example'\nversion = '0.0.0'\n", encoding="utf-8")
+    (root / "uv.lock").write_text("version = 1\n", encoding="utf-8")
     (root / "install-stamp.json").write_text('{"updateMechanism": "self"}', encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+    from pm import features
+
+    # A frozen bundle's enabled-features.json sits beside the checkout -- the real home in a
+    # test run. Pin the no-bundle answer (see _stub_sync_inputs).
+    monkeypatch.setattr(features, "read_features", lambda: None)
     store_python = tmp_path / "store" / "bin" / "python3"
     store_python.parent.mkdir(parents=True)
     store_python.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -271,3 +278,19 @@ def test_owner_launch_calls_no_pool_code(tmp_path, monkeypatch):
 
     assert venv_sync.prepare_launch(root, []) == store_python
     assert calls == []
+
+    # A6/A12: with a generation already committed, an owner launch leaves the recorded state
+    # byte-identical and creates no second stamp -- the pool may not re-record, re-stamp or
+    # shadow the owner's own home on the way past.
+    from pm.environments import install_state_dir, runtime_facts_path
+
+    _committed_generation(root)
+    facts = runtime_facts_path(root)
+    before = hashlib.sha256(facts.read_bytes()).hexdigest()
+    listing = sorted(str(path.relative_to(install_state_dir(root))) for path in install_state_dir(root).rglob("*"))
+
+    assert venv_sync.prepare_launch(root, []) == store_python
+    assert calls == []
+    assert hashlib.sha256(facts.read_bytes()).hexdigest() == before
+    assert sorted(str(path.relative_to(install_state_dir(root)))
+                  for path in install_state_dir(root).rglob("*")) == listing

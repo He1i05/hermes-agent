@@ -1170,10 +1170,18 @@ def publish_generation_to_pool(project_root: Path, *, owner: Path | None = None,
 
 def _seed_expected(package, fact: dict | None) -> tuple[list[str], str]:
     """``(enabled extras, expected stamp)`` exactly as a sync would derive them."""
+    from pm.extras import legacy_selection
+
     shipped, _frozen = _feature_policy(None, repair=False)
     recorded = fact.get("extras") if isinstance(fact, dict) else None
     if not isinstance(recorded, list) or any(not isinstance(extra, str) for extra in recorded):
-        recorded = []
+        # No record yet: this root has never committed a generation, so the sync that
+        # WOULD build it takes ``legacy_selection`` (venv_sync._sync_source_dependencies,
+        # _update_takeover) and publishes its result under THAT stamp. Deriving ``[]``
+        # here looked up a key no build of this root can ever produce, so every fresh
+        # borrowing root -- the one class the pool exists for -- missed the entry its own
+        # first launch had just published.
+        recorded = legacy_selection(package.project_root())
     enabled = sorted(set(_still_declared(package, recorded)) | set(shipped or []))
     return enabled, package.expected_stamp(enabled, **_member_inputs(None))
 

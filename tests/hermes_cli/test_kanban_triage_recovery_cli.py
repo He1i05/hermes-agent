@@ -71,6 +71,16 @@ needs_watchdog = pytest.mark.skipif(
     not WATCHDOG.is_file(), reason=f"operator watchdog script not installed at {WATCHDOG}",
 )
 
+#: Per-CLI-launch ceiling. A launch under a BORROWING data root (the ``tmp_path``
+#: ``HERMES_HOME`` every test here uses) is not a cheap process: ``venv_sync``
+#: prepares that root's dependencies and relaunches the command in the checkout's
+#: managed interpreter. Measured on this host (2026-10-22, `time env -i … kanban
+#: list`): 92-210 s for ONE launch, and a single launch in the 8-file concurrent
+#: landing run exceeded the old 240 s cap -- four false reds, all
+#: ``subprocess.TimeoutExpired``, zero assertion failures. The ceiling sits above
+#: the worst measured value instead of inside the host's load band.
+CLI_TIMEOUT_S = 900
+
 BODY = "BODY incident: two documents"
 BODY_V2 = "BODY incident v2: one document"
 
@@ -84,8 +94,13 @@ import json
 import os
 import sys
 
-hit_path = os.environ.pop("KANBAN_TEST_AUX_HIT", "")
-reply_path = os.environ.pop("KANBAN_TEST_AUX_REPLY", "")
+# ``get``, never ``pop``: importing ``hermes_cli.main`` can re-exec this driver into
+# the checkout's managed interpreter (``venv_sync`` prepares a borrowing data root,
+# then relaunches it). A popped knob is gone from the relaunched process's inherited
+# environment, so the second process would run the REAL aux client and the fan-out
+# would die with ``AuxiliaryClientUnavailable`` -- the stub must survive the relaunch.
+hit_path = os.environ.get("KANBAN_TEST_AUX_HIT", "")
+reply_path = os.environ.get("KANBAN_TEST_AUX_REPLY", "")
 if reply_path:
     from types import SimpleNamespace
 
@@ -263,7 +278,7 @@ class Board:
         return env
 
     def run(self, script: str, *args, env_extra: dict | None = None,
-            timeout: int = 240) -> subprocess.CompletedProcess:
+            timeout: int = CLI_TIMEOUT_S) -> subprocess.CompletedProcess:
         proc = subprocess.run(
             [sys.executable, str(self.scripts[script]), *[str(a) for a in args]],
             env=self.env(**(env_extra or {})),
@@ -321,6 +336,46 @@ def board(tmp_path) -> Board:
 
 
 # ── 1. the fixture really is the incident shape ────────────────────────────
+def test_the_cli_driver_knobs_survive_the_managed_relaunch(tmp_path):
+    """The harness contract this file depends on, pinned in two halves.
+
+    A borrowing ``HERMES_HOME`` makes ``venv_sync`` re-enter the CLI in the checkout's
+    managed interpreter (``os.execv`` with the inherited environment). The second process is
+    a fresh interpreter: an in-process monkeypatch of ``call_llm`` is gone there, so the driver
+    must re-read its knobs from the environment. It used to ``pop`` them -- the relaunched
+    process then ran the REAL aux client and four fan-out assertions died with
+    ``AuxiliaryClientUnavailable``, i.e. a silent red that looked like a product defect.
+
+    Half one pins the driver's own reading. Half two proves the relaunch actually hands the
+    knobs to the child, through the same ``relaunch_command`` ``hermes_bootstrap`` execs, so
+    the contract is not just this file's opinion of ``-I``.
+    """
+    assert 'os.environ.get("KANBAN_TEST_AUX_HIT"' in _CLI_DRIVER
+    assert 'os.environ.get("KANBAN_TEST_AUX_REPLY"' in _CLI_DRIVER
+    assert ".pop(" not in _CLI_DRIVER, "a popped knob is gone from the relaunched process"
+
+    from hermes_cli import venv_sync
+
+    root = tmp_path / "checkout"
+    root.mkdir()
+    probe = (
+        "import json, os\n"
+        "print(json.dumps({k: os.environ.get(k) for k in\n"
+        "                  ('KANBAN_TEST_AUX_HIT', 'KANBAN_TEST_AUX_REPLY')}))\n"
+    )
+    command = venv_sync.relaunch_command(
+        Path(sys.executable), root, ["-c", probe], [sys.executable, "-c", probe], None)
+    env = {"KANBAN_TEST_AUX_HIT": str(tmp_path / "hits.log"),
+           "KANBAN_TEST_AUX_REPLY": str(tmp_path / "reply.json"),
+           "PATH": "/usr/bin:/bin"}
+    result = subprocess.run(command, env=env, capture_output=True, text=True, check=True,
+                            timeout=60)
+    assert json.loads(result.stdout.strip().splitlines()[-1]) == {
+        "KANBAN_TEST_AUX_HIT": env["KANBAN_TEST_AUX_HIT"],
+        "KANBAN_TEST_AUX_REPLY": env["KANBAN_TEST_AUX_REPLY"],
+    }
+
+
 def test_hermetic_board_reproduces_the_incident_shape(board):
     """The shape, plus the two harness invariants every later assertion needs."""
     fixture = board.setup()

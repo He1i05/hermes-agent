@@ -90,3 +90,38 @@ def test_relaunch_env_contract_knobs_survive_pythonpath_does_not(tmp_path):
     assert observed["knob"] == "on"
     assert observed["env_pythonpath"].endswith("stub")
     assert observed["on_sys_path"] is False
+
+
+def test_the_real_relaunch_command_is_what_carries_the_env_contract(tmp_path):
+    """The test above spells ``[python, "-I", "-c", …]`` itself; drive the launcher's own.
+
+    That copy would keep passing if ``relaunch_command`` stopped inheriting the environment
+    or stopped passing ``-I`` -- and every CLI-boundary harness would break exactly as
+    ``test_kanban_triage_recovery_cli`` did: the second process is a fresh interpreter, so an
+    in-process monkeypatch is gone while a knob re-read from the environment survives. Taking
+    the command from the function ``hermes_bootstrap`` execs makes the copy unnecessary.
+    """
+    root = tmp_path / "checkout"
+    root.mkdir()
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    script = (
+        "import json, os, sys\n"
+        "print(json.dumps({'knob': os.environ.get('HERMES_TEST_KNOB'),\n"
+        "                  'env_pythonpath': os.environ.get('PYTHONPATH'),\n"
+        "                  'on_sys_path': any('stub' in entry for entry in sys.path),\n"
+        f"                  'checkout_on_path': {str(root)!r} in sys.path,\n"
+        "                  'isolated': bool(sys.flags.isolated)}))\n"
+    )
+    command = venv_sync.relaunch_command(
+        Path(sys.executable), root, ["-c", script], [sys.executable, "-c", script], None)
+    assert "-I" in command[1:-1], command  # the isolation flag is the contract, not an accident
+    env = dict(os.environ, HERMES_TEST_KNOB="on", PYTHONPATH=str(stub))
+    result = subprocess.run(command, env=env, capture_output=True, text=True, check=True,
+                            timeout=60)
+    observed = json.loads(result.stdout.strip().splitlines()[-1])
+    assert observed["isolated"] is True
+    assert observed["knob"] == "on"                       # an env-read knob survives
+    assert observed["env_pythonpath"].endswith("stub")    # PYTHONPATH is inherited...
+    assert observed["on_sys_path"] is False               # ...and inert under -I
+    assert observed["checkout_on_path"] is True           # the checkout is authoritative instead
