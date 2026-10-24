@@ -123,17 +123,6 @@ VALID_PAYLOAD = {
 }
 
 
-def _design_reply(**overrides) -> str:
-    payload = {
-        "title": "Design the widget pipeline contract",
-        "card_type": "design",
-        "body": "**Goal**\nDecide how the widget pipeline is structured.",
-        "design": VALID_PAYLOAD,
-    }
-    payload.update(overrides)
-    return jsonlib.dumps(payload)
-
-
 # ---------------------------------------------------------------------------
 # Contract shape
 # ---------------------------------------------------------------------------
@@ -469,12 +458,6 @@ def test_payload_validation_flags_single_option_and_missing_recommendation():
     })
     assert "D5: fewer than 2 options" in result.violations
     assert "D5: no named recommendation in the payload" in result.violations
-
-
-# ---------------------------------------------------------------------------
-# Specifier wiring — design cards
-# ---------------------------------------------------------------------------
-
 
 
 # ---------------------------------------------------------------------------
