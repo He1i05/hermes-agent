@@ -434,6 +434,16 @@ What the verb does:
 - **leaves every other descendant exactly as it is** and lists it in the output —
   a child that failed on its own content, a `review` handoff, or a live `running`
   card is a hard refusal, not a silent cascade;
+- classifies **the card being abandoned itself**, not just its children: a root
+  (or a leaf) whose own latest booking is `card` refuses with
+  `card_class_root:<id>`, and a root that ran and failed *unreadably* refuses with
+  `unclassified_root:<id>` (an unreadable failure is not evidence the host caused
+  it). A pure fan-in root that never ran has no failure of its own to bury, so it
+  stays eligible — fail-closed applies to evidence, not to the absence of it;
+- re-validates each card's status **inside** the write transaction (`status !=
+  'archived'` *and* the status the plan saw): a card the dispatcher claimed
+  between plan and write is skipped and reported `raced`, with no status write,
+  no `abandoned` event and no worker termination;
 - with `--force` (and a reason of at least 20 characters) those refusals are
   overridden and recorded in the manifest as `overridden_safeguards`;
 - `--dry-run` prints the plan — including every scratch workspace it would reap
@@ -441,6 +451,15 @@ What the verb does:
 - `--keep-children` archives only the named card;
 - the verb is idempotent and is denied inside a delegated child agent, so a
   worker can never abandon its own card to escape review.
+
+The dashboard exposes the same verb: every card carries a `card` / `infra`
+failure-class badge, the task drawer has an **Explain** panel (failure class and
+evidence, retry budget, cooldown, owner-loss sentence, blocking children, and the
+abandon plan with its refusal reasons), and the status action row gains an
+**Abandon** button that is enabled only when the backend's plan says `eligible` —
+a refused plan carries its `blocked_by` reasons as the button's tooltip instead
+of returning a 409 the operator has to decode. The button never sends
+`force: true`: a forced close is a CLI decision.
 
 ### The `explain` payload
 
