@@ -1609,3 +1609,44 @@
 .hermes-kanban-trash-label {
   font-weight: 500;
 }
+
+/* Failure-class badge on a board card (explain payload, design §4): the same
+   card-vs-infrastructure distinction the abandon gate uses, so an operator can
+   see WHY a card is parked without opening the drawer. */
+.hermes-kanban-fc-badge {
+  font-size: 0.68rem;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.hermes-kanban-fc-badge--infrastructure {
+  color: var(--color-warning, #ff9e3b);
+  border-color: color-mix(in srgb, var(--color-warning, #ff9e3b) 45%, transparent);
+}
+
+.hermes-kanban-fc-badge--card {
+  color: var(--color-destructive, #ff6b3d);
+  border-color: color-mix(in srgb, var(--color-destructive, #ff6b3d) 45%, transparent);
+}
+
+/* Explain panel in the task drawer — derived read model, no writes. */
+.hermes-kanban-explain-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.hermes-kanban-explain-command {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  margin-top: 0.25rem;
+}
+
+/* The Abandon action is destructive, and only ever enabled when the backend's
+   plan says eligible (see ExplainSection / StatusActions). */
+.hermes-kanban-abandon:not(:disabled) {
+  color: var(--color-destructive, #d14a4a);
+  border-color: color-mix(in srgb, var(--color-destructive, #d14a4a) 45%, transparent);
+}
+
