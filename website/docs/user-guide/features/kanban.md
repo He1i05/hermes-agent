@@ -411,6 +411,56 @@ hermes kanban unblock  t_abc t_def
 hermes kanban block    t_abc "need input" --ids t_def t_hij
 ```
 
+### Abandoning a fan-in root (`hermes kanban abandon`)
+
+A decomposed root is a **fan-in**: it can only reach `done` once every child it
+fans in on is `done` or `archived`. When those children were killed by the
+*host* (a gateway restart, a lost owner) there is nothing to retry and nothing to
+fix, and the root would otherwise sit open forever.
+
+```bash
+hermes kanban show t_root --explain        # why is this card here?
+hermes kanban abandon t_root --reason "host killed the subtree on 2026-10-24" --dry-run
+hermes kanban abandon t_root --reason "host killed the subtree on 2026-10-24"
+```
+
+What the verb does:
+
+- archives the root **and** every non-terminal descendant whose latest failure
+  class is `infrastructure`, writing `abandon_reason` / `abandoned_by` /
+  `abandoned_at` on each card and one `abandoned` event per card (the root's
+  payload enumerates the whole scope, so the decision is reconstructable from
+  `task_events`);
+- **leaves every other descendant exactly as it is** and lists it in the output —
+  a child that failed on its own content, a `review` handoff, or a live `running`
+  card is a hard refusal, not a silent cascade;
+- with `--force` (and a reason of at least 20 characters) those refusals are
+  overridden and recorded in the manifest as `overridden_safeguards`;
+- `--dry-run` prints the plan — including every scratch workspace it would reap
+  — and writes nothing;
+- `--keep-children` archives only the named card;
+- the verb is idempotent and is denied inside a delegated child agent, so a
+  worker can never abandon its own card to escape review.
+
+### The `explain` payload
+
+`hermes kanban show <id> --explain` (and `GET /api/plugins/kanban/tasks/<id>`,
+and every card on `/board`) carries one derived object answering "why is this
+card here": `failure_class` (`card` / `infrastructure` / `null`) with its
+evidence, the `retry_budget` the breaker is actually applying, the `cooldown`
+the respawn guard is applying, the operator-facing `owner_loss` sentence, the
+`blocking_children` for a root, and the `abandon` plan with every refusal reason
+and the exact command to run. It is computed, never stored, so it cannot drift
+from the code that decides those things.
+
+:::note Infrastructure failures do not charge the retry budget
+A host-caused death is booked as `infrastructure`: it never increments
+`consecutive_failures`, never becomes sticky, and is retried with a cooldown
+instead of parking the card. `retry_budget.infra_used` counts those runs for the
+operator; it is informational (`infra_enforced: false`) — the classifier
+deliberately never parks a card the host killed.
+:::
+
 :::note Where an unblocked task lands
 `unblock` restores the safe source phase: **`review`** for reviewer-origin work
 whose parents are complete, **`ready`** for implementation work whose parents
@@ -978,6 +1028,8 @@ hermes kanban schedule <id> --at <ISO8601>             # set/clear a task's sche
 hermes kanban diagnostics [--json]                     # board health snapshot (alias: diag)
 hermes kanban link <parent_id> <child_id>
 hermes kanban unlink <parent_id> <child_id>
+hermes kanban abandon <id> --reason "<why>" [--dry-run] [--keep-children] [--force] [--json]
+                                              # archive a fan-in root + its host-killed frontier
 hermes kanban claim <id> [--ttl SECONDS]
 hermes kanban comment <id> "<text>" [--author NAME]
 
