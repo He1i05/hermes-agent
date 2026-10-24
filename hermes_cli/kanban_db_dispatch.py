@@ -147,6 +147,13 @@ class DispatchResult:
     workspace but without a landed terminal board call. Booked as the run outcome
     ``work_present``, requeued WITHOUT counting a failure, and NOT a crash: the
     work exists and the retry worker is told to verify it before redoing it."""
+    infrastructure_crashed: list[str] = field(default_factory=list)
+    """Task ids whose worker died of the HOST (gateway owner loss). The run is
+    recorded with ``infrastructure: true``, the card's retry budget is untouched,
+    and ``check_respawn_guard`` spaces the retry — never a card failure."""
+    infrastructure_burst: dict[str, int] = field(default_factory=dict)
+    """``{board: n}`` when one crash sweep booked ``>= 3`` host-caused deaths:
+    a host outage, answered with wider retry spacing and one warning log line."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -935,6 +942,70 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
+# ── host-caused owner loss: classify it, and never charge it to the card ──────
+#
+# A worker dies "of the host" when the gateway owner misses its RPC window; it
+# exits nonzero carrying one of a small, closed set of strings. Before this
+# classifier the crash sweep booked that as an ordinary ``_record_task_failure``:
+# ``consecutive_failures`` climbed to the card's limit, a healthy card parked, and
+# — when the same fingerprint appeared 3+ times in one sweep — the "systemic"
+# branch tripped it at 1 with ``sticky=True``, so a host outage parked cards
+# HARDER. Measured on the deployed board before the change: 41 ``gave_up`` trips
+# at failure_limit 2, every one of them host-caused.
+#
+# The rule (design card t_82e97446, Appendix B — the reviewed r2 body):
+#   * ANCHOR — the refusal wrapper must appear in the last 200 characters. That is
+#     the proof the worker died inside the gateway submit path; tightened here and
+#     measured at 0 of 231 crashed runs carrying gateway vocabulary without it.
+#   * LABEL — read after the FIRST wrapper of the whole output, cause-first. A
+#     window-truncated label depended on where the cut fell (11 of 82 measured
+#     runs) and position cannot decide it: both print orders occur in the wild.
+_INFRASTRUCTURE_TAIL_CHARS = 200
+_INFRASTRUCTURE_BURST_MIN = 3
+_HOST_LOSS_WRAPPER = "Kanban owner refused:"
+_WRAPPED_CLASSES = (  # ordered: CAUSE first, CONSEQUENCE last
+    ("Gateway connection timed out", "gateway_timeout"),
+    ("Gateway connection failed", "gateway_connection_failed"),
+    ("Gateway protocol mismatch", "gateway_protocol_mismatch"),
+    ("Gateway disconnected", "gateway_disconnected"),
+    ("Kanban execution unknown; retained by owner", "execution_unknown"),
+)
+_HOST_LOSS_BARE_TOKENS = ("owner_unavailable",)
+
+
+def _host_loss_class(worker_output: Optional[str]) -> Optional[str]:
+    """Closed-vocabulary host-loss class from the worker's own dying words, or ``None``.
+
+    Two separate decisions, deliberately not one:
+
+    * ANCHOR — the wrapper must appear in the last ``_INFRASTRUCTURE_TAIL_CHARS``
+      characters. That is the proof the worker died inside the gateway submit path.
+    * LABEL — read from the text after the FIRST wrapper of the whole output, with a
+      fixed cause-first priority (a named cause outranks the outcome line it produced).
+
+    ``owner_unavailable`` is checked against the tail only: it is raised as a
+    ``WorkerPersistenceError`` traceback and never carries the wrapper, but a report
+    that merely *mentions* the token must not classify on its own. Absent evidence
+    (no tail) yields ``None`` — the ordinary card path, never a guess.
+    """
+    text = worker_output or ""
+    tail = text[-_INFRASTRUCTURE_TAIL_CHARS:]
+    if not tail:
+        return None
+    for token in _HOST_LOSS_BARE_TOKENS:
+        if token in tail:
+            return "owner_unavailable"
+    if _HOST_LOSS_WRAPPER not in tail:  # anchor gate: not a host refusal
+        return None
+    after = text.split(_HOST_LOSS_WRAPPER, 1)[1]
+    for token, cls in _WRAPPED_CLASSES:
+        if token in after:
+            return cls
+    if "timed out" in after:  # bare timeout, incl. "Gateway bootstrap timed out"
+        return "owner_refused_timeout"
+    return "owner_refused_other"
+
+
 # ~96% of "clean exit without a terminal tool call" tasks complete on a later
 # run, so a protocol violation gets a bounded retry before the breaker trips.
 # The budget is a violation-only STREAK (``_protocol_violation_streak``),
@@ -977,6 +1048,33 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
             _kb._json_dict(row["metadata"]).get("protocol_violation")
             or "protocol violation" in (row["error"] or "")
         ):
+            streak += 1
+            continue
+        break
+    return streak
+
+
+def _infrastructure_streak_before(conn: sqlite3.Connection, task_id: str) -> int:
+    """Count the task's trailing run of *closed* host-caused runs.
+
+    Walks closed runs newest-first (``ended_at IS NOT NULL``, same bound as the
+    violation streak). ``rate_limited`` is neutral — a quota wall says nothing about
+    the card or the host — and any other closed outcome breaks the streak. The run
+    being booked is still open in phase 2 and is deliberately NOT in this walk: the
+    caller adds it, so a first host loss is a streak of ``1``, never ``0``.
+    """
+    streak = 0
+    rows = conn.execute(
+        "SELECT outcome, metadata FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY id DESC LIMIT ?",
+        (task_id, _PROTOCOL_VIOLATION_SCAN_LIMIT),
+    ).fetchall()
+    for row in rows:
+        outcome = row["outcome"] or ""
+        if outcome == "rate_limited":
+            continue
+        if outcome == "crashed" and _kb._json_dict(row["metadata"]).get("infrastructure"):
             streak += 1
             continue
         break
@@ -1259,6 +1357,12 @@ class _DeadWorker:
     the work exists, the paperwork is missing."""
     evidence: list[str] = field(default_factory=list)
     """Workspace-relative paths that carry the evidence for ``work_present``."""
+    infrastructure: bool = False
+    """The run died because the HOST (gateway owner) did: the run is recorded, the
+    card is not charged, and ``check_respawn_guard`` spaces the retry."""
+    infrastructure_class: Optional[str] = None
+    """Closed-vocabulary token from :func:`_host_loss_class`; ``None`` unless
+    ``infrastructure``. Decided once, in :func:`_classify_dead_worker`."""
 
     @property
     def run_outcome(self) -> str:
@@ -1301,6 +1405,19 @@ def _classify_dead_worker(
         if worker_output:
             dead.error_text += f" Worker's last output: {worker_output!r}"
             dead.event_payload["worker_output"] = worker_output
+    # The ONE place the class is decided. A card-content verdict always outranks a
+    # host-loss verdict: a quota wall, a clean exit that skipped the handoff, landed
+    # work without a handoff, or a rejected provider credential is about the card or
+    # the provider, never about the host — even when the tail quotes gateway text.
+    if dead.rate_limited or dead.protocol_violation or dead.work_present or dead.terminal_provider:
+        cls = None
+    else:
+        cls = _host_loss_class(dead.event_payload.get("worker_output"))
+    if cls:
+        dead.infrastructure = True
+        dead.infrastructure_class = cls
+        dead.event_payload["infrastructure"] = True
+        dead.event_payload["infrastructure_class"] = cls
     return dead
 
 
@@ -1455,6 +1572,12 @@ class _CrashSweep:
     # exists); they are requeued like a protocol violation and counted by the
     # violation-only streak so a card that never files still reaches ``gave_up``.
     work_present: list[str] = field(default_factory=list)
+    # Host-caused worker deaths booked in this sweep (the run is recorded, the card
+    # is not charged). ``infrastructure_burst`` maps the board to that count when it
+    # reaches ``_INFRASTRUCTURE_BURST_MIN`` — a host outage, answered with wider
+    # retry spacing and one loud log line, never with a sticky flag.
+    infrastructure: list[str] = field(default_factory=list)
+    infrastructure_burst: dict[str, int] = field(default_factory=dict)
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn). ``work_present`` entries
     # ride here too: they are accounting work, not crash reporting.
@@ -1556,7 +1679,34 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             workspace_kind=cand.workspace_kind, workspace_path=cand.workspace_path,
             run_started_at=cand.run_started_at, log_text=log_text,
         )
+        if dead.infrastructure:
+            # Pre-close on purpose: phase 3's ``_end_run`` is the only writer of this
+            # run's metadata, so the streak is computed here, while the run is still
+            # open — hence ``1 +`` (it counts the run being booked, never N-1).
+            dead.event_payload["infrastructure_streak"] = 1 + _infrastructure_streak_before(
+                conn, cand.task_id
+            )
         bookings.append((cand, dead))
+
+    # Burst pass: the same host failure 3+ times in ONE sweep is a host outage, not
+    # three bad cards. Stamp every classified run (spacing for the guard) and say it
+    # once, loudly. Deliberately no block, no sticky flag, no per-card bound.
+    infra = [d for _, d in bookings if getattr(d, "infrastructure", False)]
+    burst = len(infra)
+    if infra:
+        cooldown = min(
+            _kb._resolve_rate_limit_cooldown_seconds() * max(1, min(burst, 3)), 3600
+        )
+        for d in infra:
+            d.event_payload["infrastructure_burst"] = burst >= _INFRASTRUCTURE_BURST_MIN
+            d.event_payload["infrastructure_burst_count"] = burst
+            d.event_payload["infrastructure_cooldown_seconds"] = cooldown
+    if burst >= _INFRASTRUCTURE_BURST_MIN:
+        _kb._log.warning(
+            "kanban crash sweep: %d host-caused worker deaths in one sweep (classes=%s) "
+            "— booking as infrastructure, no retry budget charged",
+            burst, sorted({d.infrastructure_class for d in infra}),
+        )
 
     # Phase 3 — book, re-checking the claim this decision was made for.
     with _kb.write_txn(conn):
@@ -1607,6 +1757,14 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             else:
                 sweep.crashed.append(cand.task_id)
                 sweep.crash_details.append((cand.task_id, cand.pid, cand.claim_lock, dead))
+            if dead.infrastructure:
+                sweep.infrastructure.append(cand.task_id)
+                if dead.event_payload.get("infrastructure_burst"):
+                    board_name = board or _kb.get_current_board()
+                    sweep.infrastructure_burst[board_name] = (
+                        sweep.infrastructure_burst.get(board_name, 0)
+                        + 1
+                    )
     return sweep
 
 
@@ -1680,9 +1838,25 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True},
             )
         else:
-            is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
+            # A host-caused death is recorded, never charged: the flag leaves
+            # ``consecutive_failures`` untouched (``_record_task_failure``), keeps the
+            # card off the ``sticky`` branch (a burst of one host error is the
+            # definition of infrastructure, not of a systemic card defect), and the
+            # prefix makes the board's error column greppable by cause.
+            infrastructure = bool(getattr(dead, "infrastructure", False))
+            is_systemic = (not infrastructure) and fp_counts.get(_error_fingerprint(error_text), 0) >= 3
             extra = {"pid": pid, "claimer": claimer}
-            if is_systemic:
+            if infrastructure:
+                extra.update({
+                    "infrastructure": True,
+                    "infrastructure_class": dead.infrastructure_class,
+                    "infrastructure_streak": dead.event_payload.get("infrastructure_streak"),
+                    "infrastructure_burst": dead.event_payload.get("infrastructure_burst"),
+                })
+                # Local only: ``fp_counts`` was built from the unprefixed
+                # ``dead.error_text``, so the 80-char fingerprint window never shifts.
+                error_text = f"[host-caused] {error_text}"
+            elif is_systemic:
                 # Trips at 1, below any ``failure_limit``: hold it for an operator.
                 extra["sticky"] = True
             tripped = _record_task_failure(
@@ -1693,6 +1867,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 release_claim=False,
                 end_run=False,
                 event_payload_extra=extra,
+                infrastructure=infrastructure,
             )
         if tripped:
             auto_blocked.append(tid)
@@ -1722,6 +1897,8 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
     detect_crashed_workers._last_work_present = sweep.work_present  # type: ignore[attr-defined]
+    detect_crashed_workers._last_infrastructure = sweep.infrastructure  # type: ignore[attr-defined]
+    detect_crashed_workers._last_infrastructure_burst = sweep.infrastructure_burst  # type: ignore[attr-defined]
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -1778,10 +1955,11 @@ def _record_task_failure(
     ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``. ``force_trip`` trips
     unconditionally (caller applied its own bounded-retry policy).
 
-    ``infrastructure=True``: the host refused the spawn (no restart-safe scope,
-    #114720) — nothing about the card ran, so the run and event are recorded
-    with ``infrastructure: true`` but ``consecutive_failures`` is left alone and
-    the breaker never trips; the card stays retryable and
+    ``infrastructure=True``: the run died of the HOST, not of the card — either the
+    host refused the spawn (no restart-safe scope, #114720) or the gateway owner was
+    lost mid-run (design t_82e97446). The run and event are recorded with
+    ``infrastructure: true`` but ``consecutive_failures`` is left alone and the
+    breaker never trips; the card stays retryable and
     :func:`check_respawn_guard` spaces the retries.
     """
     if failure_limit is None:
@@ -1938,6 +2116,19 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _coerce_infrastructure_cooldown(value, *, default: int) -> int:
+    """A stamped infrastructure cooldown, clamped to ``[60, 3600]``.
+
+    Falls back to ``default`` for absent or unparseable values, so a run recorded
+    before this stamp existed behaves exactly as it did before the change.
+    """
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(60, min(seconds, 3600))
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1977,13 +2168,20 @@ def check_respawn_guard(
     latest_run = conn.execute(
         "SELECT outcome, ended_at, metadata FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY ended_at DESC LIMIT 1",
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    if latest_run is not None and latest_run["outcome"] == "spawn_failed":
-        if rl_cooldown > 0 and _kb._json_dict(latest_run["metadata"]).get("infrastructure"):
+    if latest_run is not None and latest_run["outcome"] in ("spawn_failed", "crashed"):
+        meta = _kb._json_dict(latest_run["metadata"])
+        if rl_cooldown > 0 and meta.get("infrastructure"):
+            # A crashed host-loss run carries its own stamped spacing (a burst widens
+            # it); a spawn refusal carries none and keeps today's flat cooldown. Clamp
+            # 60..3600 and fall back to the default on any parse failure.
+            window = _coerce_infrastructure_cooldown(
+                meta.get("infrastructure_cooldown_seconds"), default=rl_cooldown
+            )
             ended_at = _kb._to_epoch(latest_run["ended_at"])
-            if ended_at is not None and (now - ended_at) < rl_cooldown:
+            if ended_at is not None and (now - ended_at) < window:
                 return "infrastructure_cooldown"
     if latest_run is not None and latest_run["outcome"] == "rate_limited":
         if rl_cooldown <= 0:
@@ -2614,6 +2812,8 @@ def _run_reclaim_phase(
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.work_present.extend(getattr(detect_crashed_workers, "_last_work_present", []))
+    result.infrastructure_crashed.extend(getattr(detect_crashed_workers, "_last_infrastructure", []))
+    result.infrastructure_burst.update(getattr(detect_crashed_workers, "_last_infrastructure_burst", {}))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
