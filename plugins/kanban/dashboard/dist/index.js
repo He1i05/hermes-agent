@@ -3224,6 +3224,19 @@
                 }, t.warnings.highest_severity === "critical" ? "!!!" :
                    t.warnings.highest_severity === "error" ? "!!" : "⚠")
               : null,
+            (t.explain && t.explain.failure_class)
+              ? h(Badge, {
+                  variant: "outline",
+                  className: cn(
+                    "hermes-kanban-tag",
+                    "hermes-kanban-fc-badge",
+                    "hermes-kanban-fc-badge--" + t.explain.failure_class,
+                  ),
+                  title: t.explain.failure_class === "infrastructure"
+                    ? "Host-caused failure: the infrastructure, gateway owner or spawn environment killed this card's last attempt. Its retry budget is untouched — see Explain in the drawer."
+                    : "Card-caused failure: this card's own content, model or protocol caused its last attempt. It is NOT abandonable without --force — see Explain in the drawer.",
+                }, t.explain.failure_class === "infrastructure" ? "infra" : "card")
+              : null,
             t.priority > 0
               ? h(Badge, { className: "hermes-kanban-priority",
                            title: `Priority ${t.priority}. Higher-priority tasks are claimed first by the dispatcher.` }, `P${t.priority}`)
@@ -3671,6 +3684,43 @@
       }
     };
 
+    // POST /tasks/:id/abandon (design D4) — archive a fan-in root WITH a reason,
+    // cascading to its infrastructure frontier. The reason IS the audit record,
+    // so it is asked for explicitly and never defaulted. No --force is sent from
+    // the UI: the server refuses a card-class/review/running tree with a 409 that
+    // names the safeguarding card, and forcing that is a CLI decision.
+    const doAbandon = function () {
+      const plan = ((data && data.task && data.task.explain) || {}).abandon || {};
+      const reason = window.prompt(
+        tx(t, "abandonReasonPrompt",
+          "Why abandon this tree? The reason is stored on every card it closes."),
+        "",
+      );
+      if (reason === null) return Promise.resolve(null);
+      const trimmed = reason.trim();
+      if (!trimmed) {
+        setPatchErr(tx(t, "abandonReasonRequired",
+          "An abandon reason is required: the board must carry why the work was closed."));
+        return Promise.resolve(null);
+      }
+      setPatchErr(null);
+      return SDK.fetchJSON(
+        withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}/abandon`, boardSlug),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ reason: trimmed, force: false }),
+        },
+      ).then(function (res) {
+        load();
+        props.onRefresh();
+        return res;
+      }).catch(function (e) {
+        setPatchErr(parseApiErrorMessage(e));
+        return null;
+      });
+    };
+
     // Local completion-summary prompt used only by doPatch above.
     // Documented carve-out — see the doPatch comment.
     function withCompletionSummary(patch) {
@@ -3824,6 +3874,7 @@
           onPatch: doPatch,
           onSpecify: doSpecify,
           onDecompose: doDecompose,
+          onAbandon: doAbandon,
           onAddParent: addLink,
           onRemoveParent: removeLink,
           onAddChild: addChild,
@@ -3992,6 +4043,106 @@
     );
   }
 
+  // -------------------------------------------------------------------------
+  // Explain section (design §4) — "why is this card here?"
+  //
+  // Renders the DERIVED payload the backend attaches to every task (``/board``
+  // and ``/tasks/{id}``): failure class + evidence, retry budget, cooldown, the
+  // operator-facing owner-loss sentence, the blocking children and the abandon
+  // plan with its refusal reasons. Read-only by design: the only action it
+  // exposes is the eligibility-gated Abandon button in the status action row,
+  // because a panel that silently wrote to the board would be a second verb.
+  // -------------------------------------------------------------------------
+  function ExplainSection(props) {
+    const { t } = useI18n();
+    const task = props.task || {};
+    const explain = task.explain || null;
+    const eligible = !!(explain && explain.abandon && explain.abandon.eligible);
+    // Open by itself when this card has something WRONG with it — a classified
+    // failure, an eligible abandon plan, or a plan that is refused for a named
+    // reason — and stay collapsed on a healthy card.
+    const noteworthy = !!(explain && (eligible
+      || explain.failure_class
+      || ((explain.abandon && explain.abandon.blocked_by) || []).length > 0));
+    const [open, setOpen] = useState(noteworthy);
+    useEffect(function () {
+      if (noteworthy) setOpen(true);
+    }, [noteworthy]);
+    if (!explain) return null;
+
+    const fcLabel = explain.failure_class === "infrastructure"
+      ? tx(t, "failureClassInfra", "infrastructure (host-caused)")
+      : explain.failure_class === "card"
+        ? tx(t, "failureClassCard", "card (this card's own failure)")
+        : tx(t, "failureClassUnknown", "unclassified — fails closed");
+    const evidence = explain.failure_evidence;
+    const budget = explain.retry_budget || {};
+    const cooldown = explain.cooldown || {};
+    const ownerLoss = explain.owner_loss;
+    const plan = explain.abandon || {};
+    const blockedBy = plan.blocked_by || [];
+    const blockingChildren = explain.blocking_children || [];
+
+    return h("div", { className: "hermes-kanban-section hermes-kanban-explain" },
+      h("div", { className: "hermes-kanban-section-head-row" },
+        h("span", { className: "hermes-kanban-section-head" },
+          tx(t, "explain", "Explain")),
+        h("button", {
+          className: "hermes-kanban-section-toggle",
+          onClick: function () { setOpen(function (x) { return !x; }); },
+          type: "button",
+        }, open ? tx(t, "hide", "Hide") : tx(t, "show", "Show")),
+      ),
+      open ? h("div", { className: "hermes-kanban-explain-body" },
+        h(MetaRow, { label: tx(t, "failureClass", "Failure class"), value: fcLabel }),
+        evidence ? h(MetaRow, {
+          label: tx(t, "failureEvidence", "Evidence"),
+          value: "run #" + evidence.run_id
+            + (evidence.source ? " (" + evidence.source + ")" : "")
+            + (evidence.error ? " — " + String(evidence.error).slice(0, 240) : ""),
+        }) : null,
+        ownerLoss ? h(MetaRow, {
+          label: tx(t, "ownerLoss", "Owner loss"),
+          value: ownerLoss.text + " [" + ownerLoss.variant + "]",
+        }) : null,
+        h(MetaRow, {
+          label: tx(t, "retryBudget", "Retry budget"),
+          value: (budget.used == null ? "?" : budget.used) + "/" + (budget.limit == null ? "?" : budget.limit)
+            + " used (" + (budget.remaining == null ? "?" : budget.remaining) + " remaining, "
+            + (budget.limit_source || "unknown") + ")"
+            + (budget.infra_used != null
+              ? " · " + budget.infra_used + "/" + budget.infra_limit + " host-caused"
+                + (budget.infra_enforced === false ? " (informational — the host is never parked)" : "")
+              : ""),
+        }),
+        h(MetaRow, {
+          label: tx(t, "cooldown", "Cooldown"),
+          value: cooldown.kind
+            ? cooldown.kind + " — " + cooldown.seconds_remaining + "s remaining"
+            : tx(t, "noCooldown", "none"),
+        }),
+        blockingChildren.length ? h(MetaRow, {
+          label: tx(t, "blockingChildren", "Blocking children"),
+          value: blockingChildren.map(function (c) {
+            return c.id + " (" + c.status + ", " + (c.failure_class || "unclassified") + ")";
+          }).join(", "),
+        }) : null,
+        h(MetaRow, {
+          label: tx(t, "abandonPlan", "Abandon"),
+          value: plan.eligible
+            ? tx(t, "abandonEligible", "eligible — would archive {n} card(s)", { n: 1 + (plan.scope || []).length })
+            : tx(t, "abandonRefused", "not abandonable")
+              + (blockedBy.length ? " — " + blockedBy.join(", ") : ""),
+        }),
+        plan.command ? h("div", {
+          className: "hermes-kanban-explain-command text-xs text-muted-foreground",
+          title: tx(t, "abandonCommandHint",
+            "Run this in a terminal (the dashboard button posts the same call through POST /tasks/{id}/abandon):"),
+        }, plan.command) : null,
+      ) : null,
+    );
+  }
+
   function TaskDetail(props) {
     const { t: i18n } = useI18n();
     const t = props.data.task;
@@ -4045,7 +4196,9 @@
         onPatch: props.onPatch,
         onSpecify: props.onSpecify,
         onDecompose: props.onDecompose,
+        onAbandon: props.onAbandon,
       }),
+      h(ExplainSection, { task: t }),
       h(DiagnosticsSection, {
         task: t,
         boardSlug: props.boardSlug,
@@ -4831,6 +4984,27 @@
         }, decomposeBusy ? "Decomposing…" : "⚗ Decompose")
       : null;
 
+    // Abandon (design D4) — the operator escape hatch for a fan-in root whose
+    // children were killed by the HOST. Enabled ONLY when the backend's derived
+    // plan says eligible; otherwise the disabled button carries the refusal
+    // reasons as its tooltip, so the operator reads why instead of collecting a
+    // 409. No implicit --force: a forced close is a CLI decision, never a click.
+    const abandonPlan = (task.explain && task.explain.abandon) || null;
+    const abandonButton = (abandonPlan && props.onAbandon)
+      ? h(Button, {
+          onClick: function () { if (abandonPlan.eligible) props.onAbandon(); },
+          disabled: !abandonPlan.eligible,
+          size: "sm",
+          className: "hermes-kanban-abandon",
+          title: abandonPlan.eligible
+            ? `${tx(t, "abandon", "Abandon")}: archive this root and ${
+                (abandonPlan.scope || []).length} infrastructure-killed card(s) with a reason. ${
+                abandonPlan.command}`
+            : `${tx(t, "abandonRefused", "Not abandonable")}: ${
+                (abandonPlan.blocked_by || []).join(", ") || "no classified failure"}`,
+        }, tx(t, "abandon", "Abandon"))
+      : null;
+
     return h("div", null,
       h("div", { className: "hermes-kanban-actions" },
         specifyButton,
@@ -4848,6 +5022,7 @@
         b(tx(t, "complete", "Complete"),  { status: "done" },
           task.status === "running" || task.status === "ready" || task.status === "blocked",
           getDestructiveConfirm(t, "done")),
+        abandonButton,
         b(tx(t, "archive", "Archive"),   { status: "archived" }, task.status !== "archived",
           getDestructiveConfirm(t, "archived")),
       ),
