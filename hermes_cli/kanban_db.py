@@ -25,7 +25,7 @@ import sys
 import logging
 import time
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -322,6 +322,41 @@ def _resolve_crash_grace_seconds() -> int:
 def _resolve_rate_limit_cooldown_seconds() -> int:
     """``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS`` (0 = next tick, for tests) else default."""
     return _env_int("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS)
+
+
+# --- failure budget (ONE resolution, read by the board) ---------------------
+
+
+def resolve_failure_limit(
+    task_max_retries: Any = None, kanban_cfg: Optional[dict] = None,
+) -> tuple[int, str]:
+    """The unified failure allowance exactly as the breaker resolves it.
+
+    Precedence: per-task ``max_retries`` > ``kanban.failure_limit`` >
+    ``DEFAULT_FAILURE_LIMIT``. The explain payload calls this so the board cannot
+    advertise a budget the breaker is not applying. The breaker's own branch lives
+    in ``kanban_db_dispatch._record_task_failure`` and is deliberately NOT touched
+    here (that file belongs to the landed classifier change); instead
+    ``tests/hermes_cli/test_kanban_explain.py`` asserts the two agree on all three
+    branches, so the read model cannot drift from the breaker silently.
+    Returns ``(limit, source)``.
+    """
+    if task_max_retries is not None:
+        try:
+            return int(task_max_retries), "task"
+        except (TypeError, ValueError):
+            pass
+    raw = (kanban_cfg or {}).get("failure_limit")
+    if raw is not None:
+        try:
+            return int(raw), "config"
+        except (TypeError, ValueError):
+            pass
+    try:
+        from hermes_cli.kanban_db_dispatch import DEFAULT_FAILURE_LIMIT as _default
+    except Exception:  # pragma: no cover - import-order only (circular at load)
+        _default = 2
+    return int(_default), "default"
 
 
 # --- Paths ---
@@ -637,6 +672,11 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # Operator abandonment provenance (``hermes kanban abandon``): archived WITH a
+    # reason instead of silently deleted. NULL = never abandoned.
+    abandon_reason: Optional[str] = None
+    abandoned_at: Optional[int] = None
+    abandoned_by: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Task:
@@ -663,7 +703,7 @@ _TASK_REQUIRED_COLUMNS = (
     "id", "title", "body", "assignee", "status", "priority", "created_by",
     "workspace_kind", "workspace_path", "claim_lock",
 )
-_TASK_EPOCH_COLUMNS = ("created_at", "started_at", "completed_at", "claim_expires", "last_heartbeat_at")
+_TASK_EPOCH_COLUMNS = ("created_at", "started_at", "completed_at", "claim_expires", "last_heartbeat_at", "abandoned_at")
 # Later-added columns read as NULL when absent from the row.
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
@@ -673,6 +713,7 @@ _TASK_OPTIONAL_COLUMNS = (
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
     "model_override", "provider_override", "reasoning_effort", "goal_max_turns", "block_kind",
+    "abandon_reason", "abandoned_by",
 )
 
 
@@ -873,7 +914,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Operator abandonment provenance (``hermes kanban abandon``): an abandoned
+    -- card is archived WITH a reason, an author and a timestamp so "operator
+    -- deleted this" and "operator abandoned this because the host killed its
+    -- subtree" are distinguishable from task_events alone.
+    abandon_reason       TEXT,
+    abandoned_at         INTEGER,
+    abandoned_by         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -3840,6 +3888,266 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     # Reap the workspace on archive too (never-completed tasks kept it forever).
     _cleanup_workspace(conn, task_id)
     return True
+
+
+# --- abandon (archive WITH a reason, cascading to the infra frontier) -------
+
+#: A forced abandon can bury work that actually failed, so it must be deliberate:
+#: the reason is the audit record, and a three-word reason is not one.
+ABANDON_FORCE_MIN_REASON = 20
+
+
+@dataclass
+class AbandonResult:
+    """Outcome of :func:`abandon_task` (one object for CLI, dashboard and tests)."""
+
+    ok: bool
+    root_id: str
+    reason: str
+    forced: bool = False
+    dry_run: bool = False
+    already_abandoned: bool = False
+    archived: list[str] = field(default_factory=list)
+    left_in_place: list[dict] = field(default_factory=list)
+    already_terminal: list[str] = field(default_factory=list)
+    overridden_safeguards: list[str] = field(default_factory=list)
+    raced: list[str] = field(default_factory=list)
+    reaped_workspace: dict[str, str] = field(default_factory=dict)
+    would_reap: dict[str, str] = field(default_factory=dict)
+    blocked_by: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "ok": self.ok, "root_id": self.root_id, "reason": self.reason,
+            "forced": self.forced, "dry_run": self.dry_run,
+            "already_abandoned": self.already_abandoned,
+            # The kernel's own verdict on the plan: the 409 payload hands the UI a
+            # disabled button with the reason instead of an error to decode.
+            "eligible": not self.blocked_by and not self.errors,
+            "archived": list(self.archived), "left_in_place": list(self.left_in_place),
+            "already_terminal": list(self.already_terminal),
+            "overridden_safeguards": list(self.overridden_safeguards),
+            "raced": list(self.raced), "reaped_workspace": dict(self.reaped_workspace),
+            "would_reap": dict(self.would_reap), "blocked_by": list(self.blocked_by),
+            "errors": list(self.errors),
+        }
+
+
+def _archive_abandoned_card(
+    conn: sqlite3.Connection, card_id: str, *, reason: str, operator: Optional[str],
+    now: int, event_payload: dict, signal_fn=None,
+) -> tuple[str, Optional[int]]:
+    """Archive ONE card with abandon provenance; returns ``(state, run_id)``.
+
+    ``state`` is ``archived`` / ``already_archived`` / ``raced`` / ``missing``. The
+    CAS on ``status != 'archived'`` is what makes a concurrent second abandon (or a
+    human archiving mid-cascade) skip instead of double-writing an event.
+    """
+    prev_pid = prev_lock = prev_started = None
+    was_running = False
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
+            (card_id,),
+        ).fetchone()
+        if row is None:
+            return "missing", None
+        if row["status"] == "archived":
+            return "already_archived", None
+        was_running = row["status"] == "running"
+        prev_pid, prev_lock, prev_started = (
+            row["worker_pid"], row["claim_lock"], row["worker_started_at"])
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'archived', abandon_reason = ?, abandoned_at = ?, "
+            "abandoned_by = ?, claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "worker_started_at = NULL WHERE id = ? AND status != 'archived'",
+            (reason, now, operator, card_id),
+        )
+        if cur.rowcount != 1:
+            return "raced", None
+        run_id = _end_run(
+            conn, card_id, outcome="reclaimed", status="reclaimed",
+            summary="task abandoned by operator",
+        )
+        _append_event(conn, card_id, "abandoned", event_payload, run_id=run_id)
+    if was_running:
+        # A forced close of a live worker must actually stop it (#76196), exactly
+        # as ``archive_task`` does; the termination lands as its own event so the
+        # ``abandoned`` record stays atomic with the status flip.
+        termination = _terminate_reclaimed_worker(
+            prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
+        with write_txn(conn):
+            _append_event(conn, card_id, "archive_worker_termination", termination, run_id=run_id)
+    return "archived", run_id
+
+
+def abandon_task(
+    conn: sqlite3.Connection, task_id: str, *, reason: str,
+    operator: Optional[str] = None, force: bool = False, keep_children: bool = False,
+    dry_run: bool = False, signal_fn=None,
+) -> AbandonResult:
+    """Archive ``task_id`` WITH a reason, cascading to its infrastructure frontier.
+
+    The operator escape hatch for a fan-in root whose children died of the HOST:
+    ``complete_task`` refuses until every child is terminal, and ``archive_task``
+    carries no reason, no cascade, no classification and no audit. This verb:
+
+    * archives the root and every non-terminal descendant whose ``failure_class``
+      is ``infrastructure`` (host-caused), writing ``abandon_reason`` /
+      ``abandoned_at`` / ``abandoned_by`` and an ``abandoned`` event per card;
+    * leaves every other descendant BYTE-IDENTICAL (no status write at all) and
+      names it in ``left_in_place`` with its class — a card-class or unclassified
+      failure is never silently buried;
+    * never writes to a ``done``/``archived`` card;
+    * is idempotent: a second run over an abandoned tree writes nothing;
+    * refuses ``review`` and live-``running`` descendants unless ``force``, and
+      then records the overridden safeguard ids;
+    * ``dry_run=True`` computes and prints the plan and writes NOTHING.
+
+    The plan itself is :func:`hermes_cli.kanban_explain.abandon_plan` — the same
+    function that renders ``explain.abandon`` — so the badge and the gate cannot
+    disagree about what is abandonable.
+    """
+    from hermes_cli import kanban_explain as ke
+    from hermes_cli import kanban_failure_class as fc
+
+    reason_text = (reason or "").strip()
+    result = AbandonResult(
+        ok=False, root_id=task_id, reason=reason_text,
+        forced=bool(force), dry_run=bool(dry_run),
+    )
+    if not reason_text:
+        result.errors.append("a reason is required: abandon archives work, so the board must carry why")
+        return result
+    if force and len(reason_text) < ABANDON_FORCE_MIN_REASON:
+        result.errors.append(
+            f"--force needs a reason of at least {ABANDON_FORCE_MIN_REASON} characters "
+            f"(got {len(reason_text)})")
+        return result
+
+    now = int(time.time())
+    ids = [task_id] + fc.subtree_ids(conn, task_id)
+    tasks = ke._load_tasks(conn, ids)
+    plan = ke.abandon_plan(
+        task_id, tasks=tasks, runs=ke._load_runs(conn, ids),
+        children=ke._load_children(conn, ids), now=now,
+    )
+    if plan["root_status"] == "missing":
+        result.errors.append(f"no such task on this board: {task_id}")
+        return result
+
+    descendants = plan["descendants"]
+    result.already_terminal = list(plan["already_terminal"])
+    open_desc = [d for d in descendants if d["status"] not in fc.TERMINAL_STATUSES]
+
+    if plan["root_status"] == "archived" and not open_desc:
+        result.ok = True
+        result.already_abandoned = True
+        return result
+
+    if keep_children:
+        targets: list[str] = []
+    elif force:
+        targets = [d["id"] for d in open_desc]
+        result.overridden_safeguards = list(plan["blocked_by"])
+    else:
+        targets = [d["id"] for d in open_desc if d["failure_class"] == fc.FAILURE_INFRA]
+
+    if not keep_children:
+        result.left_in_place = [
+            {
+                "id": d["id"], "status": d["status"],
+                "failure_class": d["failure_class"],
+                "reason": fc.explain_reason(d["status"], d["failure_class"], None),
+            }
+            for d in open_desc if d["id"] not in targets
+        ]
+
+    if plan["blocked_by"] and not force:
+        result.blocked_by = list(plan["blocked_by"])
+        return result
+
+    if plan["root_status"] == "archived":
+        # Root already archived but a branch is still open: nothing to cascade from.
+        result.blocked_by = ["already_archived"]
+        return result
+
+    for cid in [task_id, *targets]:
+        row = tasks.get(cid) or {}
+        kind, path = row.get("workspace_kind"), row.get("workspace_path")
+        if path and kind in ("scratch", "worktree"):
+            result.would_reap[cid] = path
+
+    if dry_run:
+        result.ok = True
+        result.archived = [task_id, *targets]
+        return result
+
+    manifest = {
+        "root_id": task_id,
+        "reason": reason_text,
+        "operator": operator,
+        "forced": bool(force),
+        "keep_children": bool(keep_children),
+        "scope": [task_id, *targets],
+        "left_in_place": [entry["id"] for entry in result.left_in_place],
+        "already_terminal": list(result.already_terminal),
+        "overridden_safeguards": list(result.overridden_safeguards),
+    }
+    # Descendants first, root last: the root's event then enumerates a cascade that
+    # has already committed, and every archived child has no open child left by the
+    # time the reap pass runs.
+    for cid in targets:
+        state, _ = _archive_abandoned_card(
+            conn, cid, reason=reason_text, operator=operator, now=now, signal_fn=signal_fn,
+            event_payload={"via": "abandon", "root_id": task_id, "reason": reason_text,
+                           "failure_class": fc.FAILURE_INFRA},
+        )
+        if state == "archived":
+            result.archived.append(cid)
+        elif state == "raced":
+            result.raced.append(cid)
+    state, _ = _archive_abandoned_card(
+        conn, task_id, reason=reason_text, operator=operator, now=now, signal_fn=signal_fn,
+        event_payload={"via": "abandon", **manifest},
+    )
+    if state == "archived":
+        result.archived.insert(0, task_id)
+    elif state == "raced":
+        result.raced.append(task_id)
+
+    if not result.archived:
+        result.errors.append("nothing was archived (every card lost its CAS or was already archived)")
+        return result
+
+    # Grandchildren of the abandoned frontier promote normally, once.
+    recompute_ready(conn)
+
+    # Reap AFTER the commits (never hold the write lock for file I/O), recording
+    # what was ACTUALLY removed — ``_cleanup_workspace`` is best-effort and defers
+    # a worktree that still holds unprovable work. Deepest-first: a card's cleanup
+    # also cascades to the cards that fan in on it, so iterating the other way
+    # would let the root's cascade reap a child's workspace before the child's own
+    # turn and lose the attribution.
+    path_owner = {
+        str(row.get("workspace_path")): cid
+        for cid, row in tasks.items()
+        if row.get("workspace_path")
+    }
+    for cid in reversed(result.archived):
+        reaped = _cleanup_workspace(conn, cid)
+        if not reaped:
+            continue
+        owner = path_owner.get(reaped, cid)
+        result.reaped_workspace[owner] = reaped
+        with write_txn(conn):
+            _append_event(
+                conn, owner, "abandon_workspace_reaped",
+                {"root_id": task_id, "reaped_workspace": reaped},
+            )
+    result.ok = True
+    return result
 
 
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:

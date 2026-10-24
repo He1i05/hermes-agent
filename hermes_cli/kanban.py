@@ -208,7 +208,7 @@ def _profile_author() -> str:
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
-    "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
+    "schedule", "unblock", "promote", "archive", "abandon", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
     "gc",
@@ -471,6 +471,37 @@ def _print_section(title: str, lines) -> None:
         print(line)
 
 
+def _print_explain(explain: dict, field) -> None:
+    """Render the derived explain payload (``hermes kanban show --explain``).
+
+    Same object the dashboard receives: failure class + evidence, the retry budget
+    the breaker is actually applying, the cooldown the respawn guard is applying,
+    the owner-loss sentence, and whether/how this card's tree can be abandoned.
+    """
+    print("\n  Explain:")
+    field("failure", explain.get("failure_class") or "unclassified (fails closed: not abandonable)")
+    evidence = explain.get("failure_evidence") or {}
+    if evidence:
+        field("evidence", f"run {evidence.get('run_id')} ({evidence.get('source') or 'unknown source'})")
+    budget = explain.get("retry_budget") or {}
+    field("budget", f"{budget.get('used')}/{budget.get('limit')} used, {budget.get('remaining')} left "
+                    f"({budget.get('limit_source')})")
+    field("infra", f"{budget.get('infra_used')} host-caused failure(s) on record "
+                   f"(informational threshold {budget.get('infra_limit')}; "
+                   f"{'enforced' if budget.get('infra_enforced') else 'never parks the card'})")
+    cooldown = explain.get("cooldown") or {}
+    field("cooldown", f"{cooldown.get('kind')} ({cooldown.get('seconds_remaining')}s left)"
+                      if cooldown.get("kind") else "none")
+    owner_loss = explain.get("owner_loss")
+    if owner_loss:
+        field("owner-loss", f"{owner_loss.get('text')} [{owner_loss.get('variant')}]")
+    plan = explain.get("abandon") or {}
+    if plan.get("eligible"):
+        field("abandon", f"yes — {plan.get('command')}")
+    else:
+        field("abandon", "no — " + "; ".join(plan.get("blocked_by") or ["not eligible"]))
+
+
 def _cmd_show(args: argparse.Namespace) -> int:
     rsk, rc = _run_state_kwargs(args, "show")
     if rc:
@@ -488,16 +519,24 @@ def _cmd_show(args: argparse.Namespace) -> int:
         runs = kb.list_runs(conn, args.task_id, **rsk)
         # Workers hand off via task_runs.summary; tasks.result stays NULL unless set.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        explain = None
+        if getattr(args, "explain", False):
+            from hermes_cli import kanban_explain as ke
+
+            explain = ke.task_explain(conn, task)
         if not want_json:
             graph = kb.task_graph_context(conn, task.id)
 
     if want_json:
-        _print_json({
+        payload = {
             "task": _task_to_dict(task), "latest_summary": latest_summary, "parents": parents, "children": children,
             "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
-        })
+        }
+        if explain is not None:
+            payload["explain"] = explain
+        _print_json(payload)
         return 0
 
     def field(label: str, value) -> None:
@@ -533,6 +572,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if diags:
         print(f"\n  Diagnostics ({len(diags)}):")
         _print_diagnostics(diags, "    ", with_kind=False)
+    if explain is not None:
+        _print_explain(explain, field)
     if task.started_at:
         field("started", _fmt_ts(task.started_at))
     if task.completed_at:
@@ -1134,6 +1175,54 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                            lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
 
 
+def _cmd_abandon(args: argparse.Namespace) -> int:
+    """Archive a fan-in root WITH a reason, cascading to its infra-killed descendants.
+
+    The operator escape hatch for the measured morning ritual: a decomposed root
+    whose children were killed by the HOST can never reach ``done``, and the only
+    old ways out were ``archive`` (no reason, no cascade, no audit) or unlinking
+    every child by hand. Exit 1 on a refusal so scripts cannot mistake it for an
+    abandonment; ``--dry-run`` prints the plan and writes nothing.
+    """
+    with kbc.connect_closing() as conn:
+        result = kb.abandon_task(
+            conn, args.task_id,
+            reason=args.reason,
+            operator=_profile_author(),
+            force=bool(getattr(args, "force", False)),
+            keep_children=bool(getattr(args, "keep_children", False)),
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+    if _json_out(args, result.to_dict()):
+        return 0 if result.ok and not result.blocked_by else 1
+    if result.errors:
+        for message in result.errors:
+            _err(f"kanban abandon: {message}")
+        return 1
+    if result.blocked_by:
+        _err(f"Cannot abandon {result.root_id}: {len(result.blocked_by)} safeguard(s) would bury real work:")
+        for reason in result.blocked_by:
+            _err(f"  - {reason}")
+        _err("Resolve them, or re-run with --force and a specific reason (>=20 chars).")
+        return 1
+    header = "Would abandon" if result.dry_run else "Abandoned"
+    print(f"{header} {len(result.archived)} card(s) under {result.root_id}:")
+    for tid in result.archived:
+        path = result.would_reap.get(tid) if result.dry_run else result.reaped_workspace.get(tid)
+        print(f"  - {tid}" + (f"  (workspace: {path})" if path else ""))
+    if result.left_in_place:
+        print("Left in place (no status write):")
+        for entry in result.left_in_place:
+            print(f"  - {entry['id']}  {entry['status']:8s} {entry['failure_class'] or 'unclassified'}: {entry['reason']}")
+    if result.already_terminal:
+        print(f"Already terminal (untouched): {', '.join(result.already_terminal)}")
+    if result.already_abandoned:
+        print("Already abandoned — nothing to do.")
+    if result.raced:
+        print(f"Skipped (archived concurrently): {', '.join(result.raced)}")
+    return 0
+
+
 def _cmd_stats(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         stats = kb.board_stats(conn)
@@ -1330,7 +1419,7 @@ _HANDLERS = {
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
-    "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
+    "archive": _cmd_archive, "abandon": _cmd_abandon, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,

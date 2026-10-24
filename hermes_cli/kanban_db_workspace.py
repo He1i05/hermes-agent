@@ -359,16 +359,23 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return _managed_scratch_path_info(p)[0]
 
 
-def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
+def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
+
     Called from :func:`complete_task` after the transaction commits; best-effort
     so cleanup never blocks completion. ``scratch`` is removed; ``worktree``
     only when provably free of work (clean tree, every commit reachable from a
-    remote-tracking ref); ``dir`` is intentionally preserved."""
+    remote-tracking ref); ``dir`` is intentionally preserved.
+
+    Returns the path ACTUALLY removed (``None`` when nothing was). Callers that
+    must report the loss — ``abandon_task``'s ``reaped_workspace`` — need the
+    outcome, not the intention: a deferred worktree and a refused out-of-scratch
+    path both leave the evidence in place.
+    """
     try:
         row = conn.execute(_WORKSPACE_ROW_SQL, (task_id,)).fetchone()
         if not row:
-            return
+            return None
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]
         if kind not in _REMOVABLE_KINDS or not path:
@@ -376,7 +383,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # parent scratch cleanup (e.g. a 'dir' child of a scratch parent).
             # See #33774.
             _try_cleanup_parent_workspaces(conn, task_id)
-            return
+            return None
         # Defer while any child is not yet terminal so it can still read
         # handoff artifacts from this workspace.
         if _has_active_children(conn, task_id):
@@ -385,16 +392,18 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
                 "active children still need workspace at %s",
                 kind, task_id, path,
             )
-            return
+            return None
         # Kill the (dead) tmux worker session BEFORE removing a worktree so a
         # lingering worker never has its cwd deleted from under it.
         if kind == "worktree":
             _cleanup_worker_tmux(conn, task_id)
+            reaped = None
             if not _defer_shared_worktree_cleanup(conn, task_id, path):
-                _cleanup_worktree_workspace(task_id, path, row["branch_name"])
+                reaped = _cleanup_worktree_workspace(task_id, path, row["branch_name"])
             _try_cleanup_parent_workspaces(conn, task_id)
-            return
+            return reaped
         wp = Path(path)
+        reaped_scratch = None
         if wp.is_dir():
             # Containment guard: a board's ``default_workdir`` can pair
             # ``workspace_kind='scratch'`` with a user path pointing at a real
@@ -406,6 +415,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
                     release_lsp_clients(str(wp))
                     shutil.rmtree(wp, ignore_errors=True)
                     _kb._log.debug("Removed scratch workspace: %s", wp)
+                    reaped_scratch = str(wp)
             else:
                 _kb._log.warning(
                     "Refusing to remove out-of-scratch workspace for task %s: %s "
@@ -419,23 +429,27 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         # After cleaning up this task's workspace, check if any parent tasks now have all children done —
         # their deferred cleanup can proceed (#33774).
         _try_cleanup_parent_workspaces(conn, task_id)
+        return reaped_scratch
     except Exception:
-        pass  # best-effort — never block completion
+        return None  # best-effort — never block completion
 
 
 def _cleanup_worktree_workspace(
     task_id: str, path: str, branch_name: Optional[str] = None
-) -> None:
+) -> Optional[str]:
     """Remove a finished task's linked git worktree when it holds no work.
+
     Mirrors the CLI startup pruner (``cli._prune_stale_worktrees``): removal
     requires a clean tree AND every commit reachable from a remote-tracking
     ref; any doubt (dirty, unpushed, unresolvable repo, failing git) preserves
     it. The auto-generated ``wt/<task-id>`` branch is deleted with it; custom
-    branches are kept. Best-effort."""
+    branches are kept. Best-effort; returns the removed path (``None`` when
+    preserved), which is what ``abandon_task`` reports as ``reaped_workspace``.
+    """
     try:
         from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
     except Exception:
-        return  # CLI safety predicates unavailable — preserve
+        return None  # CLI safety predicates unavailable — preserve
     try:
         wp = Path(path).expanduser()
         if not wp.is_dir():
@@ -492,8 +506,9 @@ def _cleanup_worktree_workspace(
         branch = (branch_name or "").strip() or f"wt/{task_id}"
         if branch.startswith("wt/"):
             _git(repo_root, "branch", "-D", branch, timeout=30)
+        return str(wp)
     except Exception:
-        pass  # best-effort — never block completion
+        return None  # best-effort — never block completion
 
 
 def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> None:
