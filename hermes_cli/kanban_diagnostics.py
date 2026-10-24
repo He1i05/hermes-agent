@@ -34,12 +34,19 @@ class DiagnosticAction:
     """A recovery action. ``kind`` drives rendering: ``reclaim``/``reassign``
     POST to /tasks/:id/*; ``unblock`` PATCHes status to ready; ``cli_hint``
     shows ``payload.command``; ``open_docs`` links ``payload.url``; ``comment``
-    nudges the operator. ``suggested=True`` = recommended first step."""
+    nudges the operator. ``suggested=True`` = recommended first step.
+
+    ``enabled``/``denied_reason`` let a rule render a DISABLED button with the
+    reason instead of an action that 409s: an abandon that would bury a card-class
+    child is refused by the kernel, so the UI must not invite it.
+    """
 
     kind: str
     label: str
     payload: dict = field(default_factory=dict)
     suggested: bool = False
+    enabled: bool = True
+    denied_reason: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -807,6 +814,137 @@ def _rule_stale_running(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _rule_infrastructure_parked(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """The card's newest booking was HOST-caused, not the card's fault.
+
+    Nothing about the card is broken, so "retry" is not a diagnosis and a human
+    reading only ``consecutive_failures`` would conclude the opposite. The rule
+    names the class, the owner-loss sentence, the remaining infrastructure
+    allowance and the abandon command for the tree it sits in.
+    """
+    from hermes_cli import kanban_failure_class as fc
+
+    status = _task_field(task, "status")
+    if status in fc.TERMINAL_STATUSES or status == "running":
+        return []
+    ordered = sorted(
+        runs or [],
+        key=lambda r: (int(_task_field(r, "ended_at", 0) or 0), int(_task_field(r, "id", 0) or 0)),
+        reverse=True,
+    )
+    booking = None
+    for run in ordered:
+        outcome = _task_field(run, "outcome", "") or ""
+        if outcome in fc.NEUTRAL_OUTCOMES:
+            continue
+        if outcome in fc.SUCCESS_OUTCOMES:
+            return []
+        booking = run
+        break
+    if booking is None:
+        return []
+    if fc.classify_run(booking) != fc.FAILURE_INFRA:
+        return []
+
+    task_id = str(_task_field(task, "id") or "")
+    kanban_cfg = cfg.get("kanban") or {}
+
+    # Derived from the run history the landed classifier stamps — there is no stored
+    # infrastructure counter (the classifier deliberately enforces no per-card bound).
+    infra_used = sum(
+        1 for run in (runs or []) if fc._meta(run).get("infrastructure")
+    )
+    try:
+        infra_limit = max(1, int(kanban_cfg.get("infrastructure_retry_limit", 5)))
+    except (TypeError, ValueError):
+        infra_limit = 5
+    payload = _parse_payload(booking)
+    variant = fc.host_loss_variant(payload.get("worker_output") or _task_field(booking, "error", ""))
+    owner_line = fc.OWNER_LOSS_TEXT.get(variant or "", "the host caused this failure, not the card")
+    ended_at = int(_task_field(booking, "ended_at", 0) or 0)
+    root = None
+    if cfg.get("_abandon_root_of"):
+        try:
+            root = cfg["_abandon_root_of"](task_id)
+        except Exception:
+            root = None
+    actions = [
+        DiagnosticAction(kind="cli_hint", label="See the full explanation",
+                         payload={"command": f"hermes kanban show {task_id} --explain"}, suggested=True),
+    ]
+    if root and root != task_id:
+        actions.append(DiagnosticAction(
+            kind="cli_hint", label=f"Abandon the whole tree under {root}",
+            payload={"command": f"hermes kanban abandon {root} --reason 'host killed the subtree'"},
+        ))
+    return [Diagnostic(
+        kind="infrastructure_parked", severity="error",
+        title="Host-caused failure, not the card's",
+        detail=(f"The last attempt was killed by the HOST ({owner_line}). Nothing about the card "
+                f"failed, so its retry budget was not charged — {infra_used} host-caused "
+                f"failure(s) on this card's history (informational threshold {infra_limit}; the "
+                f"classifier never parks a card the host killed). Retrying is right; if the "
+                f"subtree keeps dying this way, abandon the root with a reason instead of "
+                f"retrying forever."),
+        actions=actions,
+        first_seen_at=ended_at, last_seen_at=ended_at, count=1,
+        data={"failure_class": fc.FAILURE_INFRA, "owner_loss_variant": variant,
+              "infra_used": infra_used, "infra_limit": infra_limit,
+              "run_id": _task_field(booking, "id")},
+    )]
+
+
+def _rule_fan_in_root_unclosable(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """A fan-in root is waiting on children, and nothing is going to close it.
+
+    A decomposed root's status is a projection of its subtree: ``decompose_triage_task``
+    links every fan-out child with ``_link(conn, cid, root)``, so in graph terms the
+    root's *parents* are the cards it fans in on, and ``complete_task`` refuses the
+    root until every one of them is ``done``/``archived``. When no worker holds it and
+    such a dependency is still open, the card is not "running late" — it is waiting
+    for a human decision that used to require unlinking children by hand.
+
+    Gated on **>= 2** open-or-closed graph parents: a single dependency edge is an
+    ordinary serial wait (``_rule_running_with_open_parents`` and the dependency block
+    already cover it) and warning on every queued child would drown the board.
+    """
+    status = _task_field(task, "status")
+    if status not in ("todo", "ready", "blocked"):
+        return []
+    graph = cfg.get("_graph") or {}
+    fan_in = [p for p in (graph.get("parents") or []) if isinstance(p, dict)]
+    if len(fan_in) < 2:
+        return []
+    open_children = [p for p in fan_in if p.get("status") not in ("done", "archived")]
+    if not open_children:
+        return []
+
+    task_id = str(_task_field(task, "id") or "")
+    names = ", ".join(f"{p.get('id')} ({p.get('status')})" for p in open_children[:5])
+    extra = f" and {len(open_children) - 5} more" if len(open_children) > 5 else ""
+    command = f"hermes kanban abandon {task_id} --reason '<why>'"
+    return [Diagnostic(
+        kind="fan_in_root_unclosable", severity="warning",
+        title=f"Fan-in root waiting on {len(open_children)} open child(ren)",
+        detail=(f"This card fans in {len(fan_in)} sibling card(s): {names}{extra}. It can only "
+                f"reach done when every one of them is done or archived, and no worker holds "
+                f"it, so it waits indefinitely. If the open children died of the HOST, "
+                f"`{command}` archives the root and its host-killed frontier with a reason; "
+                f"children that failed on their own content are refused (use --dry-run to see "
+                f"the plan, --force to override with a written reason)."),
+        actions=[
+            DiagnosticAction(kind="cli_hint", label="Preview the abandon plan",
+                             payload={"command": f"{command} --dry-run"},
+                             suggested=True),
+            DiagnosticAction(kind="cli_hint", label="Abandon root + host-killed children",
+                             payload={"command": command}),
+        ],
+        first_seen_at=_latest_event_ts(events or [], {"blocked", "promoted", "gave_up"}),
+        last_seen_at=int(now), count=1,
+        data={"open_children": open_children, "total_children": len(fan_in)},
+    )]
+
+
 # Order matters: earlier rules render first on severity ties.
 _RULES: list[RuleFn] = [
     _rule_hallucinated_cards,
@@ -814,6 +952,8 @@ _RULES: list[RuleFn] = [
     _rule_prose_phantom_refs,
     _rule_repeated_failures,
     _rule_repeated_crashes,
+    _rule_infrastructure_parked,
+    _rule_fan_in_root_unclosable,
     _rule_review_dependency_deadlock,
     _rule_running_with_open_parents,
     _rule_stuck_in_blocked,
