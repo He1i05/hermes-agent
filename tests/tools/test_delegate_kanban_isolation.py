@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 
@@ -256,6 +257,103 @@ def test_delegate_child_kanban_cli_cannot_delete_parent_board(
     assert "delegate_task child contexts cannot mutate Kanban tasks" in result["output"]
     assert kb.board_exists("victim")
     assert kb.board_dir("victim").is_dir()
+
+
+# --- T3 gap: a worker could not put a design body on its own card ------------
+#
+# `hermes kanban edit --body` is the CLI route a worker reaches for, and a
+# dispatcher worker's terminal shell is fenced exactly like a delegate child's:
+# the pins make kanban_home() resolve inside the fenced root the marker carries.
+# Measured on df0f5855c5: rc=1, "delegate_task child contexts cannot mutate
+# Kanban tasks via the CLI". Card bodies therefore belong to the in-process
+# kanban_edit tool, which the second test pins.
+
+_EDIT_CLI_CODE = (
+    "import argparse;"
+    "from hermes_cli import kanban;"
+    "p = argparse.ArgumentParser();"
+    "sub = p.add_subparsers(dest='cmd');"
+    "kanban.build_parser(sub);"
+    "args = p.parse_args(['kanban', 'edit', {tid!r}, '--body', {body!r}]);"
+    "raise SystemExit(kanban.kanban_command(args))"
+)
+
+
+def _shell_env(kb, *, fenced: bool) -> dict:
+    """The env a worker's terminal shell carries: the fence marker valued at the
+    lineage's board root plus the pinned board DB, with worker identity scrubbed."""
+    home = os.environ["HERMES_HOME"]
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("HERMES_KANBAN_") and k != "HERMES_DELEGATED_CHILD_CONTEXT"}
+    env["HERMES_HOME"] = home
+    env["HERMES_KANBAN_HOME"] = home
+    env["HERMES_KANBAN_DB"] = str(kb.kanban_db_path())
+    env["PYTHONPATH"] = str(_REPO_ROOT)
+    if fenced:
+        env["HERMES_DELEGATED_CHILD_CONTEXT"] = home
+    return env
+
+
+def _cli_edit(kb, tid: str, body: str, *, fenced: bool):
+    return subprocess.run(
+        [sys.executable, "-c", _EDIT_CLI_CODE.format(tid=tid, body=body)],
+        env=_shell_env(kb, fenced=fenced), cwd=os.environ["HERMES_HOME"],
+        capture_output=True, text=True, timeout=120, check=False,
+    )
+
+
+def _body_of(kb, tid: str):
+    from hermes_cli import kanban_db_connect as kbc
+
+    conn = kbc.connect()
+    try:
+        return kb.get_task(conn, tid).body
+    finally:
+        conn.close()
+
+
+def test_worker_shell_cannot_edit_card_body_via_cli(monkeypatch, tmp_path):
+    """Reproduction plus its counterfactual: the fence is what denies the write."""
+    kb, tid, _workspace, _attachments_root = _make_running_kanban_task(monkeypatch, tmp_path)
+    assert _body_of(kb, tid) is None
+
+    fenced = _cli_edit(kb, tid, "D1. Named semantics", fenced=True)
+    assert fenced.returncode == 1, fenced
+    assert "cannot mutate Kanban tasks via the CLI" in fenced.stderr + fenced.stdout
+    assert "kanban_edit" in fenced.stderr + fenced.stdout  # names the route that works
+    assert _body_of(kb, tid) is None
+
+    unfenced = _cli_edit(kb, tid, "D1. Named semantics", fenced=False)
+    assert unfenced.returncode == 0, unfenced
+    assert "Edited" in unfenced.stdout, unfenced
+    assert _body_of(kb, tid) == "D1. Named semantics"
+
+
+def test_owning_worker_authors_body_in_process_while_its_shell_stays_fenced(
+    monkeypatch, tmp_path,
+):
+    """The fix in one frame: the worker's own process writes its body, the shell
+    (and therefore any descendant) still cannot."""
+    kb, tid, _workspace, _attachments_root = _make_running_kanban_task(monkeypatch, tmp_path)
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    # The shared helper pins HERMES_KANBAN_RUN_ID to the Task id; pin the real run
+    # so the claim-conditional write can prove ownership (a real dispatcher does).
+    conn = kbc.connect()
+    try:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb._current_run_id(conn, tid)))
+    finally:
+        conn.close()
+
+    body = "**D1. Named semantics**\n- `claim` — a run's ownership of one card\n"
+    authored = json.loads(kt._handle_edit({"body": body}))
+    assert authored["ok"] is True, authored
+    assert _body_of(kb, tid) == body
+
+    still_fenced = _cli_edit(kb, tid, "overwritten from a shell", fenced=True)
+    assert still_fenced.returncode == 1, still_fenced
+    assert _body_of(kb, tid) == body
 
 
 def test_delegate_child_attach_url_guard_leaves_no_row_or_file(monkeypatch, tmp_path):

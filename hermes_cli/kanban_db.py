@@ -3055,8 +3055,18 @@ def edit_task(
     body: Optional[str] = None, priority: Optional[int] = None,
     result: Optional[str] = None, summary: Optional[str] = None,
     metadata: Optional[dict] = None, board: Optional[str] = None,
+    expected_run_id: Optional[int] = None, author: Optional[str] = None,
 ) -> bool:
-    """Edit task fields, optionally backfilling a completed task's result."""
+    """Edit task fields, optionally backfilling a completed task's result.
+
+    ``expected_run_id`` makes the field write conditional on that run still being
+    the card's live claim (``tasks.current_run_id``): a worker the dispatcher
+    reclaimed, or a stale duplicate of a live one, gets ``False`` and no event
+    instead of overwriting the successor's card. Human/CLI callers pass ``None``
+    (unconditional, as before); ``kanban_edit`` passes the caller's run id.
+    ``author`` is recorded on the ``edited`` event when the caller is a worker,
+    so the board shows WHO authored the body and under which run.
+    """
     changed_fields = [
         field for field, value in (("title", title), ("body", body), ("priority", priority))
         if value is not None
@@ -3064,6 +3074,9 @@ def edit_task(
     with write_txn(conn):
         status = _task_status(conn, task_id)
         if status is None or (result is not None and status != "done"):
+            return False
+        # A claim-conditional edit only has a live claim to match while running.
+        if expected_run_id is not None and status != "running":
             return False
         assignments = []
         params = []
@@ -3077,16 +3090,27 @@ def edit_task(
             changed_fields.append("result")
         if not assignments:
             return False
-        conn.execute(
-            f"UPDATE tasks SET {', '.join(assignments)} WHERE id = ?",
-            (*params, task_id),
+        where, where_params = "id = ?", [task_id]
+        if expected_run_id is not None:
+            where += " AND current_run_id = ?"
+            where_params.append(expected_run_id)
+        cursor = conn.execute(
+            f"UPDATE tasks SET {', '.join(assignments)} WHERE {where}",
+            (*params, *where_params),
         )
+        if expected_run_id is not None and cursor.rowcount == 0:
+            # The claim moved between the caller's read and this txn (reclaimed or
+            # superseded). Nothing is written and no event claims otherwise.
+            return False
         if priority is not None:
             _append_event(conn, task_id, "reprioritized", {"priority": priority})
         if result is None:
             non_priority_fields = [field for field in changed_fields if field != "priority"]
             if non_priority_fields:
-                _append_event(conn, task_id, "edited", {"fields": non_priority_fields})
+                payload: dict[str, Any] = {"fields": non_priority_fields}
+                if author:
+                    payload["author"] = author
+                _append_event(conn, task_id, "edited", payload, run_id=expected_run_id)
         else:
             handoff_summary = summary if summary is not None else result
             changed_fields.append("summary")
