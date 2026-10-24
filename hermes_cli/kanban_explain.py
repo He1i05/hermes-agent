@@ -132,6 +132,24 @@ def abandon_plan(
     if root_status == "review":
         blocked_by.append("root_review")
 
+    # The card being abandoned is classified TOO. The descendant walk cannot see
+    # the root's own booking, and "operator buries a genuine failure under a
+    # host-flavoured reason" (D3's first failure mode) is exactly a root — or a
+    # leaf, which is its own root — whose own latest booking is card-class.
+    #
+    # Pinned choice for the ambiguous case (stated so it cannot drift): a root
+    # with NO booking at all is allowed, because a pure fan-in root has never run
+    # and there is no failure of its own to bury; a root whose newest booking
+    # exists but does not classify is refused (``unclassified_root``), because an
+    # unreadable failure is not evidence that the host caused it. Fail closed on
+    # evidence, not on absence of evidence.
+    root_booking = _first_booking(runs.get(root_id, []))
+    root_failure_class = fc.classify_run(root_booking) if root_booking is not None else None
+    if root_failure_class == fc.FAILURE_CARD:
+        blocked_by.append(f"card_class_root:{root_id}")
+    elif root_booking is not None and root_failure_class is None:
+        blocked_by.append(f"unclassified_root:{root_id}")
+
     # Transitive walk in the fan-in direction, bounded (kanban_failure_class).
     seen: set[str] = {root_id}
     frontier = [root_id]
@@ -173,6 +191,9 @@ def abandon_plan(
         "eligible": not blocked_by,
         "root": root_id,
         "root_status": root_status,
+        # The root's OWN classification (None when it never booked a failure), so
+        # the manifest and the drawer can state why the root itself is closable.
+        "root_failure_class": root_failure_class,
         "scope": scope,
         "left_in_place": left_in_place,
         "already_terminal": already_terminal,

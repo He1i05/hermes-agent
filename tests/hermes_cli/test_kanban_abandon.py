@@ -220,6 +220,199 @@ def test_leaf_card_degenerates_to_archive_with_a_reason(board):
     assert kb.get_task(conn, leaf).abandon_reason == REASON
 
 
+# --- the card's OWN booking (D2: never abandonable without --force) ----------
+
+def test_card_class_root_is_refused_and_nothing_is_written(board):
+    """Failing case for review round 1, blocking 1: the ROOT's own booking counts.
+
+    A root (or a leaf — it is its own root) whose latest booking is card-class is
+    "genuinely failed work", the exact thing a host-flavoured abandon reason must
+    not bury. The descendant walk never looks at it, so the plan classifies the
+    card being abandoned itself.
+    """
+    conn = board
+    root, order = _tree(conn, infra=1)
+    _book(conn, root, error="protocol violation: no handoff",
+          metadata={"protocol_violation": True}, status="blocked")
+    dump = _dump(conn)
+
+    plan = ke.task_explain(conn, kb.get_task(conn, root), kanban_cfg={})["abandon"]
+    assert plan["eligible"] is False
+    assert plan["blocked_by"] == [f"card_class_root:{root}"]
+    assert plan["root_failure_class"] == fc.FAILURE_CARD
+
+    result = kb.abandon_task(conn, root, reason=REASON, operator="juozas")
+    assert result.ok is False
+    assert result.blocked_by == [f"card_class_root:{root}"]
+    assert result.archived == []
+    # Zero writes: the whole cascade is refused, not just the root.
+    assert _dump(conn) == dump
+    assert _status(conn, root) == "blocked"
+    assert _status(conn, order["infra"][0]) == "blocked"
+
+
+def test_card_class_leaf_is_refused(board):
+    """Same invariant for a card with no children: it is its own root."""
+    conn = board
+    leaf = kb.create_task(conn, title="standalone card that genuinely failed")
+    _book(conn, leaf, error="work_present: artifact left behind",
+          metadata={"work_present": True})
+    dump = _dump(conn)
+    result = kb.abandon_task(conn, leaf, reason=REASON)
+    assert result.ok is False
+    assert result.blocked_by == [f"card_class_root:{leaf}"]
+    assert _dump(conn) == dump
+    assert _status(conn, leaf) == "blocked"
+
+
+def test_infra_class_root_stays_abandonable_positive_control(board):
+    """Positive control (the live ``t_a06eae46`` shape): the root's own booking is
+    infrastructure too, so classifying it must NOT start refusing real host kills."""
+    conn = board
+    root, order = _tree(conn, infra=2)
+    _book(conn, root, error=OWNER_LOSS, metadata={"worker_output": OWNER_LOSS, "infrastructure": True},
+          status="blocked")
+
+    plan = ke.task_explain(conn, kb.get_task(conn, root), kanban_cfg={})["abandon"]
+    assert plan["root_failure_class"] == fc.FAILURE_INFRA
+    assert plan["eligible"] is True, plan["blocked_by"]
+
+    result = kb.abandon_task(conn, root, reason=REASON, operator="juozas")
+    assert result.ok is True, result.to_dict()
+    assert sorted(result.archived) == sorted([root, *order["infra"]])
+    assert _events(conn, root)[0].payload["root_failure_class"] == fc.FAILURE_INFRA
+
+
+def test_root_with_no_booking_of_its_own_is_allowed(board):
+    """Pinned choice: a pure fan-in root never ran, so it has no failure to bury.
+
+    Fail-closed applies to *evidence*, not to the absence of evidence — otherwise
+    every fan-in root (the whole point of the verb) would be refused.
+    """
+    conn = board
+    root, order = _tree(conn, infra=1)
+    plan = ke.task_explain(conn, kb.get_task(conn, root), kanban_cfg={})["abandon"]
+    assert plan["root_failure_class"] is None
+    assert plan["eligible"] is True
+    assert plan["scope"] == order["infra"]
+
+
+def test_unclassified_root_booking_fails_closed(board):
+    """Pinned choice: a root that ran and failed UNREADABLY is refused.
+
+    An unreadable failure is not evidence that the host caused it, so the plan
+    refuses it exactly as it refuses an unclassified descendant.
+    """
+    conn = board
+    root, order = _tree(conn, infra=1)
+    _book(conn, root, error="pid 7 exited with code 1 Worker's last output: 'Traceback'",
+          status="blocked")
+    plan = ke.task_explain(conn, kb.get_task(conn, root), kanban_cfg={})["abandon"]
+    assert plan["root_failure_class"] is None
+    assert plan["eligible"] is False
+    assert plan["blocked_by"] == [f"unclassified_root:{root}"]
+
+    result = kb.abandon_task(conn, root, reason=REASON)
+    assert result.ok is False and result.blocked_by == [f"unclassified_root:{root}"]
+    assert _status(conn, order["infra"][0]) == "blocked"
+
+
+def test_force_closes_a_card_class_root_and_records_the_override(board):
+    conn = board
+    root, order = _tree(conn, infra=1)
+    _book(conn, root, error="protocol violation: no handoff",
+          metadata={"protocol_violation": True}, status="blocked")
+    result = kb.abandon_task(conn, root, reason=REASON, force=True, operator="juozas")
+    assert result.ok is True, result.to_dict()
+    assert result.forced is True
+    assert result.overridden_safeguards == [f"card_class_root:{root}"]
+    manifest = _events(conn, root)[0].payload
+    assert manifest["forced"] is True
+    assert manifest["overridden_safeguards"] == [f"card_class_root:{root}"]
+    assert manifest["scope"] == [root, *order["infra"]]
+
+
+# --- race: the write CAS re-validates the plan's status ----------------------
+
+def test_stale_plan_loses_the_cas_and_is_reported_raced(board, monkeypatch):
+    """Appendix B race: blocked at plan time, claimed by the dispatcher at write time.
+
+    The plan is a read; between reading it and archiving a card a dispatcher can
+    claim it. The per-card CAS must re-validate the planned status inside the
+    write transaction, so a claimed card is skipped as ``raced`` — no status
+    write, no ``abandoned`` event, no worker termination.
+    """
+    conn = board
+    root, order = _tree(conn, infra=1)
+    child = order["infra"][0]
+    real_plan = ke.abandon_plan
+
+    def plan_then_claim(root_id, **kwargs):
+        plan = real_plan(root_id, **kwargs)
+        conn.execute(
+            "UPDATE tasks SET status = 'running', claim_lock = 'other-host:1' WHERE id = ?",
+            (child,),
+        )
+        conn.commit()
+        return plan
+
+    monkeypatch.setattr(ke, "abandon_plan", plan_then_claim)
+    result = kb.abandon_task(conn, root, reason=REASON, operator="juozas")
+
+    assert result.ok is True
+    assert child in result.raced and child not in result.archived
+    assert _status(conn, child) == "running"
+    task = kb.get_task(conn, child)
+    assert task.abandon_reason is None and task.abandoned_by is None
+    assert _events(conn, child) == []
+    kinds = [e.kind for e in kb.list_events(conn, child)]
+    assert "archive_worker_termination" not in kinds
+    # The root itself did not move, so the tree is still closable once the child
+    # settles — the operator is not left with a half-abandoned tree.
+    assert _status(conn, root) == "archived"
+
+
+def test_stale_root_status_also_loses_the_cas(board, monkeypatch):
+    conn = board
+    root, _ = _tree(conn, infra=1)
+    real_plan = ke.abandon_plan
+
+    def plan_then_claim_root(root_id, **kwargs):
+        plan = real_plan(root_id, **kwargs)
+        conn.execute("UPDATE tasks SET status = 'running', claim_lock = 'other-host:1' "
+                     "WHERE id = ?", (root,))
+        conn.commit()
+        return plan
+
+    monkeypatch.setattr(ke, "abandon_plan", plan_then_claim_root)
+    result = kb.abandon_task(conn, root, reason=REASON)
+    assert root in result.raced
+    assert _status(conn, root) == "running"
+    assert _events(conn, root) == []
+
+
+# --- the audit manifest carries the classes ---------------------------------
+
+def test_left_in_place_entries_carry_their_class(board):
+    """D3: a card the verb leaves behind is named WITH its class, not just its id."""
+    conn = board
+    root, order = _tree(conn, infra=1, card=1)
+    result = kb.abandon_task(conn, root, reason=REASON, dry_run=True)
+    # Refused: the card-class child is left in place and the payload says why.
+    assert result.ok is False
+    assert [entry["id"] for entry in result.left_in_place] == [order["card"][0]]
+    assert result.left_in_place[0]["failure_class"] == fc.FAILURE_CARD
+    assert "card" in result.left_in_place[0]["reason"].lower()
+
+    # The manifest carries the same shape (plus the root's own class) even when a
+    # forced run leaves nothing in place.
+    root2, _ = _tree(conn, infra=1, card=1)
+    assert kb.abandon_task(conn, root2, reason=REASON, force=True).ok is True
+    manifest = _events(conn, root2)[0].payload
+    assert manifest["left_in_place"] == []
+    assert manifest["root_failure_class"] is None
+
+
 # --- idempotency / dry run ---------------------------------------------------
 
 def test_second_abandon_writes_nothing(board):
