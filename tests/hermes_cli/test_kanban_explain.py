@@ -258,6 +258,43 @@ def test_classification_and_abandon_eligibility_can_never_disagree(board):
             assert kid not in plan["scope"]
 
 
+def test_the_cards_own_class_and_the_abandon_gate_agree(board):
+    """The invariant covers the card BEING abandoned, not only its descendants.
+
+    Review round 1 found ``abandon_plan`` classifying descendants only, so a
+    card-class root/leaf read ``eligible: true`` and a host-flavoured reason could
+    bury genuinely failed work. The plan now classifies the root's own newest
+    booking with the same function that produces ``explain.failure_class``.
+    """
+    conn = board
+    card_leaf = kb.create_task(conn, title="card that genuinely failed")
+    _book(conn, card_leaf, error="protocol violation: no handoff", metadata={"protocol_violation": True})
+    card_explain = _explain(conn, card_leaf)
+    assert card_explain["failure_class"] == fc.FAILURE_CARD
+    assert card_explain["abandon"]["eligible"] is False
+    assert card_explain["abandon"]["blocked_by"] == [f"card_class_root:{card_leaf}"]
+
+    infra_leaf = kb.create_task(conn, title="card the host killed")
+    _book(conn, infra_leaf, error=OWNER_LOSS, metadata={"infrastructure": True})
+    infra_explain = _explain(conn, infra_leaf)
+    assert infra_explain["failure_class"] == fc.FAILURE_INFRA
+    assert infra_explain["abandon"]["eligible"] is True
+
+    # A child's drawer shows its root's plan, so it must explain the ROOT's refusal.
+    root = kb.create_task(conn, title="root quest", triage=True)
+    kids = kbg.decompose_triage_task(
+        conn, root, root_assignee="builder",
+        children=[{"title": "infra child", "assignee": "builder"}],
+    )
+    _book(conn, kids[0], error=OWNER_LOSS, metadata={"infrastructure": True})
+    _book(conn, root, error="protocol violation: no handoff", metadata={"protocol_violation": True},
+          status="blocked")
+    child_explain = _explain(conn, kids[0])
+    assert child_explain["abandon"]["root"] == root
+    assert child_explain["abandon"]["blocked_by"] == [f"card_class_root:{root}"]
+    assert child_explain["abandon"]["eligible"] is False
+
+
 def test_complete_child_is_already_terminal_not_a_blocker(board):
     conn = board
     root = kb.create_task(conn, title="root quest", triage=True)
