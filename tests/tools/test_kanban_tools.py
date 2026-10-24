@@ -8,6 +8,7 @@ Verifies:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -1483,3 +1484,151 @@ class TestDefaultTaskId:
         assert kt._default_task_id("") == worker_env
         assert kt._default_task_id("   ") == worker_env
         assert kt._default_task_id(None) == worker_env
+
+
+# ---------------------------------------------------------------------------
+# kanban_edit — a worker authoring its OWN card body under its live claim
+# ---------------------------------------------------------------------------
+#
+# A design card carries its D1–D6 deliverable IN tasks.body, and the CLI route
+# (`hermes kanban edit --body`) is fenced for every spawned worker shell, so the
+# owning worker needs an in-process, claim-conditional write surface.
+
+
+def test_edit_writes_the_workers_own_body_and_records_the_author(worker_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    body = "**D1. Named semantics**\n- `claim` — a run's ownership of one card\n"
+    out = json.loads(kt._handle_edit({"body": body, "title": "design: body-edit tool"}))
+
+    assert out["ok"] is True, out
+    assert out["fields"] == ["title", "body"]
+    assert out["status"] == "running"
+    assert out["body_bytes"] == len(body.encode("utf-8"))
+    assert out["body_sha256"] == hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+    conn = kbc.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        edited = [e for e in kb.list_events(conn, worker_env) if e.kind == "edited"]
+    finally:
+        conn.close()
+    # Verbatim: the body IS the deliverable (like kanban_create's body), so the
+    # reviewer reads exactly the bytes the worker handed over.
+    assert task.body == body
+    assert task.title == "design: body-edit tool"
+    assert len(edited) == 1
+    assert edited[0].payload == {"fields": ["title", "body"], "author": "test-worker"}
+
+
+def test_edit_refuses_a_card_the_worker_does_not_own(worker_env):
+    """A prompt-injected task_id must not let a worker rewrite a sibling card."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    conn = kbc.connect()
+    try:
+        other = kb.create_task(conn, title="someone else's card", assignee="other-worker")
+        before = kb.get_task(conn, other).body
+    finally:
+        conn.close()
+
+    out = json.loads(kt._handle_edit({"task_id": other, "body": "hijacked"}))
+    assert out["error"], out
+    assert "refusing to mutate" in out["error"]
+
+    conn = kbc.connect()
+    try:
+        assert kb.get_task(conn, other).body == before
+    finally:
+        conn.close()
+
+
+def test_edit_refuses_once_the_claim_moved_to_a_successor(worker_env):
+    """Reclaimed card: the board's current_run_id, not the caller's env, decides.
+
+    This is the whole point of the run-conditional UPDATE — a stale worker whose
+    claim the dispatcher released must not overwrite its successor's body.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    conn = kbc.connect()
+    try:
+        before = kb.get_task(conn, worker_env).body
+        assert kb.reclaim_task(conn, worker_env, signal_fn=lambda *_a: None) is True
+        assert kb.claim_task(conn, worker_env) is not None
+        successor_run = kb._current_run_id(conn, worker_env)
+        events_before = [e for e in kb.list_events(conn, worker_env) if e.kind == "edited"]
+    finally:
+        conn.close()
+
+    out = json.loads(kt._handle_edit({"body": "stale overwrite"}))
+    assert out["error"], out
+    assert f"held by run {successor_run}" in out["error"]
+    assert "not by this worker" in out["error"]
+
+    conn = kbc.connect()
+    try:
+        assert kb.get_task(conn, worker_env).body == before
+        assert [e for e in kb.list_events(conn, worker_env) if e.kind == "edited"] == events_before
+    finally:
+        conn.close()
+
+
+def test_edit_refuses_an_unbound_worker(monkeypatch, worker_env):
+    """No run id -> no ownership proof -> refuse (mirrors the lifecycle tools)."""
+    from tools import kanban_tools as kt
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    out = json.loads(kt._handle_edit({"body": "x"}))
+    assert out["error"], out
+    assert "HERMES_KANBAN_RUN_ID" in out["error"]
+    assert "Nothing changed" in out["error"]
+
+
+def test_edit_refuses_a_caller_with_no_dispatcher_claim(monkeypatch, worker_env):
+    """A chat/orchestrator session sees the tool but cannot author a worker's card;
+    the refusal names the CLI route a human actually uses."""
+    from tools import kanban_tools as kt
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    out = json.loads(kt._handle_edit({"task_id": worker_env, "body": "x"}))
+    assert out["error"], out
+    assert "hermes kanban edit" in out["error"]
+
+
+def test_edit_refuses_a_delegate_child(worker_env):
+    """The fence stays intact: a delegate_task child shares the parent's env."""
+    from agent.delegation_context import delegated_child_context
+    from tools import kanban_tools as kt
+    with delegated_child_context():
+        out = json.loads(kt._handle_edit({"body": "x"}))
+    assert out["error"], out
+    assert "delegate_task child" in out["error"]
+
+
+def test_edit_rejects_a_missing_or_blank_field(worker_env):
+    from tools import kanban_tools as kt
+    empty = json.loads(kt._handle_edit({}))
+    assert empty["error"] and "title, body" in empty["error"]
+    blank = json.loads(kt._handle_edit({"title": "   "}))
+    assert blank["error"] and "blank" in blank["error"]
+    typo = json.loads(kt._handle_edit({"bodyy": "x"}))
+    assert typo["error"] and "unknown parameter" in typo["error"]
+
+
+def test_edit_is_registered_and_reaches_codex_runtime_workers():
+    """A codex app-server worker only reaches tools named in EXPOSED_TOOLS; without
+    kanban_edit such a worker stays unable to author its own card body."""
+    from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
+    from tools import kanban_tools as _kt  # registers kanban_edit at import
+    from tools.registry import registry
+
+    assert _kt is not None
+    assert "kanban_edit" in EXPOSED_TOOLS
+    schema = registry.get_schema("kanban_edit")
+    assert set(schema["parameters"]["properties"]) == {"task_id", "title", "body", "board"}
