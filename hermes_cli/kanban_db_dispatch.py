@@ -953,8 +953,9 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     just closed). ``rate_limited`` runs are neutral and skipped (a quota wall
     says nothing about the task); ``work_present`` rows count like violations
     (work landed, paperwork did not — a card that keeps producing output and never
-    files must still reach ``gave_up``); any other closed run breaks the streak, so
-    the budget counts ONLY protocol violations. Violations are recognized by the
+    files must still reach ``gave_up``); any other closed run breaks the streak,
+    so only clean exits that filed no handoff — ``protocol_violation`` and
+    ``work_present`` — extend the budget. Violations are recognized by the
     ``protocol_violation`` run-metadata marker, with the error text as fallback
     for runs recorded before the marker existed.
     """
