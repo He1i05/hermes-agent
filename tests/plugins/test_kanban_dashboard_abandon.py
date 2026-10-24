@@ -174,6 +174,62 @@ def test_abandon_endpoint_requires_a_reason(env):
     assert response.status_code == 400, response.text
 
 
+def test_abandon_endpoint_refuses_a_card_class_root(env):
+    """Review round 1, blocking 1 at the API surface the drawer reads."""
+    client = env
+    with _conn() as conn:
+        root, infra_ids, _ = _tree(conn, infra=1)
+        _book(conn, root, error="protocol violation: no handoff",
+              metadata={"protocol_violation": True})
+    card = _card(client, root)
+    assert card["explain"]["failure_class"] == "card"
+    assert card["explain"]["abandon"]["eligible"] is False
+    assert card["explain"]["abandon"]["blocked_by"] == [f"card_class_root:{root}"]
+    assert card["explain"]["abandon"]["root_failure_class"] == "card"
+
+    response = client.post(f"/api/plugins/kanban/tasks/{root}/abandon", json={"reason": REASON})
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["blocked_by"] == [f"card_class_root:{root}"]
+    with _conn() as conn:
+        assert kb.get_task(conn, root).status == "blocked"
+        assert kb.get_task(conn, infra_ids[0]).status == "blocked"
+
+
+# --- the bundle (dist/index.js) that renders the payload ---------------------
+
+def _bundle() -> str:
+    repo_root = Path(__file__).resolve().parents[2]
+    return (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text(
+        encoding="utf-8")
+
+
+def test_dashboard_bundle_renders_the_explain_panel_and_gates_the_abandon_action():
+    """D4's UI half: the bundle is hand-maintained (no build step), so the panel,
+    the card badge and the eligibility-gated action must exist in the shipped file.
+
+    Static assertions are what is possible without a JS test runner; the payload
+    the panel reads is covered behaviourally by the tests above.
+    """
+    bundle = _bundle()
+    # The drawer panel and its fields.
+    assert "function ExplainSection(" in bundle
+    assert "h(ExplainSection, { task: t })" in bundle
+    for field in ("failure_class", "failure_evidence", "retry_budget", "cooldown",
+                  "owner_loss", "blocking_children", "abandon"):
+        assert field in bundle, field
+    # The card badge distinguishes card from infrastructure.
+    assert "hermes-kanban-fc-badge--" in bundle
+    assert '"infra"' in bundle and '"card"' in bundle
+    # The action is gated on the backend's own eligibility verdict, and a refused
+    # plan is explained instead of being clickable.
+    assert "const abandonPlan = (task.explain && task.explain.abandon) || null;" in bundle
+    assert "disabled: !abandonPlan.eligible" in bundle
+    assert "abandonPlan.blocked_by || []).join" in bundle
+    # It posts the same verb the CLI does, and never force-closes from a click.
+    assert "/abandon`" in bundle
+    assert 'body: JSON.stringify({ reason: trimmed, force: false })' in bundle
+
+
 def test_open_parent_refusal_names_the_real_root_and_the_abandon_verb(env):
     """The 409 an operator hits on a fan-in root must name the escape hatch."""
     client = env
