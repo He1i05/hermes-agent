@@ -8,6 +8,7 @@ shlex quoting of JSON metadata, structured-JSON failures). Humans use CLI/dashbo
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -22,9 +23,9 @@ from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
-    KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
-    KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
-    KANBAN_SCHEDULE_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
+    KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_EDIT_SCHEMA, KANBAN_HEARTBEAT_SCHEMA,
+    KANBAN_LINK_SCHEMA, KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA,
+    KANBAN_REQUEST_REVIEW_SCHEMA, KANBAN_SCHEDULE_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
 
 logger = logging.getLogger(__name__)
 
@@ -973,6 +974,65 @@ def _handle_comment(args: dict, **kw) -> str:
         return _ok(task_id=tid, comment_id=cid)
 
 
+@_kanban_handler("kanban_edit")
+def _handle_edit(args: dict, **kw) -> str:
+    """Author this worker's OWN card body/title under its live claim.
+
+    The CLI route (``hermes kanban edit``) is fenced for every spawned worker shell
+    by design (``agent.delegation_context.kanban_path_is_fenced``), and a design card
+    carries its D1–D6 deliverable IN the body, so the owning worker needs an
+    in-process surface. This one is claim-conditional: it refuses a caller with no
+    dispatcher run, a foreign card, or a run that no longer owns the card, so a
+    reclaimed worker cannot overwrite its successor's body.
+    """
+    tid = _worker_guard("kanban_edit", args)
+    title = args.get("title")
+    body = args.get("body")
+    _check(title is not None or body is not None,
+           "provide at least one of: title, body (both omitted leaves the card unchanged). "
+           "Nothing changed.")
+    if title is not None:
+        _check(str(title).strip(), "title must not be blank. Nothing changed.")
+    run_id = _worker_run_id(tid)
+    if run_id is None:
+        raise _Reject(
+            f"kanban_edit refused: this caller holds no dispatcher run on {tid} "
+            "(HERMES_KANBAN_RUN_ID is unset or unresolvable), so it cannot prove it owns "
+            "the card's live claim. A body edit belongs to the worker the card was "
+            "dispatched to; a human or orchestrator uses `hermes kanban edit "
+            f"{tid} --body ...`. Nothing changed.")
+    with _board(args.get("board")) as (kb, conn):
+        task = _existing_task(kb, conn, tid)
+        live = task.current_run_id
+        if live != run_id:
+            # The board, not the caller's env, is the authority on who holds the card.
+            raise _Reject(
+                f"kanban_edit refused: {tid} is held by run {live}, not by this worker "
+                f"(run {run_id}, status {task.status}). A reclaimed card belongs to its "
+                "successor — record what you found with kanban_comment and stop. "
+                "Nothing changed.")
+        _check(task.status == "running",
+               f"kanban_edit refused: {tid} is {task.status}, not running — a body edit "
+               "needs the live claim. Nothing changed.")
+        # No redaction: like kanban_create's body, this text IS the deliverable
+        # (a D1–D6 design body, a spec), so it lands byte-for-byte and the reply's
+        # body_sha256 lets the worker prove what the reviewer will read.
+        ok = kb.edit_task(
+            conn, tid, title=title, body=body, expected_run_id=run_id,
+            author=_persisted_identity(), board=args.get("board"))
+        _check(ok,
+               f"kanban_edit refused: {tid} changed hands before the write (the run "
+               "conditional did not match), so nothing was written. Re-read the card "
+               "with kanban_show before retrying.")
+        stored = kb.get_task(conn, tid)
+        stored_body = stored.body or ""
+        return _ok(
+            task_id=tid, run_id=run_id, status=stored.status, title=stored.title,
+            fields=[name for name, value in (("title", title), ("body", body)) if value is not None],
+            body_bytes=len(stored_body.encode("utf-8")),
+            body_sha256=hashlib.sha256(stored_body.encode("utf-8")).hexdigest())
+
+
 def _store_attachment(board, tid, filename, data, content_type) -> str:
     """Store via ``kanban_db.store_attachment_bytes`` (shared size cap, per-task
     dir, metadata row) so agent, dashboard, and CLI surfaces stay in lockstep."""
@@ -1302,6 +1362,7 @@ _TOOLS = (
     ("kanban_request_changes", KANBAN_REQUEST_CHANGES_SCHEMA, _handle_request_changes, "↩"),
     ("kanban_heartbeat", KANBAN_HEARTBEAT_SCHEMA, _handle_heartbeat, "💓"),
     ("kanban_comment", KANBAN_COMMENT_SCHEMA, _handle_comment, "💬"),
+    ("kanban_edit", KANBAN_EDIT_SCHEMA, _handle_edit, "✏"),
     ("kanban_attach", KANBAN_ATTACH_SCHEMA, _handle_attach, "📎"),
     ("kanban_attach_url", KANBAN_ATTACH_URL_SCHEMA, _handle_attach_url, "📎"),
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
