@@ -471,7 +471,7 @@ def _print_section(title: str, lines) -> None:
         print(line)
 
 
-def _print_explain(explain: dict, field) -> None:
+def _print_explain(explain: dict, field, task_id: str | None = None) -> None:
     """Render the derived explain payload (``hermes kanban show --explain``).
 
     Same object the dashboard receives: failure class + evidence, the retry budget
@@ -479,7 +479,7 @@ def _print_explain(explain: dict, field) -> None:
     the owner-loss sentence, and whether/how this card's tree can be abandoned.
     """
     print("\n  Explain:")
-    field("failure", explain.get("failure_class") or "unclassified (fails closed: not abandonable)")
+    field("failure", explain.get("failure_class") or "unclassified (no classified failure on record)")
     evidence = explain.get("failure_evidence") or {}
     if evidence:
         field("evidence", f"run {evidence.get('run_id')} ({evidence.get('source') or 'unknown source'})")
@@ -496,10 +496,15 @@ def _print_explain(explain: dict, field) -> None:
     if owner_loss:
         field("owner-loss", f"{owner_loss.get('text')} [{owner_loss.get('variant')}]")
     plan = explain.get("abandon") or {}
+    # Say WHOSE plan this is. A child's explain carries its ROOT's abandon plan, so
+    # "not abandonable" beside the child's own `infra` class must not read as if the
+    # child were the subject — the refusal belongs to the root's tree.
+    plan_root = plan.get("root")
+    whose = f" (root {plan_root}'s tree)" if task_id and plan_root and plan_root != task_id else ""
     if plan.get("eligible"):
-        field("abandon", f"yes — {plan.get('command')}")
+        field("abandon", f"yes{whose} — {plan.get('command')}")
     else:
-        field("abandon", "no — " + "; ".join(plan.get("blocked_by") or ["not eligible"]))
+        field("abandon", f"no{whose} — " + "; ".join(plan.get("blocked_by") or ["not eligible"]))
 
 
 def _cmd_show(args: argparse.Namespace) -> int:
@@ -573,7 +578,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"\n  Diagnostics ({len(diags)}):")
         _print_diagnostics(diags, "    ", with_kind=False)
     if explain is not None:
-        _print_explain(explain, field)
+        _print_explain(explain, field, task.id)
     if task.started_at:
         field("started", _fmt_ts(task.started_at))
     if task.completed_at:

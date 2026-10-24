@@ -3936,13 +3936,22 @@ class AbandonResult:
 
 def _archive_abandoned_card(
     conn: sqlite3.Connection, card_id: str, *, reason: str, operator: Optional[str],
-    now: int, event_payload: dict, signal_fn=None,
+    now: int, event_payload: dict, signal_fn=None, expected_status: Optional[str] = None,
 ) -> tuple[str, Optional[int]]:
     """Archive ONE card with abandon provenance; returns ``(state, run_id)``.
 
-    ``state`` is ``archived`` / ``already_archived`` / ``raced`` / ``missing``. The
-    CAS on ``status != 'archived'`` is what makes a concurrent second abandon (or a
-    human archiving mid-cascade) skip instead of double-writing an event.
+    ``state`` is ``archived`` / ``already_archived`` / ``raced`` / ``missing``.
+
+    Two guards, both inside the write transaction (design D3):
+
+    * ``status != 'archived'`` — a concurrent second abandon (or a human archiving
+      mid-cascade) skips instead of double-writing an event;
+    * ``status = <expected_status>`` — the status the PLAN saw. A card that moved
+      between plan and write (a dispatcher claim turning ``blocked`` into
+      ``running`` is the real case) loses the CAS and is reported ``raced``: no
+      status write, no ``abandoned`` event, no worker termination. Without this
+      guard the verb would archive — and kill — a card that started working after
+      the operator read the plan.
     """
     prev_pid = prev_lock = prev_started = None
     was_running = False
@@ -3955,15 +3964,21 @@ def _archive_abandoned_card(
             return "missing", None
         if row["status"] == "archived":
             return "already_archived", None
+        if expected_status is not None and row["status"] != expected_status:
+            return "raced", None
         was_running = row["status"] == "running"
         prev_pid, prev_lock, prev_started = (
             row["worker_pid"], row["claim_lock"], row["worker_started_at"])
-        cur = conn.execute(
+        sql = (
             "UPDATE tasks SET status = 'archived', abandon_reason = ?, abandoned_at = ?, "
             "abandoned_by = ?, claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
-            "worker_started_at = NULL WHERE id = ? AND status != 'archived'",
-            (reason, now, operator, card_id),
+            "worker_started_at = NULL WHERE id = ? AND status != 'archived'"
         )
+        params: list = [reason, now, operator, card_id]
+        if expected_status is not None and expected_status != "archived":
+            sql += " AND status = ?"
+            params.append(expected_status)
+        cur = conn.execute(sql, tuple(params))
         if cur.rowcount != 1:
             return "raced", None
         run_id = _end_run(
@@ -4003,6 +4018,10 @@ def abandon_task(
     * is idempotent: a second run over an abandoned tree writes nothing;
     * refuses ``review`` and live-``running`` descendants unless ``force``, and
       then records the overridden safeguard ids;
+    * refuses when the CARD ITSELF — root or leaf — is the thing that failed:
+      its own newest booking being card-class blocks with ``card_class_root``
+      (and an unreadable one with ``unclassified_root``), so a host-flavoured
+      reason can never bury genuinely failed work;
     * ``dry_run=True`` computes and prints the plan and writes NOTHING.
 
     The plan itself is :func:`hermes_cli.kanban_explain.abandon_plan` — the same
@@ -4091,16 +4110,24 @@ def abandon_task(
         "forced": bool(force),
         "keep_children": bool(keep_children),
         "scope": [task_id, *targets],
-        "left_in_place": [entry["id"] for entry in result.left_in_place],
+        # Each left-in-place card carries its CLASS, not just its id: D3 wants the
+        # audit trail to be enough to reconstruct *why* the verb stopped there
+        # (``card``: genuinely failed work; None: unreadable failure, fail closed).
+        "left_in_place": [dict(entry) for entry in result.left_in_place],
         "already_terminal": list(result.already_terminal),
         "overridden_safeguards": list(result.overridden_safeguards),
+        "root_failure_class": plan.get("root_failure_class"),
     }
+    # The status the PLAN saw, per card: the write CAS re-validates it so a card
+    # that moved between plan and write is reported ``raced`` instead of archived.
+    planned_status = {d["id"]: d["status"] for d in descendants}
     # Descendants first, root last: the root's event then enumerates a cascade that
     # has already committed, and every archived child has no open child left by the
     # time the reap pass runs.
     for cid in targets:
         state, _ = _archive_abandoned_card(
             conn, cid, reason=reason_text, operator=operator, now=now, signal_fn=signal_fn,
+            expected_status=planned_status.get(cid),
             event_payload={"via": "abandon", "root_id": task_id, "reason": reason_text,
                            "failure_class": fc.FAILURE_INFRA},
         )
@@ -4110,6 +4137,7 @@ def abandon_task(
             result.raced.append(cid)
     state, _ = _archive_abandoned_card(
         conn, task_id, reason=reason_text, operator=operator, now=now, signal_fn=signal_fn,
+        expected_status=plan["root_status"],
         event_payload={"via": "abandon", **manifest},
     )
     if state == "archived":
