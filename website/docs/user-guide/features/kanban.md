@@ -629,9 +629,10 @@ and can be disabled with `HERMES_KANBAN_STOP_NUDGE=0`.
 before reaching the nudge, the dispatcher gives the violation a **bounded retry**
 (up to `_PROTOCOL_VIOLATION_FAILURE_LIMIT` consecutive violations, default 3)
 before auto-blocking the task instead of respawning it into the same loop. The
-budget counts only *consecutive* clean-exit protocol violations — interleaved
-rate-limited requeues are neutral, and any other failure kind resets the
-streak — and a per-task `max_retries` overrides the bound. A card blocked by
+budget counts only *consecutive* clean exits that filed no handoff —
+`protocol_violation` and `work_present` runs both advance the streak;
+interleaved rate-limited requeues are neutral, and any other failure kind resets
+the streak — and a per-task `max_retries` overrides the bound. A card blocked by
 this budget stays blocked (it is not auto-promoted like a below-`failure_limit`
 breaker block) until `hermes kanban unblock <id>`, which also grants a fresh
 retry budget. This usually means
