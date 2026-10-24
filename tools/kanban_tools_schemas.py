@@ -332,6 +332,34 @@ KANBAN_COMMENT_SCHEMA = _schema(
     ["task_id", "body"],
 )
 
+KANBAN_EDIT_SCHEMA = _schema(
+    "kanban_edit",
+    (
+        "Author your OWN card's title or body — a design body, a fleshed-out spec, "
+        "corrected acceptance criteria — while you hold its live claim. The write is "
+        "conditional on your run id, so a reclaimed or stale worker cannot overwrite "
+        "the successor's card; a caller with no live dispatcher claim, or a "
+        "delegate_task child, is refused. Only the title/body are reachable here: "
+        "priority, result and metadata edits stay on `hermes kanban edit`. ``body`` "
+        "replaces the whole body (markdown), and is stored byte-for-byte like "
+        "``kanban_create``'s body — the reply carries body_bytes/body_sha256 so you "
+        "can prove exactly what landed."
+    ),
+    {
+        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "title": _prop("string", (
+                "New title (omit to leave it unchanged). A whitespace-only title is "
+                "refused."
+        )),
+        "body": _prop("string", (
+                "New full body markdown (omit to leave it unchanged). Replaces the "
+                "body wholesale, so read the card with kanban_show first and send "
+                "the complete text you want the card to carry."
+        )),
+    },
+    [],
+)
+
 KANBAN_ATTACH_SCHEMA = _schema(
     "kanban_attach",
     (
