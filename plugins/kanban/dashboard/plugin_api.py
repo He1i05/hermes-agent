@@ -36,6 +36,8 @@ from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli import kanban_explain as ke
+from hermes_cli import kanban_failure_class as kfc
 from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES, _collision_free_path, _safe_attachment_name
 
 log = logging.getLogger(__name__)
@@ -213,6 +215,9 @@ def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[
     if task_ids is not None and not task_ids:
         return {}
     diag_config = kd.config_from_runtime_config(load_config())
+    # The infrastructure rule names the fan-in root an infra-parked child sits in,
+    # so the board offers the real abandon command instead of a generic hint.
+    diag_config["_abandon_root_of"] = lambda tid: kfc.nearest_fan_in_root(conn, tid)
     if task_ids is not None:
         rows = conn.execute(f"SELECT * FROM tasks WHERE id IN ({_placeholders(task_ids)})", tuple(task_ids)).fetchall()
     else:
@@ -313,6 +318,9 @@ def get_board(
             p["total"] += 1
             p["done"] += row["cstatus"] == "done"
         diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=None)
+        # One derived explain object per card (3 aggregate queries, not N+1):
+        # failure class, retry budget, cooldown, owner-loss reason, abandon plan.
+        explain_per_task = ke.board_explain(conn, tasks)
         latest_event_id = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM task_events").fetchone()["m"]
         columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
         if include_archived:
@@ -331,6 +339,7 @@ def get_board(
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
             _attach_diagnostics(d, diagnostics_per_task.get(t.id))
+            d["explain"] = explain_per_task.get(t.id)
             columns[t.status if t.status in columns else "todo"].append(d)
 
         # Queue lanes keep the list_tasks dispatch order; the done column is
@@ -396,6 +405,7 @@ def get_task(
         child_summaries = kanban_db.latest_summaries(conn, links["children"])
         children = filter(None, (kanban_db.get_task(conn, cid) for cid in links["children"]))
         _attach_diagnostics(task_d, _compute_task_diagnostics(conn, task_ids=[task_id]).get(task_id) or [])
+        task_d["explain"] = ke.task_explain(conn, task)
         return {
             "task": task_d,
             "comments": [asdict(c) for c in kanban_db.list_comments(conn, task_id)],
@@ -664,7 +674,12 @@ def _open_parent_refusal(conn, task_id: str, s: str) -> Optional[str]:
     if not blockers:
         return None
     detail = ", ".join(f"{pid} ({status})" for pid, status in blockers)
-    return f"cannot move {task_id} to {s!r}: unsatisfied parent dependencies: {detail}; complete the parents first (done or archived)"
+    hint = ""
+    root = kfc.nearest_fan_in_root(conn, task_id)
+    if root:
+        hint = (f"; or abandon the whole subtree it fans in on: "
+                f"hermes kanban abandon {root} --reason '<why>' (POST /tasks/{root}/abandon)")
+    return f"cannot move {task_id} to {s!r}: unsatisfied parent dependencies: {detail}; complete the parents first (done or archived){hint}"
 
 
 def _patch_title_body(conn, task_id: str, payload: UpdateTaskBody, board: Optional[str]) -> None:
@@ -1013,6 +1028,55 @@ def reclaim_task_endpoint(task_id: str, payload: ReclaimBody, board: Optional[st
         if not kanban_db.reclaim_task(conn, task_id, reason=payload.reason):
             raise _conflict(f"cannot reclaim {task_id}: not in a claimable state (not running, or unknown id)")
         return {"ok": True, "task_id": task_id}
+
+
+class AbandonBody(BaseModel):
+    """``POST /tasks/{id}/abandon`` — archive a fan-in root WITH a reason.
+
+    ``reason`` is required and lands on every card the cascade touches;
+    ``dry_run`` returns the plan and writes nothing; ``force`` is the only way to
+    archive a card-class / review / running descendant, and the manifest records
+    which safeguards were overridden.
+    """
+
+    reason: str
+    force: bool = False
+    keep_children: bool = False
+    dry_run: bool = False
+
+
+@router.post("/tasks/{task_id}/abandon")
+def abandon_task_endpoint(task_id: str, payload: AbandonBody, board: Optional[str] = Query(None)):
+    """Archive a fan-in root and its infrastructure-killed descendants.
+
+    A fan-in root (a decomposed quest) can never reach ``done`` while a child is
+    open, and a child killed by the HOST leaves nothing for the operator to retry.
+    The 409 payload enumerates ``blocked_by`` so the UI can disable the button with
+    a reason instead of asking the operator to decode a refusal.
+    """
+    with _errors_to_500("abandon"):
+        with _board_conn(board) as (board, conn):
+            result = kanban_db.abandon_task(
+                conn, task_id,
+                reason=payload.reason,
+                operator="dashboard",
+                force=bool(payload.force),
+                keep_children=bool(payload.keep_children),
+                dry_run=bool(payload.dry_run),
+            )
+    body = result.to_dict()
+    if result.blocked_by:
+        raise _conflict({
+            "error": f"cannot abandon {task_id}: {len(result.blocked_by)} safeguard(s) would bury real work",
+            "task_id": task_id,
+            "blocked_by": list(result.blocked_by),
+            "abandon": body,
+        })
+    if not result.ok:
+        raise HTTPException(status_code=400, detail={
+            "error": "abandon refused", "task_id": task_id, "errors": list(result.errors),
+        })
+    return body
 
 
 class SpecifyBody(BaseModel):
