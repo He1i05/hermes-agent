@@ -2724,6 +2724,9 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    _gate_completion_evidence(
+        conn, task_id, result=result, summary=summary, metadata=metadata,
+    )
     handoff_summary = summary if summary is not None else result
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
@@ -2826,6 +2829,29 @@ def _gate_created_cards(
 
 def _substantive_text(value: Optional[str]) -> bool:
     return bool(value is not None and str(value).strip())
+
+
+def _gate_completion_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    result: Optional[str],
+    summary: Optional[str],
+    metadata: Optional[dict],
+) -> None:
+    """M13 completion-evidence gate (H1), **shadow only**.
+
+    Records one ``completion_gate_shadow`` event carrying ``would_refuse`` for the
+    R2 class; refuses nothing, mutates nothing, emits no worker-visible text. Off by
+    default (``kanban.completion_gate``), and off means no evaluation at all. See
+    :mod:`hermes_cli.kanban_completion_gate` — enforcement is deliberately absent
+    until the 14-day shadow window in the M13 packet is measured.
+    """
+    try:
+        from hermes_cli.kanban_completion_gate import gate_completion
+    except Exception:  # pragma: no cover - a missing module must not wedge a completion
+        return
+    gate_completion(conn, task_id, result=result, summary=summary, metadata=metadata)
 
 
 def _gate_empty_completion(

@@ -1109,6 +1109,51 @@ kanban:
   default_workdir: ~/work/active-project
 ```
 
+### Completion-evidence gate (`completion_gate`) — shadow only
+
+`kanban.completion_gate` adds a post-hoc evidence check to every completion. It is
+**shadow-only**: it records a decision and blocks nothing.
+
+| Value | Behaviour |
+|-------|-----------|
+| `off` (default) | No evaluation, no event. One config read per completion. |
+| `shadow` | Evaluate each completion and append a `completion_gate_shadow` event with `would_refuse`. Never refuses, mutates nothing, emits no text to the worker. |
+| `enforce` | **Reserved — unproven and untested.** Accepted as a value, behaves exactly like `shadow` and records `enforce_ignored: true`. No refusal path ships. |
+
+One refusal class (`R2`) is evaluated: *the completion claims a code/file change but no
+cited commit resolves into the card's own tree* — the workspace tree, a repo path the
+worker declared in metadata (`repo`, `repo_path`, `workspace_repo`, `repo_root`), or an
+absolute path named in the completion payload. Resolution is `git merge-base
+--is-ancestor` against that tree's `HEAD`, never equality, so a commit that lands during
+a run still verifies. Nothing is attributed host-wide: on a machine with several
+checkouts of the same repo a single-HEAD rule would refuse the wrong cards.
+
+Three exempt classes, each recorded on the event so promotion purity is measurable:
+
+- `review_approval` — the completion approves a card out of `review` (structurally
+  43–48 % of completions on a busy board).
+- `adoption_evidence_waiver` — completion metadata carries an `adoption_evidence` key.
+- `no_implementable_artifact` — the card declares `read_only: true`, or no git tree can
+  be attributed to it (research cards, decision packets, wiki prose).
+
+A gate error is recorded as `completion_gate_error` and never blocks the completion.
+
+```bash
+# turn it on for one profile (the gate runs in the worker process, so the worker's
+# config home decides) ...
+hermes --profile builder config set kanban.completion_gate shadow
+# ... and roll it back with one command. The key is read per completion, so no
+# restart or service bounce is required in either direction.
+hermes --profile builder config set kanban.completion_gate off
+```
+
+To see what it would have said before enabling it, replay a live board read-only
+(`--host-repo` is a diagnostic and is never used by the gate):
+
+```bash
+python3 scripts/m13_completion_gate_replay.py --days 11
+```
+
 ### Scheduled task starts (`scheduled_at`)
 
 Set `scheduled_at` on a task to delay dispatch until a specific time. The dispatcher skips ready tasks whose `scheduled_at` is in the future and picks them up on the first tick after that timestamp.
@@ -1548,6 +1593,8 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `stale` | `{elapsed_seconds, last_heartbeat_at, heartbeat_age_seconds, timeout_seconds, pid, terminated}` | Task ran longer than `kanban.dispatch_stale_timeout_seconds` (default 4 h) AND no `kanban_heartbeat` arrived in the last hour. Dispatcher SIGTERM'd the host-local worker (if any), reset the task to `ready` for re-dispatch. Does NOT tick the failure counter (stale is dispatcher-side absence detection, not a worker fault). Workers running long operations should call `kanban_heartbeat` at least once an hour to avoid this. |
 | `reconciled` | `{reason, claim_lock, claim_expires, worker_pid}` | Orphaned-card reconciliation: the card was `running` with broken claim bookkeeping (`claim_lock` or `claim_expires` NULL — crash mid-claim, manual SQL, DB restore) and no live worker, so none of the TTL/crash/stale paths could ever recover it. The dispatcher requeued it to `ready` with an explanatory comment. Gated by `kanban.reconcile_orphans` in config.yaml (default `true`). |
 | `respawn_guarded` | `{reason}` | Dispatcher refused to re-spawn this ready task this tick. Reasons: `infrastructure_cooldown` (the host refused the last spawn — no restart-safe systemd scope — and the cooldown has not elapsed; never counted against the card), `rate_limit_cooldown` (the last run hit a quota wall; same cooldown, never counted), `blocker_auth` (last failure was a quota/auth/429 error — wait for the rate window to reset), `recent_success` (a completed run happened in the last hour — wait for review before re-running), `active_pr` (a GitHub PR URL appears in a recent comment — a prior worker already opened a PR). The task stays in `ready`; the next tick gets another chance to spawn. If the underlying condition persists, the normal `consecutive_failures` circuit breaker will auto-block via `gave_up` after `failure_limit` failures. |
+| `completion_gate_shadow` | `{mode, evaluated, exempt_class?, refusal_class?, would_refuse, reason, claims_code_change, sha_candidates, resolution_domains, resolved_sha?, enforce_ignored, elapsed_ms}` | `kanban.completion_gate` is `shadow` (or the reserved `enforce`): the completion-evidence gate evaluated this completion. Purely advisory — it is appended in its own transaction before the completion's own write, and blocks nothing. `exempt_class` is `review_approval`, `adoption_evidence_waiver` or `no_implementable_artifact`; `refusal_class` is `R2_unresolvable_code_change` when `would_refuse` is true. Off (the default) records nothing. |
+| `completion_gate_error` | `{mode, evaluated: false, error}` | The gate itself failed while evaluating this completion. The completion proceeds unchanged; the row exists so gate defects are countable instead of silent. |
 | `spawn_failed` | `{error, failures}` | One spawn attempt failed (missing PATH, workspace unmountable, …). Counter increments; task returns to `ready` for retry. |
 | `skipped_nonspawnable` | `{assignee}` | Dispatcher refused to spawn because the assignee profile does not exist in this home (or is not in `kanban.dispatch_profiles`). Written once per card — repeated only when another event landed in between — so `show`/`tail` name the missing profile without a row per tick. The card stays in `ready`; reassign it or install the profile. |
 | `protocol_violation` | `{pid, claimer, exit_code, protocol_violation, worker_output?}` | A clean exit (`rc=0`) while the task was still `running` with **no** cause and **no** evidence: the dispatcher books a provider quota wall as `rate_limited` and a run that left artifacts in its workspace as `work_present` first, so this row means neither was found. The message names all five terminal tools (`kanban_complete`, `kanban_block`, `kanban_schedule`, `kanban_request_review`, `kanban_request_changes`). Emitted on every violation (the payload's `protocol_violation: true` marker is copied into the run metadata and feeds the violation-only retry budget). Below the budget — up to `_PROTOCOL_VIOLATION_FAILURE_LIMIT` (default 3) *consecutive* violations, per-task `max_retries` overriding — the task simply returns to `ready` for another attempt; when the streak reaches the bound the dispatcher also emits `gave_up` and auto-blocks. `worker_output` carries the worker's own last printed text (usually its explanation of why it stopped), also folded into `last_failure_error` and shown to the retry worker as the prior-attempt error. |
