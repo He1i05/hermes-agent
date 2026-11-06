@@ -382,3 +382,23 @@ def test_home_and_hermes_home_are_never_resolution_domains(home, tmp_path, monke
             mode="shadow",
         ).resolution_domains
     )
+
+
+def test_replay_per_week_follows_the_window_length(home):
+    """The replay's weekly rate divides by ``--days``, not by a hardcoded 11."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[2] / "scripts" / "m13_completion_gate_replay.py"
+    spec = importlib.util.spec_from_file_location("m13_replay_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    card = {"id": "t_x", "assignee": "builder", "title": "x", "metadata": {}}
+    hit = gate.GateDecision(mode="shadow", evaluated=True, would_refuse=True, reason="r")
+    miss = gate.GateDecision(mode="shadow", evaluated=True, reason="no code-change claim")
+
+    assert module._summarise([card], [(card, hit)], 7)["per_week"] == 1.0
+    assert module._summarise([card], [(card, hit)], 14)["per_week"] == 0.5
+    assert module._summarise([card], [(card, hit), (card, miss)], 14)["per_week"] == 0.5
+    assert module._summarise([card], [(card, hit)], 0)["per_week"] == 0.0
+
