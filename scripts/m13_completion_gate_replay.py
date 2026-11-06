@@ -139,7 +139,9 @@ def _replay(cards: list[dict], scope: str) -> dict:
     return decisions
 
 
-def _summarise(cards: list[dict], decisions: list[tuple[dict, gate.GateDecision]]) -> dict:
+def _summarise(
+    cards: list[dict], decisions: list[tuple[dict, gate.GateDecision]], days: int
+) -> dict:
     exempt = Counter()
     reasons = Counter()
     latencies = []
@@ -175,7 +177,7 @@ def _summarise(cards: list[dict], decisions: list[tuple[dict, gate.GateDecision]
         "allowed": n - sum(exempt.values()) - hits,
         "would_refuse": hits,
         "would_refuse_share": round(hits / n, 4) if n else 0.0,
-        "per_week": round(hits / (11 / 7), 2) if n else 0.0,
+        "per_week": round(hits / (days / 7), 2) if n and days else 0.0,
         "median_latency_ms": round(statistics.median(latencies), 2) if latencies else 0.0,
         "p95_latency_ms": (
             round(sorted(latencies)[max(0, int(len(latencies) * 0.95) - 1)], 2)
@@ -311,8 +313,8 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         conn.close()
 
-    card_scoped = _summarise(cards, _replay(cards, "card"))
-    workspace_only = _summarise(cards, _replay(cards, "workspace"))
+    card_scoped = _summarise(cards, _replay(cards, "card"), args.days)
+    workspace_only = _summarise(cards, _replay(cards, "workspace"), args.days)
     _print_table(args.days, since, now, card_scoped, workspace_only)
 
     diag = None
