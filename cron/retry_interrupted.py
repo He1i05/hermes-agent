@@ -23,10 +23,13 @@ that already exists applies unchanged — at-most-once claim, occurrence dedupe,
 fencing, delivery.
 
 Delays are capped at the job's own grace window (``cron.jobs._compute_grace_seconds``), so a
-planned retry is always *inside* grace and therefore classifies ``on_time``/``late`` — never
-``catch_up``. That is what makes "retry" and ``cron.catch_up_missed`` mutually exclusive by
-construction instead of a race between two dispatchers: catch-up only ever acts on an instant
-already past grace, and the same instant cannot be both.
+retry planned while the host is up fires *inside* grace and classifies ``on_time``/``late``. If
+the host is down at the retry instant, that instant is already past grace when it comes back, so
+the ``cron.catch_up_missed`` policy owns the single fire (kind ``catch_up``) — the ledger still
+holds exactly one retry row, so the two paths can never both fire. Catch-up and retry are
+therefore mutually exclusive in outcome, not by an untestable classification claim: catch-up only
+ever acts on an instant already past grace, and a retry that was fired promptly can never be
+past it.
 
 Kill switches: ``cron.retry_interrupted: false`` in config.yaml, and per-job
 ``retry.max_attempts: 0``. Recurring jobs only: finite one-shots are pre-claimed by
@@ -154,8 +157,10 @@ def delay_seconds(job: dict[str, Any], attempt: int) -> float:
     """Exponential backoff for the Nth retry, capped by the job's own grace window.
 
     ``delay_n = min(backoff * 2**(n-1), min(max_backoff, grace_seconds(job)))``. Reusing the
-    grace window means a planned retry is always inside the job's late window, so the due scan
-    can never classify it ``catch_up`` — the no-double-fire invariant of the catch-up policy.
+    grace window keeps a prompt retry inside the job's late window, so the due scan fires it as
+    ``on_time``/``late``. A retry whose instant is only reached after an outage is past grace by
+    then and is therefore owned by the catch-up policy (one fire, kind ``catch_up``) — not by two
+    dispatch paths racing.
     """
     policy = job_retry_policy(job)
     cap = max(0.0, min(float(policy.max_backoff_seconds), _grace_seconds(job)))
@@ -326,17 +331,24 @@ def plan_pending_retries(limit: int = MAX_INTENTS_PER_PASS) -> int:
     The intent is claimed first (R4 — a fenced ``retry_pending 1 -> 0``), so two schedulers
     sharing a store cannot both amend the schedule; the loser sees ``rowcount == 0`` and drops
     out. A gate that refuses after the claim drops the intent durably and logs why (F6).
+
+    With retries switched off, the owed intents are voided instead of left pending: an intent
+    that will never be planned must not keep its row prune-exempt indefinitely.
     """
-    from cron.executions import claim_retry_intent, pending_retry_intents
+    from cron.executions import claim_retry_intent, pending_retry_intents, void_retry_intent
     from cron.jobs import _parse_aware, get_job, _with_job, is_job_runnable, is_terminal_job
 
     intents = pending_retry_intents(limit)
     if not intents:
         return 0
     if not retry_enabled():
-        logger.info(
-            "cron.retry_interrupted is off — %d interrupted-run retr%s left unplanned",
-            len(intents), "y" if len(intents) == 1 else "ies")
+        voided = sum(
+            1 for row in intents
+            if row.get("id") and void_retry_intent(str(row["id"])))
+        if voided:
+            logger.info(
+                "cron.retry_interrupted is off — %d interrupted-run retr%s voided",
+                voided, "y" if voided == 1 else "ies")
         return 0
 
     planned = 0

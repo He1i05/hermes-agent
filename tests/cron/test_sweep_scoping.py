@@ -7,8 +7,10 @@ fresh run declared unaccountable by the process that launched it.
 The sweep now demands positive proof of death and never judges a claim that postdates its own
 start:
 
-* S1 — precedence, monotonic: a claim newer than this process's own start is out of scope; the
-  one exemption is the self-sufficient proof (owner pid absent) after a full reap interval.
+* S1 — precedence, boot clock: a claim newer than this process's own start is out of scope. The
+  claim instant is the ``claimed_boottime`` stamp written at claim time (seconds since boot, the
+  same clock as ``process_started_at``), so a wall-clock step in either direction changes nothing;
+  the one exemption is the self-sufficient proof (owner pid absent) after a full reap interval.
 * S2 — machine scope: a row from another machine's pid namespace is undecidable, never dead.
 * S3 — proof: pid absence, a RECORDED fingerprint mismatch, or a boot change on this machine.
   A fingerprint that could not be read at claim time is not proof.
@@ -24,7 +26,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -33,12 +35,20 @@ import cron.executions as executions_mod
 
 @pytest.fixture(autouse=True)
 def _ledger(monkeypatch, tmp_path):
+    # Explicit tmp isolation: never the live ledger, board or cron store.
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
     monkeypatch.setattr(
         executions_mod, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
     # The sweeper's own start is deterministic in these tests: it began an hour ago, so a row
-    # stamped "now" genuinely postdates it and a backdated row genuinely predates it.
+    # stamped "now" genuinely postdates it and a backdated row genuinely predates it. Both
+    # readings are stubbed because S1 compares on the boot clock and only falls back to the
+    # monotonic one for a row claimed before ``claimed_boottime`` existed.
     monkeypatch.setattr(
         executions_mod, "_process_start_monotonic", lambda: time.monotonic() - 3600.0)
+    monkeypatch.setattr(
+        executions_mod, "_process_start_boottime",
+        lambda: (executions_mod._now_boottime() or 0.0) - 3600.0)
     return executions_mod
 
 
@@ -51,6 +61,12 @@ def _dead_pid() -> int:
     return int(proc.stdout.strip())
 
 
+def _boottime_for(claimed_at: str) -> float:
+    """The boot-clock stamp that belongs with a wall-clock claim instant."""
+    age = (executions_mod._hermes_now() - datetime.fromisoformat(claimed_at)).total_seconds()
+    return (executions_mod._now_boottime() or 0.0) - age
+
+
 def _seed(
     executions,
     job_id: str,
@@ -59,22 +75,30 @@ def _seed(
     pid: int | None = None,
     process_started_at: int | None = None,
     claimed_at: str | None = None,
+    claimed_boottime: float | None | str = "auto",
     boot_id: str | None = None,
     machine_id: str | None = None,
     attempt: int = 1,
 ) -> str:
-    """A foreign owner's row, shaped like a real claim (owner image, pid, fingerprint)."""
+    """A foreign owner's row, shaped like a real claim (owner image, pid, fingerprint).
+
+    ``claimed_boottime="auto"`` (the default) keeps the boot stamp consistent with
+    ``claimed_at``; pass ``None`` to model a row claimed before that column existed.
+    """
     record = executions.create_execution(job_id, source="builtin", attempt=attempt)
+    stamp = claimed_at or record["claimed_at"]
+    if claimed_boottime == "auto":
+        claimed_boottime = _boottime_for(stamp)
     with executions._transaction() as conn:
         conn.execute(
             """UPDATE executions
                   SET status=?, started_at=?, process_id='foreign-image', pid=?,
-                      process_started_at=?, claimed_at=COALESCE(?, claimed_at),
+                      process_started_at=?, claimed_at=?, claimed_boottime=?,
                       boot_id=?, machine_id=?
                 WHERE id=?""",
             (status, executions._hermes_now().isoformat() if status == "running" else None,
              os.getpid() if pid is None else pid,
-             process_started_at, claimed_at,
+             process_started_at, stamp, claimed_boottime,
              boot_id if boot_id is not None else executions._read_boot_id(),
              machine_id if machine_id is not None else executions._machine_scope_id(),
              record["id"]),
@@ -163,7 +187,64 @@ def test_clock_step_backwards_does_not_make_a_fresh_claim_eligible():
     assert _status(older) == "unknown"
 
 
+def test_a_claim_written_while_the_clock_ran_behind_is_still_postdating(caplog):
+    """The direction the host actually ran: the stamp was WRITTEN 92 min in the past (the clock
+    was behind), and the sweep happens after NTP corrected it.
+
+    A claim instant reconstructed from ``claimed_at`` reads that row as 92 min old, i.e. as
+    pre-restart, and S3's fingerprint mismatch then swept a 20-second-old run. The boot-clock
+    stamp (``claimed_boottime``) says the claim is 20 s old, so it postdates this process and is
+    out of scope — a wall-clock step cannot reorder the two clocks.
+    """
+    execution_id = _seed(
+        executions_mod, "clock-behind",
+        pid=os.getpid(),                       # live owner, fingerprint does not match the claim
+        process_started_at=executions_mod._process_start_time(os.getpid()) + 60_000_000,
+        claimed_at=(executions_mod._hermes_now() - timedelta(minutes=92)).isoformat(),
+        claimed_boottime=(executions_mod._now_boottime() or 0.0) - 20.0,
+        boot_id=executions_mod._read_boot_id(),
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="cron.executions"):
+        assert executions_mod.recover_interrupted_executions() == 0
+
+    assert _status(execution_id) == "running"
+    assert "claimed after this process started" in caplog.text
+
+
+def test_a_legacy_row_without_a_boottime_stamp_still_falls_back_to_the_wall_clock(caplog):
+    """Documented residual: a row claimed BEFORE ``claimed_boottime`` existed carries only the
+    wall-clock stamp, so a backwards step can still make it look pre-restart. It is not
+    terminalized on that reading alone — the fingerprint mismatch below is the actual proof —
+    and every row claimed by this version carries the boot stamp, so the window closes with the
+    first restart."""
+    execution_id = _seed(
+        executions_mod, "legacy-clock-behind",
+        pid=os.getpid(),
+        process_started_at=executions_mod._process_start_time(os.getpid()) + 60_000_000,
+        claimed_at=(executions_mod._hermes_now() - timedelta(minutes=92)).isoformat(),
+        claimed_boottime=None,
+    )
+
+    assert executions_mod.recover_interrupted_executions() == 1
+
+    record = executions_mod.get_execution(execution_id)
+    assert record["status"] == "unknown"
+    assert record["outcome_class"] == "owner_gone"
+
+
 # --- S2 / S3: machine scope, boot change, and what is NOT proof ------------------------------
+
+def test_every_claim_records_the_boot_clock_stamp():
+    """S1 can only be clock-step-proof if the stamp exists: ``create_execution`` records seconds
+    since boot (and the boot id it belongs to) with every attempt."""
+    record = executions_mod.create_execution("stamped-job", source="builtin")
+
+    assert record["boot_id"] == executions_mod._read_boot_id()
+    now_boot = executions_mod._now_boottime()
+    assert now_boot is not None and record["claimed_boottime"] is not None
+    assert 0.0 <= now_boot - record["claimed_boottime"] < 60.0
+
 
 def test_a_row_from_another_machine_is_never_swept_however_dead_it_looks():
     execution_id = _seed(

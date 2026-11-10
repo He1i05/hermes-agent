@@ -76,11 +76,14 @@ def test_genuine_external_worker_crash_is_recovered_unknown(
         execution_ledger, "_PROCESS_ID", "replacement-scheduler")
     # The crashed worker's claim must age past this process's own start before the sweep may
     # judge it (S1 in cron/executions.py); the crashed owner's pid is gone, which is the
-    # self-sufficient proof.
+    # self-sufficient proof. Both clock readings are backdated: S1 reads the boot-clock stamp
+    # first, so a row whose ``claimed_at`` is old but whose boot stamp is "now" would model a
+    # claim that postdates this very process.
     with execution_ledger._transaction() as conn:
         conn.execute(
-            "UPDATE executions SET claimed_at=? WHERE id=?",
+            "UPDATE executions SET claimed_at=?, claimed_boottime=? WHERE id=?",
             ((execution_ledger._hermes_now() - timedelta(seconds=600)).isoformat(),
+             (execution_ledger._now_boottime() or 0.0) - 600.0,
              record["id"]),
         )
     assert execution_ledger.recover_interrupted_executions() == 1

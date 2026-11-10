@@ -64,21 +64,30 @@ def _new_attempt(job_id: str, *, attempt: int = 1, retry_of: str | None = None) 
     return record["id"]
 
 
+def _claim_boottime(age_seconds: float) -> float:
+    """Boot-clock stamp for a claim ``age_seconds`` old (S1 compares on the boot clock)."""
+    return (executions_mod._now_boottime() or 0.0) - age_seconds
+
+
 def _kill(execution_id: str, *, age_seconds: float = 600.0) -> None:
     """Make the attempt look like a run killed mid-flight: a dead owner, a pre-restart claim.
 
     The killed run's fire claim is released with its owner: ``_claim_is_live`` drops a claim
-    whose owner pid has exited, so the retry's claim is not blocked by a dead firer.
+    whose owner pid has exited, so the retry's claim is not blocked by a dead firer. Both clock
+    readings are backdated: a row that says ``claimed_at`` 10 minutes ago but carries a boot
+    stamp of "now" would be a claim that postdates this very process, which is the opposite of
+    what a killed predecessor looks like.
     """
     record = executions_mod.get_execution(execution_id)
     with executions_mod._transaction() as conn:
         conn.execute(
             """UPDATE executions
                   SET status='running', started_at=?, process_id='dead-worker', pid=?,
-                      process_started_at=NULL, claimed_at=?
+                      process_started_at=NULL, claimed_at=?, claimed_boottime=?
                 WHERE id=?""",
             (executions_mod._hermes_now().isoformat(), _dead_pid(),
              (executions_mod._hermes_now() - timedelta(seconds=age_seconds)).isoformat(),
+             _claim_boottime(age_seconds),
              execution_id),
         )
     if record is not None:
@@ -133,7 +142,9 @@ def test_killed_mid_run_is_retried_exactly_once(monkeypatch):
     # The planner converts the intent into a schedule amendment and clears it.
     assert retry_mod.plan_pending_retries() == 1
     stored = jobs.get_job(job["id"])
-    assert stored["next_run_at"] == parent["retry_at"]
+    # Compare instants, not their ISO spellings: the store canonicalises to UTC while
+    # ``retry_at`` keeps the profile zone's offset.
+    assert datetime.fromisoformat(stored["next_run_at"]) == retry_at
     assert stored["retry_interrupted"] == {
         "at": parent["retry_at"], "attempt": 2, "row_id": parent_id, "expr": None}
     assert executions_mod.get_execution(parent_id)["retry_pending"] == 0
@@ -144,7 +155,7 @@ def test_killed_mid_run_is_retried_exactly_once(monkeypatch):
     assert row is not None
     assert row["attempt"] == 2
     assert row["retry_of"] == parent_id
-    assert row["scheduled_instant"] == parent["retry_at"]
+    assert datetime.fromisoformat(row["scheduled_instant"]) == retry_at
     assert jobs.get_job(job["id"])["last_dispatch"]["kind"] == "on_time"
 
     # Exactly one retry: the occurrence is consumed, and no third attempt exists.
@@ -335,15 +346,21 @@ def test_a_retry_for_a_paused_job_is_dropped_durably():
     assert jobs.get_job(job["id"])["state"] == "paused"
 
 
-def test_a_kill_switch_off_leaves_the_intent_unplanned(monkeypatch):
+def test_a_kill_switch_off_voids_the_owed_intent(monkeypatch):
+    """With retries switched off the intent is not planned — and not left pending either: an
+    owed intent that will never be converted must stop keeping its row prune-exempt."""
     job = _job()
     parent_id = _new_attempt(job["id"])
     _kill(parent_id)
     executions_mod.recover_interrupted_executions()
+    next_run_before = jobs.get_job(job["id"])["next_run_at"]
     monkeypatch.setattr(retry_mod, "retry_enabled", lambda cfg=None: False)
 
     assert retry_mod.plan_pending_retries() == 0
-    assert executions_mod.get_execution(parent_id)["retry_pending"] == 1
+    parent = executions_mod.get_execution(parent_id)
+    assert parent["retry_pending"] == 0      # voided, so the row can be pruned again
+    assert parent["retry_at"] is not None    # the record of when it was owed survives
+    assert jobs.get_job(job["id"])["next_run_at"] == next_run_before
 
 
 def test_a_verified_receipt_cancels_the_owed_retry():
@@ -373,10 +390,11 @@ def test_owner_wedged_is_never_retried(monkeypatch):
     with executions_mod._transaction() as conn:
         conn.execute(
             """UPDATE executions SET status='running', process_id='wedged-worker',
-                   pid=?, process_started_at=?, claimed_at=?
+                   pid=?, process_started_at=?, claimed_at=?, claimed_boottime=?
                 WHERE id=?""",
             (os.getpid(), executions_mod._process_start_time(os.getpid()),
              (executions_mod._hermes_now() - timedelta(seconds=9000)).isoformat(),
+             _claim_boottime(9000.0),
              record["id"]),
         )
 

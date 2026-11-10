@@ -42,11 +42,14 @@ def test_default_and_uncomputable_still_catch_up(tmp_path, monkeypatch, uncomput
 
 
 @pytest.mark.parametrize("schedule", ["every 1m", "every 5m", "every 1h", "0 9 * * 1"])
-def test_a_planned_retry_can_never_be_classified_catch_up(schedule):
+def test_a_promptly_fired_retry_is_never_classified_catch_up(schedule):
     """The interrupted-run retry rides the ONE due scan, so "retry vs catch-up" is not a race
-    between two dispatchers but a classification invariant: the retry delay is capped at the
-    job's own grace window, so its lateness can only classify ``on_time``/``late``. Catch-up
-    only ever acts on an instant already past grace, and the same instant cannot be both.
+    between two dispatchers: the retry delay never exceeds the job's own grace window, so the
+    parked instant is inside grace and firing it promptly classifies ``on_time``/``late``.
+    Catch-up only ever acts on an instant already past grace — which is precisely what happens
+    when the host is down at the retry instant (one fire, owned by catch-up; see
+    ``test_retry_interrupted.py::test_a_retry_that_outlived_a_second_outage_is_handled_by_catch_up_not_twice``).
+    Neither reading allows two fires for the one retry row.
     """
     from cron.retry_interrupted import delay_seconds
 

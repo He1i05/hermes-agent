@@ -37,12 +37,13 @@ def _backdate_claim(executions, execution_id: str, *, seconds: float = 600.0) ->
     are about what happens to a departed owner's claim, not about the ordering rule itself
     (covered by ``tests/cron/test_sweep_scoping.py``).
     """
-    from cron.executions import _hermes_now
+    from cron.executions import _hermes_now, _now_boottime
 
     with executions._transaction() as conn:
         conn.execute(
-            "UPDATE executions SET claimed_at=? WHERE id=?",
-            ((_hermes_now() - timedelta(seconds=seconds)).isoformat(), str(execution_id)),
+            "UPDATE executions SET claimed_at=?, claimed_boottime=? WHERE id=?",
+            ((_hermes_now() - timedelta(seconds=seconds)).isoformat(),
+             (_now_boottime() or 0.0) - seconds, str(execution_id)),
         )
 
 

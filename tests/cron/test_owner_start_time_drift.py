@@ -40,8 +40,9 @@ def _seed_external_running(monkeypatch, *, claimed_start_time: int) -> str:
         executions_mod.mark_execution_running(record["id"])
     with executions_mod._transaction() as conn:
         conn.execute(
-            "UPDATE executions SET claimed_at=? WHERE id=?",
-            ((executions_mod._hermes_now() - timedelta(seconds=600)).isoformat(), record["id"]),
+            "UPDATE executions SET claimed_at=?, claimed_boottime=? WHERE id=?",
+            ((executions_mod._hermes_now() - timedelta(seconds=600)).isoformat(),
+             (executions_mod._now_boottime() or 0.0) - 600.0, record["id"]),
         )
     return record["id"]
 

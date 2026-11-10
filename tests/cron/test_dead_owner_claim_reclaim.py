@@ -71,8 +71,8 @@ def _orphan_claimed_row(executions, job_id: str) -> str:
     with executions._transaction() as conn:
         conn.execute(
             "UPDATE executions SET process_id='dead-cli-process', pid=?, "
-            "process_started_at=NULL, claimed_at=? WHERE id=?",
-            (_dead_pid(), _backdated_claim(), record["id"]),
+            "process_started_at=NULL, claimed_at=?, claimed_boottime=? WHERE id=?",
+            (_dead_pid(), _backdated_claim(), _backdated_boottime(), record["id"]),
         )
     return record["id"]
 
@@ -82,6 +82,18 @@ def _backdated_claim(seconds: float = 600.0) -> str:
     from cron.executions import _hermes_now
 
     return (_hermes_now() - timedelta(seconds=seconds)).isoformat()
+
+
+def _backdated_boottime(seconds: float = 600.0) -> float:
+    """The boot-clock stamp that belongs with ``_backdated_claim``.
+
+    S1 reads ``claimed_boottime`` first (a wall-clock stamp cannot order a claim against the
+    sweep's own start), so a fixture that only backdates ``claimed_at`` would model a claim
+    that postdates the running process — the opposite of a leftover from an earlier one.
+    """
+    from cron.executions import _now_boottime
+
+    return (_now_boottime() or 0.0) - seconds
 
 
 def _run_tick():
@@ -110,8 +122,8 @@ class TestTickReapsDeadOwnerClaims:
         with executions._transaction() as conn:
             conn.execute(
                 "UPDATE executions SET process_id='dead-cli-process', pid=?, "
-                "process_started_at=NULL, claimed_at=? WHERE id=?",
-                (_dead_pid(), _backdated_claim(), record["id"]),
+                "process_started_at=NULL, claimed_at=?, claimed_boottime=? WHERE id=?",
+                (_dead_pid(), _backdated_claim(), _backdated_boottime(), record["id"]),
             )
 
         _run_tick()

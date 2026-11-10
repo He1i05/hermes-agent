@@ -2,13 +2,16 @@
 
 The ledger records what is known about each attempt; it is not a retry queue. Interrupted attempts
 become ``unknown`` only after their owner is proved gone — a start-time reading that fails to
-match the claim-time fingerprint is not proof of death. Terminal states are immutable.
+match the claim-time fingerprint is not proof of death. A terminal attempt's verdict
+(``status``, ``error``, ``outcome_class``) is write-once.
 
 One bounded amendment to that rule (``cron/retry_interrupted.py``): an attempt killed through no
 fault of the job (owner proved gone, or an interruption written by the failure paths) records a
 retry *intent* (``retry_pending``/``retry_at``) in the SAME fenced UPDATE that terminalizes it,
 and a later planning pass converts the intent into a schedule amendment. The retry itself is a
-new row (``retry_of``/``attempt``); the terminal row is never rewritten.
+new row (``retry_of``/``attempt``). After that write the only field any caller may still change is
+the intent flag itself — a one-way ``retry_pending 1 -> 0`` when the intent is planned, voided, or
+superseded by a verified receipt. The verdict above is never rewritten.
 """
 
 from __future__ import annotations
@@ -44,7 +47,9 @@ LIVE_OWNER_STALE_CLAIM_FLOOR_SECONDS = 7200.0
 # for an inferential verdict; the self-sufficient proof (owner pid absent) still applies, but only
 # once the claim has had one full reap interval to terminalize itself. Both numbers exist to stop a
 # *fresh* run being declared unaccountable by the process that launched it (2026-11-09: claimed
-# 09:13:40, started 09:13:46, swept 09:14:18.939).
+# 09:13:40, started 09:13:46, swept 09:14:18.939). The comparison runs on the boot clock
+# (``claimed_boottime`` vs this process's ticks-since-boot), never on the wall clock, which ran
+# 92 min behind on that boot until NTP corrected it.
 SWEEP_START_SLACK_SECONDS = 5.0
 SWEEP_POSTDATING_MIN_AGE_SECONDS = 300.0
 
@@ -132,6 +137,13 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(conn, "executions", "retry_at", "retry_at TEXT")
     add_column_if_missing(conn, "executions", "boot_id", "boot_id TEXT")
     add_column_if_missing(conn, "executions", "machine_id", "machine_id TEXT")
+    # ``claimed_boottime``: the claim instant in seconds since boot (``/proc/uptime``), i.e. on
+    #   the SAME clock as ``process_started_at`` (``/proc/<pid>/stat`` ticks / HZ). S1's
+    #   "does this claim postdate the sweeper?" comparison is measured on this stamp, so a wall
+    #   clock step — in either direction — cannot reorder the two. NULL on rows claimed before
+    #   the column existed: those fall back to the wall-clock derivation.
+    add_column_if_missing(conn, "executions", "claimed_boottime",
+                          "claimed_boottime REAL")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_retry_pending "
         "ON executions(retry_at) WHERE retry_pending=1"
@@ -266,60 +278,135 @@ def _machine_scope_id() -> str:
     return _MACHINE_SCOPE_CACHE
 
 
+def _now_boottime() -> Optional[float]:
+    """Seconds since boot (``/proc/uptime``) — the clock ``process_started_at`` ticks use."""
+    try:
+        return float(Path("/proc/uptime").read_text(encoding="ascii").split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _boottime_to_monotonic(stamp: Optional[float]) -> Optional[float]:
+    """A seconds-since-boot stamp on the ``time.monotonic()`` scale (None when unreadable)."""
+    if stamp is None:
+        return None
+    now_boot = _now_boottime()
+    if now_boot is None:
+        return None
+    return time.monotonic() - max(0.0, now_boot - float(stamp))
+
+
+_MY_START_BOOTTIME: Optional[float] = None
+
+
+def _process_start_boottime() -> Optional[float]:
+    """This process's own start as seconds since boot (``process_started_at`` / HZ).
+
+    The same clock the ledger's ``claimed_boottime`` stamp is written on, so claim and sweeper
+    can be compared without either wall clock being involved (see ``_claim_precedence``).
+    """
+    global _MY_START_BOOTTIME
+    if _MY_START_BOOTTIME is not None:
+        return _MY_START_BOOTTIME
+    ticks = _process_start_time(os.getpid())
+    if ticks is None:
+        return None
+    try:
+        hz = float(os.sysconf("SC_CLK_TCK"))
+    except (AttributeError, ValueError, OSError):
+        hz = 100.0
+    _MY_START_BOOTTIME = float(ticks) / hz
+    return _MY_START_BOOTTIME
+
+
 _MY_START_MONOTONIC: Optional[float] = None
 
 
 def _process_start_monotonic() -> Optional[float]:
     """The monotonic instant this process started (None when /proc cannot settle it).
 
-    Both sides of the claim-vs-sweeper comparison must come from the monotonic clock:
-    ``process_started_at`` is ticks-since-boot and cannot be compared with ``claimed_at``, and
-    the wall clock steps (this host ran -92 min after the 2026-11-09 boot until NTP corrected).
+    Derived from the boot clock (``process_started_at`` is ticks-since-boot and cannot be
+    compared with ``claimed_at``), and used only for rows that carry no ``claimed_boottime``
+    stamp — i.e. claims written before that column existed.
     """
     global _MY_START_MONOTONIC
     if _MY_START_MONOTONIC is not None:
         return _MY_START_MONOTONIC
-    ticks = _process_start_time(os.getpid())
-    if ticks is None:
+    start_mono = _boottime_to_monotonic(_process_start_boottime())
+    if start_mono is None:
         return None
-    try:
-        uptime = float(Path("/proc/uptime").read_text(encoding="ascii").split()[0])
-    except (OSError, ValueError, IndexError):
-        return None
-    try:
-        hz = float(os.sysconf("SC_CLK_TCK"))
-    except (AttributeError, ValueError, OSError):
-        hz = 100.0
-    age = max(0.0, uptime - (float(ticks) / hz))
-    _MY_START_MONOTONIC = time.monotonic() - age
+    _MY_START_MONOTONIC = start_mono
     return _MY_START_MONOTONIC
+
+
+def _row_field(row: Any, name: str) -> Any:
+    """One column from a ``sqlite3.Row`` or a dict (None when the column is absent)."""
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None
+
+
+def _claim_precedence(row: dict[str, Any]) -> tuple[Optional[bool], Optional[float]]:
+    """(does the claim postdate this process's own start?, claim age) — measured on ONE clock.
+
+    Preferred reading: seconds since boot on both sides — the claim's ``claimed_boottime``
+    stamp and this process's own start (``/proc/<pid>/stat`` ticks / HZ). A wall-clock step,
+    including the -92 min this host ran after the 2026-11-09 boot until NTP corrected it, then
+    cannot move one side relative to the other in EITHER direction; elapsed time is read off
+    ``/proc/uptime``, never off ``claimed_at``.
+
+    Rows claimed before that stamp existed (NULL) or whose stamp belongs to another boot fall
+    back to deriving the claim instant from ``claimed_at`` plus the monotonic start. That
+    fallback is the documented residual: a stamp written while the clock ran behind reads the
+    claim older than it is, so it can look pre-restart. It still cannot terminalize anything on
+    its own — S3 must independently prove the owner dead.
+
+    Returns ``(None, None)`` when neither reading can settle the claim instant.
+    """
+    my_start = _process_start_monotonic()
+    if my_start is None:
+        return None, None
+    stamp = _row_field(row, "claimed_boottime")
+    my_start_boot = _process_start_boottime()
+    if (stamp is not None and my_start_boot is not None
+            and not _boot_changed(_row_field(row, "boot_id"))):
+        now_boot = _now_boottime()
+        if now_boot is not None:
+            age = now_boot - float(stamp)
+            if age >= 0:  # a stamp past "now" on the boot clock is unreadable, not evidence
+                return float(stamp) > my_start_boot + SWEEP_START_SLACK_SECONDS, age
+    try:
+        age = _claim_age_seconds(row["claimed_at"])
+    except (TypeError, ValueError):
+        return None, None
+    return time.monotonic() - age > my_start + SWEEP_START_SLACK_SECONDS, age
 
 
 def _claim_precedence_refusal(row: dict[str, Any], *, pid_absent: bool) -> Optional[str]:
     """S1 — why this row is out of scope for THIS sweeper, or None when it is in scope.
 
-    A claim that postdates the sweeper's own start measured on the monotonic clock cannot be
-    judged by it: its owner is at least as young as the sweeper, so a boot-change or
-    fingerprint verdict about it describes a *different* process (2026-11-09: a run claimed at
-    09:13:40 was declared unaccountable at 09:14:18.939 by the process that launched it).
+    A claim that postdates the sweeper's own start cannot be judged by it: its owner is at
+    least as young as the sweeper, so a boot-change or fingerprint verdict about it describes
+    a *different* process (2026-11-09: a run claimed at 09:13:40 was declared unaccountable at
+    09:14:18.939 by the process that launched it).
+
+    The comparison is taken on the boot clock (``claimed_boottime`` vs this process's own
+    ticks-since-boot), so a wall clock step in either direction changes nothing; only a row
+    claimed before that stamp existed is derived from ``claimed_at`` (see
+    ``_claim_precedence``), and such a row is still terminalized only on independent proof of
+    death.
 
     The one exemption is the self-sufficient proof — the owner pid is *absent* — and only after
     the claim has had a full reap interval to terminalize itself. That keeps the #86721
     guarantee (a crashed `hermes cron run` clears without a gateway restart) while no fresh run
     can be swept out from under itself in its first few seconds.
-
-    A wall clock step changes nothing here: elapsed seconds are measured on the monotonic clock,
-    and a backwards step makes the claim look newer than it is, i.e. it fails safe (skipped).
     """
-    my_start = _process_start_monotonic()
-    if my_start is None:
-        return "this process's own start is unreadable (/proc unavailable)"
-    try:
-        age = _claim_age_seconds(row["claimed_at"])
-    except (TypeError, ValueError):
-        return "unreadable claim stamp"
-    claimed_mono = time.monotonic() - age
-    if claimed_mono <= my_start + SWEEP_START_SLACK_SECONDS:
+    postdates, age = _claim_precedence(row)
+    if postdates is None:
+        return ("this process's own start is unreadable (/proc unavailable)"
+                if _process_start_monotonic() is None else "unreadable claim stamp")
+    if not postdates:
         return None  # claimed before this process started: the pre-restart batch
     if not pid_absent:
         return "claimed after this process started (owner not provably gone by pid absence)"
@@ -456,10 +543,12 @@ def create_execution(
         conn.execute(
             """INSERT INTO executions
                (id, job_id, source, process_id, pid, process_started_at,
-                status, claimed_at, scheduled_instant, attempt, retry_of, boot_id, machine_id)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?, ?, ?)""",
+                status, claimed_at, claimed_boottime, scheduled_instant,
+                attempt, retry_of, boot_id, machine_id)
+               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?, ?, ?, ?)""",
             (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
-             _process_start_time(pid), now, canonical_instant(scheduled_instant),
+             _process_start_time(pid), now, _now_boottime(),
+             canonical_instant(scheduled_instant),
              max(1, int(attempt)), retry_of, _read_boot_id(), _machine_scope_id()),
         )
         record = _fetch(conn, execution_id)
@@ -745,7 +834,8 @@ def _sweep_deferral(row: dict[str, Any], *, pid_absent: bool) -> Optional[str]:
 
     Composed of the two ordering gates that must both hold before any verdict:
     S2 (machine scope — another machine's pid namespace proves nothing) and S1 (the claim must
-    not postdate this process's own start). S3's proof is evaluated by the caller.
+    not postdate this process's own start, measured on the boot clock). S3's proof is evaluated
+    by the caller.
     """
     if not _same_machine(row["machine_id"]):
         return "claimed by another machine's pid namespace (undecidable, never dead)"
@@ -781,7 +871,7 @@ def recover_interrupted_executions() -> int:
     with _transaction() as conn:
         rows = conn.execute(
             """SELECT id, job_id, status, process_id, pid, process_started_at,
-                      boot_id, machine_id, attempt,
+                      boot_id, machine_id, attempt, claimed_boottime,
                       handoff_pending, handoff_started_at, claimed_at, progress_at
                FROM executions
                WHERE status IN ('claimed','running')"""
@@ -916,6 +1006,17 @@ def claim_retry_intent(execution_id: str) -> bool:
             (str(execution_id),),
         )
     return cur.rowcount == 1
+
+
+def void_retry_intent(execution_id: str) -> bool:
+    """Cancel an owed retry without planning it: the same fenced ``retry_pending 1 -> 0``.
+
+    Used when retries are switched off entirely (``cron.retry_interrupted: false``): an intent
+    that will never be converted must stop keeping its row prune-exempt, or the ledger grows
+    past ``MAX_TERMINAL_EXECUTIONS`` one interruption at a time. ``retry_at`` stays as the
+    record of when the re-run was owed; only the flag gates planning.
+    """
+    return claim_retry_intent(execution_id)
 
 
 
