@@ -403,3 +403,91 @@ def test_owner_wedged_is_never_retried(monkeypatch):
     assert row["outcome_class"] == "owner_wedged"
     assert row["retry_pending"] == 0
     assert row["retry_at"] is None
+
+
+# --- (e) planning touches the schedule, never the fire claim ---------------------------------
+
+def test_retry_does_not_stamp_fire_claim_twice():
+    """T8: the planner is a schedule amendment, not a dispatch.
+
+    ``claim_job_for_fire`` stamps ``fire_claim`` and advances ``next_run_at``; if the planning
+    pass did either, the retry instant would be consumed twice (the due scan would skip it, or a
+    second claim would be refused). So after planning: no fire claim on the record, and the only
+    fields that moved are the three the amendment owns.
+    """
+    job = _job()
+    parent_id = _new_attempt(job["id"])
+    _kill(parent_id)
+    assert executions_mod.recover_interrupted_executions() == 1
+
+    # A legacy/hand-edited record whose state is not yet ``scheduled``: this is the only case in
+    # which the amendment also rewrites ``state`` (a fresh job is already "scheduled", and a
+    # paused one is refused upstream), so the exact-diff assertion below can see all three.
+    stored_jobs = jobs.load_jobs()
+    stored_jobs[0]["state"] = "active"
+    jobs.save_jobs(stored_jobs)
+
+    before = jobs.get_job(job["id"])
+    assert before["state"] == "active"
+    assert not before.get("fire_claim")
+
+    assert retry_mod.plan_pending_retries() == 1
+
+    after = jobs.get_job(job["id"])
+    assert not after.get("fire_claim"), "planning must not stamp a fire claim"
+    changed = {key for key in set(before) | set(after)
+               if before.get(key) != after.get(key)}
+    assert changed == {"next_run_at", "retry_interrupted", "state"}, changed
+    # The amendment really landed (guards against a vacuous key set).
+    assert after["retry_interrupted"]["row_id"] == parent_id
+    assert after["state"] == "scheduled"
+
+
+# --- (f) the drops: a job that is gone, or that turned terminal under the planner ------------
+
+def test_a_retry_for_a_deleted_job_is_dropped_durably():
+    """T7: the job record vanished between the kill and the planning pass (``cron/retry_
+    interrupted.py``: "the job record is gone"). The intent must be cleared, not left owed."""
+    job = _job()
+    parent_id = _new_attempt(job["id"])
+    _kill(parent_id)
+    assert executions_mod.recover_interrupted_executions() == 1
+    assert executions_mod.get_execution(parent_id)["retry_pending"] == 1
+    assert jobs.remove_job(job["id"]) is True
+
+    assert retry_mod.plan_pending_retries() == 0
+
+    assert executions_mod.get_execution(parent_id)["retry_pending"] == 0
+    assert jobs.get_job(job["id"]) is None
+
+
+def test_a_retry_for_a_job_that_turned_terminal_under_the_planner_is_dropped(monkeypatch):
+    """T7: the other drop — the gate read a runnable record, then the job became terminal before
+    the store write (the re-check inside ``apply``, "job became unrunnable").
+
+    The race is injected at the exact seam: the pre-check passes, then the record is retired
+    before ``_with_job`` re-reads it under the jobs lock.
+    """
+    job = _job()
+    parent_id = _new_attempt(job["id"])
+    _kill(parent_id)
+    assert executions_mod.recover_interrupted_executions() == 1
+    before = jobs.get_job(job["id"])
+
+    real_refusal = retry_mod._retry_refusal
+
+    def racing_refusal(candidate, *, attempt, retry_at):
+        verdict = real_refusal(candidate, attempt=attempt, retry_at=retry_at)
+        if verdict is None:  # the gate saw a runnable job; retire it before the write
+            jobs.update_job(candidate["id"], {"state": "completed", "enabled": False})
+        return verdict
+
+    monkeypatch.setattr(retry_mod, "_retry_refusal", racing_refusal)
+
+    assert retry_mod.plan_pending_retries() == 0
+
+    stored = jobs.get_job(job["id"])
+    assert stored["state"] == "completed"
+    assert stored.get("retry_interrupted") is None      # no amendment landed
+    assert stored["next_run_at"] == before["next_run_at"]
+    assert executions_mod.get_execution(parent_id)["retry_pending"] == 0

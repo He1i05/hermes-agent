@@ -32,6 +32,10 @@ import pytest
 
 import cron.executions as executions_mod
 
+# Captured before the autouse fixture replaces the module attribute, so an F1 test can restore
+# the real resolver and make it run without /proc.
+_REAL_PROCESS_START_MONOTONIC = executions_mod._process_start_monotonic
+
 
 @pytest.fixture(autouse=True)
 def _ledger(monkeypatch, tmp_path):
@@ -302,3 +306,86 @@ def test_owner_is_live_with_no_fingerprint_is_fail_safe():
     which handed every such row to the sweep. Unreadable is not dead."""
     assert executions_mod._owner_is_live(os.getpid(), None) is True
     assert executions_mod._owner_is_live(_dead_pid(), None) is False
+
+
+# --- F1: /proc is optional — an unreadable start must not disable the sweep or S4 ------------
+
+def _hide_proc(monkeypatch):
+    """Model a host without ``/proc`` (or with an unreadable ``/proc/uptime``).
+
+    ``_now_boottime``/``_process_start_boottime`` return None exactly as they do when the file
+    is missing, and the real (non-stubbed) start resolver is restored so the portable fallback
+    is the code under test.
+    """
+    monkeypatch.setattr(executions_mod, "_process_start_monotonic",
+                        _REAL_PROCESS_START_MONOTONIC)
+    monkeypatch.setattr(executions_mod, "_now_boottime", lambda: None)
+    monkeypatch.setattr(executions_mod, "_process_start_boottime", lambda: None)
+    monkeypatch.setattr(executions_mod, "_MY_START_BOOTTIME", None)
+    monkeypatch.setattr(executions_mod, "_MY_START_MONOTONIC", None)
+    # ``raising=False``: the cache flag only exists once F1 landed, and the pre-fix tree must
+    # fail on BEHAVIOUR (start unreadable -> every row deferred), not on a missing attribute.
+    monkeypatch.setattr(executions_mod, "_MY_START_MONOTONIC_RESOLVED", False, raising=False)
+
+
+def test_the_sweeper_start_is_never_unreadable(monkeypatch):
+    """F1: without /proc the start used to be ``None``, which deferred every row. Import time is
+    the portable floor and keeps the ordering test available."""
+    _hide_proc(monkeypatch)
+
+    assert executions_mod._process_start_monotonic() == pytest.approx(
+        executions_mod._IMPORT_MONOTONIC)
+
+
+def test_without_proc_a_proved_dead_owner_is_still_swept(monkeypatch):
+    """F1: a pre-restart claim whose owner is provably gone must be terminalized even when
+    ``/proc`` cannot place the claim instant. Before: start unreadable -> every row deferred ->
+    ``swept=0`` for a 1-hour-old row with a dead pid."""
+    _hide_proc(monkeypatch)
+    execution_id = _seed(
+        executions_mod, "no-proc-dead-owner",
+        pid=_dead_pid(), claimed_at=_backdated(3600), claimed_boottime=None,
+    )
+
+    assert executions_mod.recover_interrupted_executions() == 1
+    record = executions_mod.get_execution(execution_id)
+    assert record["status"] == "unknown"
+    assert record["outcome_class"] == "owner_gone"
+
+
+def test_without_proc_the_wedged_backstop_still_runs(monkeypatch):
+    """F1: S4 needs no cross-clock comparison, so an unreadable start must not disable it. This
+    is the backstop the design calls the thing that stops S1 from hiding a row forever."""
+    monkeypatch.setenv("HERMES_CRON_TIMEOUT", "600")
+    _hide_proc(monkeypatch)
+    live_owner = executions_mod.create_execution("no-proc-wedged", source="builtin")
+    with executions_mod._transaction() as conn:
+        conn.execute(
+            """UPDATE executions
+                  SET status='running', process_id='wedged-worker', pid=?,
+                      process_started_at=?, claimed_at=?, claimed_boottime=NULL
+                WHERE id=?""",
+            (os.getpid(), executions_mod._process_start_time(os.getpid()),
+             (executions_mod._hermes_now() - timedelta(seconds=9000)).isoformat(),
+             live_owner["id"]),
+        )
+
+    assert executions_mod.recover_interrupted_executions() == 1
+    row = executions_mod.get_execution(live_owner["id"])
+    assert row["outcome_class"] == "owner_wedged"
+    assert row["retry_pending"] == 0
+
+
+def test_without_proc_a_postdating_claim_with_a_live_owner_is_still_left_alone(monkeypatch):
+    """The protection S1 exists for survives: a claim made inside this process's own lifetime is
+    never declared wedged. With no boot stamp the reading is the portable monotonic one."""
+    monkeypatch.setenv("HERMES_CRON_TIMEOUT", "600")
+    _hide_proc(monkeypatch)
+    execution_id = _seed(
+        executions_mod, "no-proc-fresh",
+        pid=os.getpid(), claimed_at=executions_mod._hermes_now().isoformat(),
+        claimed_boottime=None,
+    )
+
+    assert executions_mod.recover_interrupted_executions() == 0
+    assert _status(execution_id) == "running"
