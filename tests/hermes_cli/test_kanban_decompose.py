@@ -8,6 +8,8 @@ and the assignee-fallback logic.
 from __future__ import annotations
 
 import json as jsonlib
+import os
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -15,6 +17,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_decompose as decomp
 
 
@@ -250,11 +253,31 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert outcome.ok is False
 
 
-def test_decompose_child_workspace_override_reaches_the_graph(kanban_home):
-    """A child that asks for its own worktree must actually be created with
-    ``workspace_kind='worktree'`` — the mechanism that keeps two repo-touching
-    siblings off one checkout. An unrecognised kind is dropped and the child
-    inherits the root's kind."""
+def _make_repo(path: Path) -> Path:
+    """A throwaway git repo with one commit (no global git config needed)."""
+    path.mkdir(parents=True, exist_ok=True)
+    git = ["git", "-C", str(path), "-c", "user.name=Test User",
+           "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false"]
+
+    def run(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run([*git, *args], check=True, capture_output=True, text=True)
+
+    subprocess.run(["git", "init", "-b", "main", str(path)], check=True, capture_output=True, text=True)
+    (path / "README.md").write_text("base\n", encoding="utf-8")
+    run("add", "README.md")
+    run("commit", "-m", "init")
+    return path
+
+
+def test_decompose_worktree_child_resolves_to_its_own_tree(kanban_home):
+    """A repo-touching child must be created DISPATCHABLE: kind=worktree plus a
+    repo-root ``workspace_path``. With a bare kind and no path, dispatch asked
+    the board for a ``default_workdir`` that is unset here, failed the spawn,
+    and the child burned its retry budget without ever starting.
+
+    Proven with the dispatcher's own resolver, on the row the decomposer wrote —
+    not by asserting the column."""
+    repo = _make_repo(kanban_home / "hermes-agent")
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="patch the repo", triage=True)
 
@@ -288,17 +311,87 @@ def test_decompose_child_workspace_override_reaches_the_graph(kanban_home):
         impl = kb.get_task(conn, outcome.child_ids[0])
         verify = kb.get_task(conn, outcome.child_ids[1])
     assert impl.workspace_kind == "worktree"
-    # Dispatch materialises a per-child tree; a shared path is exactly what we are avoiding.
-    assert impl.workspace_path is None
+    # The anchor (not the deploy checkout itself) — dispatch turns this into
+    # <repo>/.worktrees/<child-id>, one tree per child.
+    assert Path(impl.workspace_path).resolve() == repo.resolve()
+    workspace, branch = kbw._resolve_worktree_workspace(impl, board="default")
+    assert workspace == (repo / ".worktrees" / impl.id).resolve()
+    assert workspace.is_dir()
+    assert (workspace / ".git").is_file()  # a LINKED worktree, not the main checkout
+    assert branch == f"wt/{impl.id}"
+    # The bogus kind is dropped and the child inherits the root's kind.
     assert verify.workspace_kind == "scratch"
-    # And the verify child still waits for the implement child.
+    # ...and the verify child still waits for the implement child.
     assert verify.status == "todo"
 
 
-def test_deploy_tree_state_never_raises_without_a_checkout(kanban_home):
-    """The prompt's deploy-tree line is read, not asserted: an unreadable
-    checkout degrades to a stated unknown instead of failing the fan-out."""
+def test_decompose_worktree_child_falls_back_when_no_anchor_is_reachable(kanban_home):
+    """No repo to anchor on means no worktree child: emitting kind=worktree with
+    an unresolvable path is the spawn-failure this card exists to prevent. The
+    child inherits the root's kind and its body still carries the worktree
+    command, so the work is not lost — only the per-child provisioning."""
+    assert decomp._worktree_anchor(None) is None
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="patch a repo that is not here", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "single child",
+        "tasks": [
+            {"title": "implement", "body": "do it", "assignee": "engineer", "parents": [],
+             "workspace_kind": "worktree", "workspace_path": "/home/someone/tmp-worktrees/x"},
+        ],
+    })
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kbc.connect() as conn:
+        child = kb.get_task(conn, outcome.child_ids[0])
+    assert child.workspace_kind == "scratch"
+    # The LLM's un-resolvable path is dropped, never persisted to fail dispatch.
+    assert child.workspace_path is None
+
+
+def test_deploy_tree_state_reads_live_checkout_and_orders_lanes_by_commit(kanban_home):
+    """The prompt's deploy-tree line is READ, not asserted: it reports the
+    checkout's actual branch, and lists carry lanes newest-commit-first so
+    "the first lane" is the lane a card should branch from."""
+    repo = _make_repo(kanban_home / "hermes-agent")
+    subprocess.run(["git", "-C", str(repo), "branch", "carry/v0.22.7-release"],
+                   check=True, capture_output=True, text=True)
+    (repo / "CARRY.md").write_text("bump\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=Test User",
+                    "-c", "user.email=test@example.com", "add", "CARRY.md"],
+                   check=True, capture_output=True, text=True)
+    # Explicit future dates: two commits inside the same second share a
+    # committerdate, and the sort then falls back to the name order this test
+    # distinguishes itself from.
+    future = {"GIT_AUTHOR_DATE": "2030-01-01T00:00:00 +0000",
+              "GIT_COMMITTER_DATE": "2030-01-01T00:00:00 +0000"}
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=Test User",
+                    "-c", "user.email=test@example.com", "commit", "-m", "carry bump"],
+                   check=True, capture_output=True, text=True, env={**os.environ, **future})
+    subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", "carry/v0.23.0-main"],
+                   check=True, capture_output=True, text=True)
     state = decomp._deploy_tree_state()
     assert state.startswith("Deploy checkout:")
-    # Either the live reading, or the stated-unknown fallback — never a raise.
-    assert "branch=" in state or "state unknown" in state
+    assert "branch=carry/v0.23.0-main" in state
+    lanes = state.split("carry lanes: ", 1)[1].splitlines()[0]
+    # Newest commit first; alphabetical order would put 0.22.7 ahead of 0.23.0.
+    assert lanes.split(", ")[0] == "carry/v0.23.0-main"
+
+
+def test_deploy_tree_state_reports_unknown_without_a_checkout(kanban_home):
+    """An unreadable checkout degrades to a STATED unknown (the fixture home has
+    no ``hermes-agent``), never a raise that would fail the fan-out."""
+    state = decomp._deploy_tree_state()
+    assert state.startswith("Deploy checkout:")
+    assert "state unknown" in state
