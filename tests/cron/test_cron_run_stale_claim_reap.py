@@ -39,11 +39,13 @@ def test_one_shot_cli_path_reaps_dead_owner_row_before_returning_sync(tmp_path, 
     # never judges a claim that postdates the invoking process (#S1 in cron/executions.py), and
     # this regression is about a SUBSEQUENT invocation reaping it.
     stale_claim = (executions._hermes_now() - timedelta(seconds=600)).isoformat()
+    # Both clocks, for the same reason as the comment above: S1 reads claimed_boottime first.
+    stale_boottime = (executions._now_boottime() or 0.0) - 600.0
     with sqlite3.connect(tmp_path / "executions.db") as conn:
         conn.execute(
             "UPDATE executions SET status='running', process_id='other-process', pid=?, "
-            "process_started_at=1, claimed_at=? WHERE id=?",
-            (dead_pid, stale_claim, row["id"]))
+            "process_started_at=1, claimed_at=?, claimed_boottime=? WHERE id=?",
+            (dead_pid, stale_claim, stale_boottime, row["id"]))
 
     token = _SESSION_ASYNC_DELIVERY.set(False)
     try:
