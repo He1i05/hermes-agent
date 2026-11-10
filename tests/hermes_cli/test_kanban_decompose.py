@@ -11,6 +11,7 @@ import json as jsonlib
 import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -323,6 +324,87 @@ def test_decompose_worktree_child_resolves_to_its_own_tree(kanban_home):
     assert verify.workspace_kind == "scratch"
     # ...and the verify child still waits for the implement child.
     assert verify.status == "todo"
+
+
+def test_worktree_anchor_ignores_the_state_repo_and_uses_the_code_checkout(kanban_home):
+    """A dispatched root's workspace lives under the Hermes state home
+    (``~/.hermes/kanban/workspaces/<id>``), and on this install the home is
+    itself a git repo. Anchoring there hands the child a linked worktree of the
+    CONFIG repo — no code — and the body's fallback for a tree that is "not a
+    linked git worktree OF THE HERMES REPO" cannot fire, because it IS one.
+    The anchor must be the code checkout; proven through the dispatcher's own
+    resolver on the row the decomposer actually wrote."""
+    _make_repo(kanban_home)                          # the state home is a git repo
+    code = _make_repo(kanban_home / "hermes-agent")  # the code checkout
+    scratch = kanban_home / "kanban" / "workspaces" / "t_root0001"
+    scratch.mkdir(parents=True)
+
+    assert decomp._main_repo_root(scratch) == kanban_home.resolve()
+    assert decomp._is_hermes_state_root(kanban_home.resolve()) is True
+    assert decomp._worktree_anchor(SimpleNamespace(workspace_path=str(scratch))) == str(code.resolve())
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="patch the repo", triage=True,
+                             workspace_kind="dir", workspace_path=str(scratch))
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "single repo child",
+        "tasks": [
+            {"title": "implement", "body": "do it", "assignee": "engineer", "parents": [],
+             "workspace_kind": "worktree"},
+        ],
+    })
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kbc.connect() as conn:
+        impl = kb.get_task(conn, outcome.child_ids[0])
+    assert impl.workspace_kind == "worktree"
+    assert Path(impl.workspace_path).resolve() == code.resolve()
+    workspace, branch = kbw._resolve_worktree_workspace(impl, board="default")
+    assert workspace == (code / ".worktrees" / impl.id).resolve()
+    assert workspace.is_dir()
+    assert (workspace / ".git").is_file()
+    assert branch == f"wt/{impl.id}"
+
+
+def test_worktree_anchor_normalises_a_linked_worktree_root(kanban_home):
+    """``--show-toplevel`` inside a linked worktree returns the WORKTREE, so a
+    root that is itself a worktree task would nest its children under
+    ``<parent-worktree>/.worktrees/``. The anchor must be the main repo root."""
+    code = _make_repo(kanban_home / "hermes-agent")
+    parent_tree = kanban_home.parent / "tmp-worktrees" / "t_parent"
+    subprocess.run(
+        ["git", "-C", str(code), "worktree", "add", "-b", "wt/t_parent", str(parent_tree)],
+        check=True, capture_output=True, text=True,
+    )
+
+    assert decomp._main_repo_root(parent_tree) == code.resolve()
+    anchor = decomp._worktree_anchor(SimpleNamespace(workspace_path=str(parent_tree)))
+    assert anchor == str(code.resolve())
+
+
+def test_worktree_anchor_finds_the_checkout_from_a_profile_home(kanban_home, tmp_path, monkeypatch):
+    """A profile session's ``HERMES_HOME`` is ``<home>/profiles/<name>``, where
+    no checkout lives. The anchor must still resolve the default home's code
+    checkout instead of silently dropping the worktree kind."""
+    code = _make_repo(kanban_home / "hermes-agent")
+    profile_home = kanban_home / "profiles" / "builder"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "elsewhere")
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    assert decomp._hermes_code_checkout() == code.resolve()
+    assert decomp._worktree_anchor(None) == str(code.resolve())
 
 
 def test_decompose_worktree_child_falls_back_when_no_anchor_is_reachable(kanban_home):
