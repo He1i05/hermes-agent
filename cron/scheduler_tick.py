@@ -14,6 +14,11 @@ logger = logging.getLogger("cron.scheduler")
 _YIELD_LOG_INTERVAL_SECONDS = 3600.0
 _last_yield_log: dict[str, object] = {}
 
+# Interrupted-run retry planning throttle (per profile home). Independent of the 300 s dead-owner
+# reap: the sweep creates an intent, this converts it on the next tick at the earliest.
+_RETRY_PLAN_INTERVAL_SECONDS = 30.0
+_last_retry_plan_at: dict[str, float] = {}
+
 
 def _log_tick_yield_once(reason: str) -> None:
     """Log the yield at error level once per episode (skew signature)."""
@@ -72,9 +77,36 @@ def _advance_or_drop_recurring(_sched, due_jobs: list) -> list:
         return [j for j in due_jobs if not is_recurring(j)]
 
 
+def _plan_pending_retries(_sched) -> None:
+    """Convert owed interrupted-run retry intents into schedule amendments (throttled 30 s).
+
+    Runs AFTER the dead-owner reap (which creates the intents) and BEFORE the due scan (which
+    fires them on the same tick when already due). Throttled per profile home so an idle 60 s
+    tick pays one indexed ledger query at most every 30 s, and no config/job-store read at all
+    when there is no candidate (#33612).
+    """
+    from hermes_constants import hermes_home_key
+
+    key = hermes_home_key(_sched._get_hermes_home())
+    now = time.monotonic()
+    last = _last_retry_plan_at.get(key)
+    if last is not None and now - last < _RETRY_PLAN_INTERVAL_SECONDS:
+        return
+    _last_retry_plan_at[key] = now
+    try:
+        from cron.retry_interrupted import plan_pending_retries
+
+        planned = plan_pending_retries()
+        if planned:
+            _sched.logger.info(
+                "Scheduled %d interrupted-run retr%s", planned, "y" if planned == 1 else "ies")
+    except Exception as exc:  # a planner failure must never break the tick
+        _sched.logger.debug("Interrupted-run retry planning failed: %s", exc)
+
+
 def _pre_dispatch_housekeeping(_sched, headless: bool) -> None:
-    """Admission reconcile, legacy upgrade drain and dead-owner reap, run under the tick lock
-    before due jobs are read."""
+    """Admission reconcile, legacy upgrade drain, dead-owner reap and interrupted-run retry
+    planning, run under the tick lock before due jobs are read."""
     from cron.scheduler_authority import reconcile_pending
     if headless:
         reconcile_pending(allow_connect=False)
@@ -87,6 +119,9 @@ def _pre_dispatch_housekeeping(_sched, headless: bool) -> None:
     except Exception as _legacy_exc:
         _sched.logger.warning("Legacy Bot Chat pending drain failed: %s", _legacy_exc, exc_info=True)
     _sched._maybe_reap_dead_owners()
+    # Ordering matters: the sweep creates retry intents, the planner converts them, and the due
+    # scan below fires them on this same tick when they are already due.
+    _plan_pending_retries(_sched)
 
 
 def _tick_admitted(
