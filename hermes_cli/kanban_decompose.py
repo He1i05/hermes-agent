@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
@@ -95,19 +96,27 @@ in the Hermes repo:
         git -C /home/juozas/.hermes/hermes-agent worktree add \
             /home/juozas/tmp-worktrees/<card-id> -b <branch> carry/v0.23.0-main
 
-    Use the newest carry lane listed in the prompt's deploy-checkout block
-    — currently `carry/v0.23.0-main`. Never a frozen SHA, and never `main`.
+    Use the first carry lane in the prompt's deploy-checkout block (the lanes
+    are listed newest-commit-first) — currently `carry/v0.23.0-main`. Never a
+    frozen SHA, and never `main`.
   - ...and MUST require the child to preflight before it starts: `git -C
     <deploy checkout> rev-parse --abbrev-ref HEAD` must be the expected
     carry lane and `git status --porcelain` must be empty; if either fails
     the child STOPS and reports instead of proceeding against a foreign or
     dirty tree. Same check at the end: never "fix" the tree, never `git
     stash` / `git checkout -- .` another worker's files.
-  - Set "workspace_kind": "worktree" on repo-touching children so dispatch
-    materialises a tree per child. An implement child and the child that
-    verifies it get separate worktrees, or the verifier waits for the
-    implementer; a verify pass must never read a tree an implement sibling
-    is mutating.
+  - Set "workspace_kind": "worktree" on repo-touching children. Dispatch then
+    provisions that child's own tree at <deploy checkout>/.worktrees/<card-id>
+    and hands it to the worker as its workspace, so an implement child and the
+    child that verifies it never share a checkout. Either give the verifier its
+    own worktree or make it wait for the implementer: a verify pass must never
+    read a tree an implement sibling is mutating. Send no "workspace_path" for
+    such a child — the system resolves it, and a path the worker cannot resolve
+    fails dispatch.
+  - Their bodies MUST also carry a fallback for a delivered workspace that is
+    not a linked git worktree (scratch child, legacy card): run the `git
+    worktree add` command above into /home/juozas/tmp-worktrees/<card-id> and
+    do all work there. Either way the deploy checkout is never the workspace.
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:
@@ -145,13 +154,52 @@ def _deploy_tree_state() -> str:
         return f"Deploy checkout: {root} — state unknown (git could not read it)"
     dirty = _git_stdout(["status", "--porcelain"], cwd=root)
     dirty_txt = "unknown" if dirty is None else f"{len(dirty.splitlines())} file(s)"
-    lanes = _git_stdout(["branch", "--list", "carry/*", "--format=%(refname:short)"], cwd=root) or ""
+    lanes = _git_stdout(
+        ["branch", "--list", "carry/*", "--sort=-committerdate", "--format=%(refname:short)"],
+        cwd=root,
+    ) or ""
     lane_txt = ", ".join(ln.strip() for ln in lanes.splitlines() if ln.strip()) or "none"
     return (
         f"Deploy checkout: {root}\n"
         f"  branch={branch or 'DETACHED'}  dirty={dirty_txt}  carry lanes: {lane_txt}\n"
         f"  (the tree systemd runs — repo work goes in a worktree, never here)"
     )
+
+
+def _worktree_anchor(root_task: Optional[kb.Task] = None) -> Optional[str]:
+    """Absolute repo root that per-child worktrees hang off, or ``None``.
+
+    Dispatch resolves a ``worktree`` task that carries a repo-root
+    ``workspace_path`` to ``<repo>/.worktrees/<child-id>``. With *no* path it
+    falls back to the board's ``default_workdir`` and raises when that is
+    unset — the dispatcher records that as ``spawn_failed``, so the child
+    never runs. Naming the anchor explicitly makes a repo-touching child
+    dispatchable with no board configuration at all.
+
+    Prefer the repo the root task already lives in, else the deploy checkout.
+    Best effort: an unknown anatomy means "no anchor" and the child keeps the
+    root's kind — its body still names the canonical ``git worktree add``
+    command, so the work is not lost, only the per-child provisioning.
+    """
+    from hermes_cli.kanban_db_workspace import _git_toplevel
+
+    candidates: list[Path] = []
+    raw = getattr(root_task, "workspace_path", None)
+    if isinstance(raw, str) and raw.strip():
+        candidates.append(Path(raw).expanduser())
+    try:
+        from hermes_constants import get_hermes_home
+        candidates.append(get_hermes_home() / "hermes-agent")
+    except Exception:
+        pass
+    for candidate in candidates:
+        try:
+            top = _git_toplevel(candidate)
+        except Exception:
+            top = None
+        if top is not None:
+            return str(top)
+    return None
 
 
 _USER_TEMPLATE = """Task id: {task_id}
@@ -299,7 +347,9 @@ def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -
     return DecomposeOutcome(task.id, True, "single task (no fanout)", fanout=False, new_title=title_val)
 
 
-def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[list[dict], str]:
+def _clean_children(
+    task_id: str, raw_tasks: list, routing: _Routing, *, worktree_anchor: Optional[str] = None,
+) -> tuple[list[dict], str]:
     """Validate/normalise the LLM's ``tasks`` list; ``(children, "")`` or ``([], reason)``.
     Unknown assignees route to the default; never assignee=None."""
     children: list[dict] = []
@@ -324,8 +374,7 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
         if not isinstance(parents, list):
             parents = []
         # Workspace overrides: the LLM may ask for a per-child worktree so
-        # siblings never share a checkout (``_insert_decomposed_child``
-        # materialises one per child). Anything unrecognised is dropped and
+        # siblings never share a checkout. Anything unrecognised is dropped and
         # the child inherits the root's kind.
         ws_kind = entry.get("workspace_kind")
         if ws_kind not in kb.VALID_WORKSPACE_KINDS:
@@ -334,6 +383,20 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
         ws_path = ws_path.strip() if isinstance(ws_path, str) and ws_path.strip() else None
         if ws_kind == "dir" and not ws_path:  # a dir child with no path is unusable
             ws_kind = None
+        if ws_kind == "worktree":
+            # Never trust an LLM path here: the child id does not exist yet, and
+            # dispatch only materialises a worktree it can resolve. Anchor on the
+            # repo root so dispatch provisions <repo>/.worktrees/<child-id>.
+            if worktree_anchor:
+                ws_path = worktree_anchor
+            else:
+                logger.warning(
+                    "decompose: task %s child %d asked for a worktree but no repo "
+                    "anchor is reachable — keeping the root's kind (its body still "
+                    "names the git worktree add command)", task_id, idx,
+                )
+                ws_kind = None
+                ws_path = None
         child = {
             "title": title.strip()[:200],
             "body": body.strip() if isinstance(body, str) else "",
@@ -349,11 +412,16 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
     return children, ""
 
 
-def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) -> DecomposeOutcome:
+def _apply_fanout(
+    task_id: str, parsed: dict, routing: _Routing, author: str,
+    *, root_task: Optional[kb.Task] = None,
+) -> DecomposeOutcome:
     raw_tasks = parsed.get("tasks") or []
     if not isinstance(raw_tasks, list) or not raw_tasks:
         return DecomposeOutcome(task_id, False, "decomposer returned fanout=true with empty tasks list")
-    children, reason = _clean_children(task_id, raw_tasks, routing)
+    children, reason = _clean_children(
+        task_id, raw_tasks, routing, worktree_anchor=_worktree_anchor(root_task),
+    )
     if reason:
         return DecomposeOutcome(task_id, False, reason)
     try:
@@ -412,7 +480,7 @@ def decompose_task(
     audit_author = author or _profile_author()
     if not parsed.get("fanout"):
         return _apply_single(task, parsed, routing, audit_author)
-    return _apply_fanout(task_id, parsed, routing, audit_author)
+    return _apply_fanout(task_id, parsed, routing, audit_author, root_task=task)
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
