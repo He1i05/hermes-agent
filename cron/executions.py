@@ -224,30 +224,46 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
     return start_time_fingerprints_match(started_at, current)
 
 
+_BOOT_ID_CACHE: Optional[str] = None
+_MACHINE_SCOPE_CACHE: Optional[str] = None
+
+
 def _read_boot_id() -> str:
-    """This boot's id (``""`` when unreadable): the only portable "same boot" witness."""
-    try:
-        return Path("/proc/sys/kernel/random/boot_id").read_text(
-            encoding="ascii", errors="replace").strip()
-    except OSError:
-        return ""
+    """This boot's id (``""`` when unreadable): the only portable "same boot" witness.
+
+    Cached: a boot id cannot change within one process lifetime (a reboot ends the process), and
+    the claim path reads it for every attempt.
+    """
+    global _BOOT_ID_CACHE
+    if _BOOT_ID_CACHE is None:
+        try:
+            _BOOT_ID_CACHE = Path("/proc/sys/kernel/random/boot_id").read_text(
+                encoding="ascii", errors="replace").strip()
+        except OSError:
+            _BOOT_ID_CACHE = ""
+    return _BOOT_ID_CACHE
 
 
 def _machine_scope_id() -> str:
     """A machine identity that is stable ACROSS processes on the same host.
 
     ``cron.jobs._machine_id()`` is ``hostname:pid`` (per-process attribution), so it can never
-    scope a row to a machine. ``HERMES_MACHINE_ID`` when set, else the hostname.
+    scope a row to a machine. ``HERMES_MACHINE_ID`` when set, else the hostname. Cached: the
+    claim path reads it for every attempt.
     """
-    explicit = os.getenv("HERMES_MACHINE_ID", "").strip()
-    if explicit:
-        return explicit
-    try:
-        import socket
+    global _MACHINE_SCOPE_CACHE
+    if _MACHINE_SCOPE_CACHE is None:
+        explicit = os.getenv("HERMES_MACHINE_ID", "").strip()
+        if explicit:
+            _MACHINE_SCOPE_CACHE = explicit
+        else:
+            try:
+                import socket
 
-        return socket.gethostname()
-    except Exception:
-        return ""
+                _MACHINE_SCOPE_CACHE = socket.gethostname()
+            except Exception:
+                _MACHINE_SCOPE_CACHE = ""
+    return _MACHINE_SCOPE_CACHE
 
 
 _MY_START_MONOTONIC: Optional[float] = None
