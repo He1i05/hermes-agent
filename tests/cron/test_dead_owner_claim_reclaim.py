@@ -22,6 +22,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import time
+from datetime import timedelta
 from unittest.mock import patch
 
 import pytest
@@ -61,16 +62,38 @@ def _orphan_claimed_row(executions, job_id: str) -> str:
     """Persist a claimed execution owned by a process that no longer exists.
 
     Mirrors what a one-shot ``hermes cron run`` leaves behind: a row stuck in
-    ``claimed`` whose owner pid is dead.
+    ``claimed`` whose owner pid is dead. The claim is backdated past one dead-owner reap
+    interval because the sweep never judges a claim younger than one reap interval that
+    postdates its own start (S1 in ``cron/executions.py``); the guarantee under test is that
+    the row still auto-clears without a gateway restart.
     """
     record = executions.create_execution(job_id, source="direct")
     with executions._transaction() as conn:
         conn.execute(
             "UPDATE executions SET process_id='dead-cli-process', pid=?, "
-            "process_started_at=NULL WHERE id=?",
-            (_dead_pid(), record["id"]),
+            "process_started_at=NULL, claimed_at=?, claimed_boottime=? WHERE id=?",
+            (_dead_pid(), _backdated_claim(), _backdated_boottime(), record["id"]),
         )
     return record["id"]
+
+
+def _backdated_claim(seconds: float = 600.0) -> str:
+    """A claim stamp old enough for the sweep to judge it (see ``_orphan_claimed_row``)."""
+    from cron.executions import _hermes_now
+
+    return (_hermes_now() - timedelta(seconds=seconds)).isoformat()
+
+
+def _backdated_boottime(seconds: float = 600.0) -> float:
+    """The boot-clock stamp that belongs with ``_backdated_claim``.
+
+    S1 reads ``claimed_boottime`` first (a wall-clock stamp cannot order a claim against the
+    sweep's own start), so a fixture that only backdates ``claimed_at`` would model a claim
+    that postdates the running process — the opposite of a leftover from an earlier one.
+    """
+    from cron.executions import _now_boottime
+
+    return (_now_boottime() or 0.0) - seconds
 
 
 def _run_tick():
@@ -99,8 +122,8 @@ class TestTickReapsDeadOwnerClaims:
         with executions._transaction() as conn:
             conn.execute(
                 "UPDATE executions SET process_id='dead-cli-process', pid=?, "
-                "process_started_at=NULL WHERE id=?",
-                (_dead_pid(), record["id"]),
+                "process_started_at=NULL, claimed_at=?, claimed_boottime=? WHERE id=?",
+                (_dead_pid(), _backdated_claim(), _backdated_boottime(), record["id"]),
             )
 
         _run_tick()

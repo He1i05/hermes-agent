@@ -1,8 +1,17 @@
 """Profile-local durable audit ledger for cron execution attempts.
 
 The ledger records what is known about each attempt; it is not a retry queue. Interrupted attempts
-become ``unknown`` only after their owner process is proved gone — a start-time reading that fails
-to match the claim-time fingerprint is not proof of death. Terminal states are immutable.
+become ``unknown`` only after their owner is proved gone — a start-time reading that fails to
+match the claim-time fingerprint is not proof of death. A terminal attempt's verdict
+(``status``, ``error``, ``outcome_class``) is write-once.
+
+One bounded amendment to that rule (``cron/retry_interrupted.py``): an attempt killed through no
+fault of the job (owner proved gone, or an interruption written by the failure paths) records a
+retry *intent* (``retry_pending``/``retry_at``) in the SAME fenced UPDATE that terminalizes it,
+and a later planning pass converts the intent into a schedule amendment. The retry itself is a
+new row (``retry_of``/``attempt``). After that write the only field any caller may still change is
+the intent flag itself — a one-way ``retry_pending 1 -> 0`` when the intent is planned, voided, or
+superseded by a verified receipt. The verdict above is never rewritten.
 """
 
 from __future__ import annotations
@@ -34,6 +43,16 @@ MAX_TERMINAL_EXECUTIONS = 1000
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
 # Floor for the live-owner stale-claim bound (#115692); see _live_owner_stale_after_seconds.
 LIVE_OWNER_STALE_CLAIM_FLOOR_SECONDS = 7200.0
+# Dead-owner sweep scoping (S1). A claim that postdates this process's own start is out of scope
+# for an inferential verdict; the self-sufficient proof (owner pid absent) still applies, but only
+# once the claim has had one full reap interval to terminalize itself. Both numbers exist to stop a
+# *fresh* run being declared unaccountable by the process that launched it (2026-11-09: claimed
+# 09:13:40, started 09:13:46, swept 09:14:18.939). The comparison runs on the boot clock
+# (``claimed_boottime`` vs this process's ticks-since-boot), never on the wall clock, which ran
+# 92 min behind on that boot until NTP corrected it.
+SWEEP_START_SLACK_SECONDS = 5.0
+SWEEP_POSTDATING_MIN_AGE_SECONDS = 300.0
+
 # ``cancelled``: an operator stopped the run (``hermes cron cancel``, removing the job mid-run).
 # ``missed``: never started — one row books every occurrence the scheduler skipped past.
 _TERMINAL_STATES = ("completed", "failed", "unknown", "cancelled", "missed")
@@ -99,6 +118,36 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(conn, "executions", "delivery_outcome", "delivery_outcome TEXT")
     add_column_if_missing(conn, "executions", "scheduled_instant", "scheduled_instant TEXT")
     add_column_if_missing(conn, "executions", "progress_at", "progress_at TEXT")
+    # --- interrupted-run retry evidence (cron/retry_interrupted.py) --------------------------
+    # ``attempt``: 1 = the original fire, N+1 = the Nth retry of that occurrence.
+    # ``retry_of``: the parent attempt's id (NULL for an original fire).
+    # ``outcome_class``: machine-readable verdict written once, at the terminal write, by the
+    #   writer that knows it (``owner_gone`` / ``owner_wedged`` / ``interrupted``) — never
+    #   re-derived from the prose in ``error``.
+    # ``retry_pending``/``retry_at``: the retry intent, stamped in the same fenced UPDATE that
+    #   terminalizes the row (there is no post-terminal rewrite rule).
+    # ``boot_id``/``machine_id``: what the dead-owner sweep needs to tell "another boot" and
+    #   "another machine" from "a dead owner" without trusting a boot-scoped fingerprint.
+    add_column_if_missing(conn, "executions", "attempt",
+                          "attempt INTEGER NOT NULL DEFAULT 1")
+    add_column_if_missing(conn, "executions", "retry_of", "retry_of TEXT")
+    add_column_if_missing(conn, "executions", "outcome_class", "outcome_class TEXT")
+    add_column_if_missing(conn, "executions", "retry_pending",
+                          "retry_pending INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(conn, "executions", "retry_at", "retry_at TEXT")
+    add_column_if_missing(conn, "executions", "boot_id", "boot_id TEXT")
+    add_column_if_missing(conn, "executions", "machine_id", "machine_id TEXT")
+    # ``claimed_boottime``: the claim instant in seconds since boot (``/proc/uptime``), i.e. on
+    #   the SAME clock as ``process_started_at`` (``/proc/<pid>/stat`` ticks / HZ). S1's
+    #   "does this claim postdate the sweeper?" comparison is measured on this stamp, so a wall
+    #   clock step — in either direction — cannot reorder the two. NULL on rows claimed before
+    #   the column existed: those fall back to the wall-clock derivation.
+    add_column_if_missing(conn, "executions", "claimed_boottime",
+                          "claimed_boottime REAL")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_executions_retry_pending "
+        "ON executions(retry_at) WHERE retry_pending=1"
+    )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
@@ -174,7 +223,10 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
     except Exception:
         return True  # fail safe: inability to prove death must not rewrite state
     if started_at is None:
-        return pid == os.getpid()
+        # The claim-time fingerprint could not be read (#115692): that is *not* proof of death,
+        # so a live foreign pid must read as live. The old ``pid == os.getpid()`` answer
+        # contradicted this module's own header and handed every foreign row to the sweep.
+        return True
     current = _process_start_time(pid)
     if current is None:
         return True  # cannot compare -> cannot prove death; a misread must not rewrite state
@@ -182,6 +234,229 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
     # bounded by the stale-claim sweep below.
     from gateway.status import start_time_fingerprints_match
     return start_time_fingerprints_match(started_at, current)
+
+
+_BOOT_ID_CACHE: Optional[str] = None
+_MACHINE_SCOPE_CACHE: Optional[str] = None
+
+
+def _read_boot_id() -> str:
+    """This boot's id (``""`` when unreadable): the only portable "same boot" witness.
+
+    Cached: a boot id cannot change within one process lifetime (a reboot ends the process), and
+    the claim path reads it for every attempt.
+    """
+    global _BOOT_ID_CACHE
+    if _BOOT_ID_CACHE is None:
+        try:
+            _BOOT_ID_CACHE = Path("/proc/sys/kernel/random/boot_id").read_text(
+                encoding="ascii", errors="replace").strip()
+        except OSError:
+            _BOOT_ID_CACHE = ""
+    return _BOOT_ID_CACHE
+
+
+def _machine_scope_id() -> str:
+    """A machine identity that is stable ACROSS processes on the same host.
+
+    ``cron.jobs._machine_id()`` is ``hostname:pid`` (per-process attribution), so it can never
+    scope a row to a machine. ``HERMES_MACHINE_ID`` when set, else the hostname. Cached: the
+    claim path reads it for every attempt.
+    """
+    global _MACHINE_SCOPE_CACHE
+    if _MACHINE_SCOPE_CACHE is None:
+        explicit = os.getenv("HERMES_MACHINE_ID", "").strip()
+        if explicit:
+            _MACHINE_SCOPE_CACHE = explicit
+        else:
+            try:
+                import socket
+
+                _MACHINE_SCOPE_CACHE = socket.gethostname()
+            except Exception:
+                _MACHINE_SCOPE_CACHE = ""
+    return _MACHINE_SCOPE_CACHE
+
+
+def _now_boottime() -> Optional[float]:
+    """Seconds since boot (``/proc/uptime``) — the clock ``process_started_at`` ticks use."""
+    try:
+        return float(Path("/proc/uptime").read_text(encoding="ascii").split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _boottime_to_monotonic(stamp: Optional[float]) -> Optional[float]:
+    """A seconds-since-boot stamp on the ``time.monotonic()`` scale (None when unreadable)."""
+    if stamp is None:
+        return None
+    now_boot = _now_boottime()
+    if now_boot is None:
+        return None
+    return time.monotonic() - max(0.0, now_boot - float(stamp))
+
+
+_MY_START_BOOTTIME: Optional[float] = None
+
+
+def _process_start_boottime() -> Optional[float]:
+    """This process's own start as seconds since boot (``process_started_at`` / HZ).
+
+    The same clock the ledger's ``claimed_boottime`` stamp is written on, so claim and sweeper
+    can be compared without either wall clock being involved (see ``_claim_precedence``).
+    """
+    global _MY_START_BOOTTIME
+    if _MY_START_BOOTTIME is not None:
+        return _MY_START_BOOTTIME
+    ticks = _process_start_time(os.getpid())
+    if ticks is None:
+        return None
+    try:
+        hz = float(os.sysconf("SC_CLK_TCK"))
+    except (AttributeError, ValueError, OSError):
+        hz = 100.0
+    _MY_START_BOOTTIME = float(ticks) / hz
+    return _MY_START_BOOTTIME
+
+
+_MY_START_MONOTONIC: Optional[float] = None
+
+
+def _process_start_monotonic() -> Optional[float]:
+    """The monotonic instant this process started (None when /proc cannot settle it).
+
+    Derived from the boot clock (``process_started_at`` is ticks-since-boot and cannot be
+    compared with ``claimed_at``), and used only for rows that carry no ``claimed_boottime``
+    stamp — i.e. claims written before that column existed.
+    """
+    global _MY_START_MONOTONIC
+    if _MY_START_MONOTONIC is not None:
+        return _MY_START_MONOTONIC
+    start_mono = _boottime_to_monotonic(_process_start_boottime())
+    if start_mono is None:
+        return None
+    _MY_START_MONOTONIC = start_mono
+    return _MY_START_MONOTONIC
+
+
+def _row_field(row: Any, name: str) -> Any:
+    """One column from a ``sqlite3.Row`` or a dict (None when the column is absent)."""
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None
+
+
+def _claim_precedence(row: dict[str, Any]) -> tuple[Optional[bool], Optional[float]]:
+    """(does the claim postdate this process's own start?, claim age) — measured on ONE clock.
+
+    Preferred reading: seconds since boot on both sides — the claim's ``claimed_boottime``
+    stamp and this process's own start (``/proc/<pid>/stat`` ticks / HZ). A wall-clock step,
+    including the -92 min this host ran after the 2026-11-09 boot until NTP corrected it, then
+    cannot move one side relative to the other in EITHER direction; elapsed time is read off
+    ``/proc/uptime``, never off ``claimed_at``.
+
+    Rows claimed before that stamp existed (NULL) or whose stamp belongs to another boot fall
+    back to deriving the claim instant from ``claimed_at`` plus the monotonic start. That
+    fallback is the documented residual: a stamp written while the clock ran behind reads the
+    claim older than it is, so it can look pre-restart. It still cannot terminalize anything on
+    its own — S3 must independently prove the owner dead.
+
+    Returns ``(None, None)`` when neither reading can settle the claim instant.
+    """
+    my_start = _process_start_monotonic()
+    if my_start is None:
+        return None, None
+    stamp = _row_field(row, "claimed_boottime")
+    my_start_boot = _process_start_boottime()
+    if (stamp is not None and my_start_boot is not None
+            and not _boot_changed(_row_field(row, "boot_id"))):
+        now_boot = _now_boottime()
+        if now_boot is not None:
+            age = now_boot - float(stamp)
+            if age >= 0:  # a stamp past "now" on the boot clock is unreadable, not evidence
+                return float(stamp) > my_start_boot + SWEEP_START_SLACK_SECONDS, age
+    try:
+        age = _claim_age_seconds(row["claimed_at"])
+    except (TypeError, ValueError):
+        return None, None
+    return time.monotonic() - age > my_start + SWEEP_START_SLACK_SECONDS, age
+
+
+def _claim_precedence_refusal(row: dict[str, Any], *, pid_absent: bool) -> Optional[str]:
+    """S1 — why this row is out of scope for THIS sweeper, or None when it is in scope.
+
+    A claim that postdates the sweeper's own start cannot be judged by it: its owner is at
+    least as young as the sweeper, so a boot-change or fingerprint verdict about it describes
+    a *different* process (2026-11-09: a run claimed at 09:13:40 was declared unaccountable at
+    09:14:18.939 by the process that launched it).
+
+    The comparison is taken on the boot clock (``claimed_boottime`` vs this process's own
+    ticks-since-boot), so a wall clock step in either direction changes nothing; only a row
+    claimed before that stamp existed is derived from ``claimed_at`` (see
+    ``_claim_precedence``), and such a row is still terminalized only on independent proof of
+    death.
+
+    The one exemption is the self-sufficient proof — the owner pid is *absent* — and only after
+    the claim has had a full reap interval to terminalize itself. That keeps the #86721
+    guarantee (a crashed `hermes cron run` clears without a gateway restart) while no fresh run
+    can be swept out from under itself in its first few seconds.
+    """
+    postdates, age = _claim_precedence(row)
+    if postdates is None:
+        return ("this process's own start is unreadable (/proc unavailable)"
+                if _process_start_monotonic() is None else "unreadable claim stamp")
+    if not postdates:
+        return None  # claimed before this process started: the pre-restart batch
+    if not pid_absent:
+        return "claimed after this process started (owner not provably gone by pid absence)"
+    if age < SWEEP_POSTDATING_MIN_AGE_SECONDS:
+        return (
+            "claimed after this process started and younger than one reap interval "
+            f"({max(0.0, age):.0f}s < {SWEEP_POSTDATING_MIN_AGE_SECONDS:.0f}s)"
+        )
+    return None
+
+
+def _same_machine(recorded: Optional[str]) -> bool:
+    """S2 — machine scope. A row from another machine's pid namespace is undecidable, never dead.
+
+    An empty ``machine_id`` is a pre-upgrade row: it falls through to today's behaviour.
+    """
+    stamp = (recorded or "").strip()
+    if not stamp:
+        return True
+    return stamp == _machine_scope_id()
+
+
+def _boot_changed(recorded: Optional[str]) -> bool:
+    """S3(c) — a boot change, usable only when BOTH sides recorded a non-empty id."""
+    stamp = (recorded or "").strip()
+    current = _read_boot_id()
+    return bool(stamp and current and stamp != current)
+
+
+def _owner_death_proof(
+    row: dict[str, Any], *, pid_absent: bool, owner_live: bool,
+) -> bool:
+    """S3 — positive proof of death, or False when the row must be left alone (S4 still bounds it).
+
+    Exactly three disjuncts: (a) pid absent, self-sufficient; (b) a fingerprint that was
+    RECORDED at claim time and now mismatches beyond the drift tolerance — ``owner_live`` is
+    the already-evaluated comparison, and it is False only when that comparison actually ran and
+    failed (an unreadable current reading reads as live there); a recorded
+    ``process_started_at IS NULL`` is not this case; (c) a boot change, which also catches the
+    coincidence S3(b) cannot (a fingerprint that happens to land within tolerance across a boot
+    would otherwise read as "alive" and wedge the row).
+    """
+    if pid_absent:
+        return True  # (a)
+    if _boot_changed(row["boot_id"]):
+        return True  # (c)
+    if row["process_started_at"] is None:
+        return False  # fingerprint unreadable at claim time: not proof (see the header)
+    return not owner_live  # (b)
+
 
 
 def _live_owner_stale_after_seconds() -> Optional[float]:
@@ -234,10 +509,13 @@ def touch_execution_progress(execution_id: str) -> bool:
 
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
+    # ``retry_pending = 0``: an owed retry intent must never be pruned away (the retry planner
+    # would otherwise lose the evidence that a killed run still owes a re-run).
     conn.execute(
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
              WHERE status IN ('completed','failed','unknown','cancelled','missed')
+               AND retry_pending = 0
              ORDER BY julianday(finished_at) DESC, finished_at DESC,
                       julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
@@ -247,8 +525,15 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
 
 def create_execution(
     job_id: str, *, source: str, scheduled_instant: Optional[str] = None,
+    attempt: int = 1, retry_of: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Persist a claimed attempt before executor/provider dispatch."""
+    """Persist a claimed attempt before executor/provider dispatch.
+
+    ``attempt``/``retry_of``: the retry path's identity for a re-run of an occurrence that was
+    killed mid-flight (see ``cron/retry_interrupted.py``); an ordinary fire is attempt 1 with no
+    parent. The claim also records which machine and boot claimed it, so a later sweeper can
+    tell "another machine/boot" from "a dead owner" without trusting a boot-scoped fingerprint.
+    """
     from cron.occurrences import scheduled_instant as canonical_instant
 
     now = _hermes_now().isoformat()
@@ -258,14 +543,18 @@ def create_execution(
         conn.execute(
             """INSERT INTO executions
                (id, job_id, source, process_id, pid, process_started_at,
-                status, claimed_at, scheduled_instant)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?)""",
+                status, claimed_at, claimed_boottime, scheduled_instant,
+                attempt, retry_of, boot_id, machine_id)
+               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?, ?, ?, ?)""",
             (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
-             _process_start_time(pid), now, canonical_instant(scheduled_instant)),
+             _process_start_time(pid), now, _now_boottime(),
+             canonical_instant(scheduled_instant),
+             max(1, int(attempt)), retry_of, _read_boot_id(), _machine_scope_id()),
         )
         record = _fetch(conn, execution_id)
     _emit_execution_state(record)
     return record  # type: ignore[return-value]
+
 
 
 def set_execution_occurrence(execution_id: str, instant: Optional[str]) -> None:
@@ -280,6 +569,26 @@ def set_execution_occurrence(execution_id: str, instant: Optional[str]) -> None:
         )
         if cur.rowcount != 1:
             raise RuntimeError("Cron occurrence could not be bound before dispatch")
+
+
+def set_execution_retry_identity(
+    execution_id: str, attempt: int, retry_of: Optional[str],
+) -> None:
+    """Stamp ``attempt``/``retry_of`` on a claim created BEFORE its fire claim was taken.
+
+    An external provider's ``claim_fire`` persists the attempt and only then learns which
+    instant it won, so the retry identity of that instant has to be stamped afterwards — fenced
+    to this process's own still-claimed row, exactly like ``set_execution_occurrence``.
+    """
+    if int(attempt) <= 1 and not retry_of:
+        return
+    with _transaction() as conn:
+        conn.execute(
+            """UPDATE executions SET attempt=?, retry_of=?
+               WHERE id=? AND status='claimed' AND handoff_pending=0
+                 AND process_id=? AND pid=?""",
+            (max(1, int(attempt)), retry_of, str(execution_id), _PROCESS_ID, os.getpid()),
+        )
 
 
 def mark_execution_handoff_pending(execution_id: str) -> Optional[dict[str, Any]]:
@@ -347,24 +656,43 @@ def mark_execution_running(execution_id: str) -> Optional[dict[str, Any]]:
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
     delivery_outcome: Optional[str] = None, cancelled: bool = False,
+    outcome_class: Optional[str] = None,
+    retry_intent: Optional[tuple[str, int]] = None,
 ) -> Optional[dict[str, Any]]:
     """Write a terminal result once; terminal attempts cannot be rewritten.
 
     Only the owning process may finish its attempt; receipt recovery for a departed owner
     settles through ``recover_receipted_execution``.
+
+    ``outcome_class``: the machine-readable verdict of the writer that knows it, written only
+    when a failure is terminalized (``interrupted`` from the three interruption paths). It is
+    never re-derived from the prose in ``error``.
+
+    ``retry_intent``: ``(retry_at, attempt)`` decided by the caller through
+    ``cron.retry_interrupted.retry_intent_for`` — written in the SAME UPDATE that terminalizes
+    the row, so no terminal row is ever updated afterwards. The ledger writer stays job-free:
+    it is handed a decided intent, never a policy.
     """
     now = _hermes_now().isoformat()
     status = "cancelled" if cancelled else ("completed" if success else "failed")
     detail = None if success else (str(error) if error else "unknown failure")
+    retry_at: Optional[str] = None
+    if retry_intent is not None and not success and not cancelled:
+        retry_at = str(retry_intent[0])
     with _transaction() as conn:
         owner = (_PROCESS_ID, os.getpid())
         cur = conn.execute(
             """UPDATE executions
                SET status=?, finished_at=?, error=?, handoff_pending=0,
-                   handoff_started_at=NULL, delivery_outcome=?
+                   handoff_started_at=NULL, delivery_outcome=?,
+                   outcome_class=COALESCE(?, outcome_class),
+                   retry_pending=?, retry_at=?
                WHERE id=? AND status IN ('claimed','running')
                  AND process_id=? AND pid=?""",
-            (status, now, detail, delivery_outcome, execution_id, *owner),
+            (status, now, detail, delivery_outcome,
+             None if success else outcome_class,
+             1 if retry_at else 0, retry_at,
+             execution_id, *owner),
         )
         if cur.rowcount != 1:
             return None
@@ -373,6 +701,7 @@ def finish_execution(
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
     record_cron_finish(record, delivery_outcome)
     return record
+
 
 
 def record_missed_occurrences(
@@ -414,9 +743,13 @@ def recover_receipted_execution(execution_id, job_id, *, success, error=None, de
         row = _recoverable_row(conn, execution_id, job_id)
         if row is None or _row_owner_live(row):
             return None
+        # A verified canonical receipt proves the attempt FINISHED after all: any retry intent
+        # the sweep stamped on it is cancelled here, in the same write, so a completed run can
+        # never be re-fired by the retry planner.
         conn.execute(
             """UPDATE executions SET status=?, finished_at=?, error=?, handoff_pending=0,
-               handoff_started_at=NULL, delivery_outcome=? WHERE id=?""",
+               handoff_started_at=NULL, delivery_outcome=?, retry_pending=0, retry_at=NULL
+               WHERE id=?""",
             ('completed' if success else 'failed', now, None if success else (str(error) if error else 'unknown failure'),
              delivery_outcome, execution_id))
         _prune_unlocked(conn)
@@ -486,12 +819,50 @@ def settle_unstarted_execution(execution_id: str, job_id: str, error: str) -> No
                      job_id, execution_id, error, record_err)
 
 
+def _pid_absent(pid: int) -> bool:
+    """True only when the probe positively says the pid is gone (an unreadable probe is not)."""
+    try:
+        from gateway.status import _pid_exists
+
+        return not _pid_exists(pid)
+    except Exception:
+        return False
+
+
+def _sweep_deferral(row: dict[str, Any], *, pid_absent: bool) -> Optional[str]:
+    """Why this row is out of scope for THIS sweep pass, or None when it is in scope.
+
+    Composed of the two ordering gates that must both hold before any verdict:
+    S2 (machine scope — another machine's pid namespace proves nothing) and S1 (the claim must
+    not postdate this process's own start, measured on the boot clock). S3's proof is evaluated
+    by the caller.
+    """
+    if not _same_machine(row["machine_id"]):
+        return "claimed by another machine's pid namespace (undecidable, never dead)"
+    return _claim_precedence_refusal(row, pid_absent=pid_absent)
+
+
 def recover_interrupted_executions() -> int:
-    """Mark abandoned attempts unknown without scheduling retries: rows whose owner is provably
-    dead, plus rows whose live owner holds a claim older than the derived stale bound (the
-    process is not killed)."""
+    """Mark abandoned attempts unknown; record a bounded retry for the ones no fault of the job.
+
+    Two classes of row are ever terminalized here:
+
+    * **proved dead** (S2 + S3, then S1 precedence): the owner pid is absent, or a recorded
+      fingerprint mismatches beyond the drift tolerance, or this is a different boot on the same
+      machine. ``interrupted``-class evidence is never inferred from prose.
+    * **wedged** (S4): a LIVE owner whose claim has been silent past the derived stale bound
+      (#115692). Deliberately not retryable: that process was never killed and may still be
+      writing, so re-firing is a concurrent second run, not a recovery.
+
+    Everything else — a different machine, a claim younger than this process, an unreadable
+    fingerprint with no boot change, an unparseable /proc — is left alone. A lost sweep is
+    recoverable (a later process, or S4); a wrong sweep is not.
+
+    A retry intent is decided here (``cron/retry_interrupted.retry_intent_for``) and written in
+    the SAME fenced UPDATE that terminalizes the row, so the terminal row is never rewritten and
+    a further planning pass converts the intent into a schedule amendment.
+    """
     now = _hermes_now().isoformat()
-    changed = 0
     recovered: list[dict[str, Any]] = []
     # Derived on the first live-owned row only: the bound reads config, and the idle gateway
     # tick must stay config-free (tests/cron/test_idle_tick_config_skip.py).
@@ -499,35 +870,77 @@ def recover_interrupted_executions() -> int:
     stale_after_resolved = False
     with _transaction() as conn:
         rows = conn.execute(
-            """SELECT id, status, process_id, pid, process_started_at,
+            """SELECT id, job_id, status, process_id, pid, process_started_at,
+                      boot_id, machine_id, attempt, claimed_boottime,
                       handoff_pending, handoff_started_at, claimed_at, progress_at
                FROM executions
                WHERE status IN ('claimed','running')"""
         ).fetchall()
-        for row in rows:
-            if row["process_id"] == _PROCESS_ID:
+
+    # Decisions are made OUTSIDE the ledger write transaction: the retry gate reads the job
+    # store and the config, and holding the ledger lock across those would invert the
+    # jobs->ledger lock order that mark_job_run already establishes.
+    decisions: list[tuple[dict[str, Any], str, str, Optional[tuple[str, int]]]] = []
+    for row in rows:
+        if row["process_id"] == _PROCESS_ID:
+            continue
+        pid = int(row["pid"])
+        pid_absent = _pid_absent(pid)
+        deferral = _sweep_deferral(row, pid_absent=pid_absent)
+        if deferral:
+            logger.debug(
+                "Cron execution %s (job %s) left to a later sweep: %s",
+                row["id"], row["job_id"], deferral)
+            continue
+        owner_live = _owner_is_live(pid, row["process_started_at"])
+        if _owner_death_proof(row, pid_absent=pid_absent, owner_live=owner_live):
+            retry_intent: Optional[tuple[str, int]] = None
+            try:
+                from cron.jobs import get_job
+                from cron.retry_interrupted import retry_intent_for
+
+                retry_intent = retry_intent_for(
+                    get_job(str(row["job_id"])),
+                    execution_id=str(row["id"]),
+                    attempt=int(row["attempt"] or 1),
+                    outcome_class="owner_gone",
+                    finished_at=now,
+                )
+            except Exception as retry_exc:  # a planner bug must never block the sweep
+                logger.debug(
+                    "Cron execution %s: retry planning skipped (%s)", row["id"], retry_exc)
+            decisions.append((dict(row), _OWNER_GONE_REASON, "owner_gone", retry_intent))
+            continue
+        if owner_live:
+            # A live owner whose death is unproved is normally a legitimately running job. A
+            # worker permanently deadlocked (e.g. futex_wait behind a route/proxy flip, #115692)
+            # also passes this check, so a claim SILENT for longer than the derived bound is
+            # treated as wedged and released — the external-worker wait loop polls this ledger
+            # for a terminal status, so the job can fire again. Silence is measured from the
+            # owner's last ``progress_at`` stamp (the run monitor refreshes it while the agent is
+            # active), so a healthy multi-hour run is never reclaimed while it is still working.
+            # The wedged worker PROCESS is NOT terminated here (leaked until host restart); rows
+            # owned by this process (process_id == _PROCESS_ID) are skipped above.
+            if not stale_after_resolved:
+                stale_after = _live_owner_stale_after_seconds()
+                stale_after_resolved = True
+            if (
+                stale_after is None
+                or _stale_age_seconds(row["claimed_at"], row["progress_at"]) <= stale_after
+            ):
                 continue
-            reason = _OWNER_GONE_REASON
-            if _owner_is_live(int(row["pid"]), row["process_started_at"]):
-                # A live owner is normally a legitimately running job. A worker permanently
-                # deadlocked (e.g. futex_wait behind a route/proxy flip, #115692) also passes
-                # this check, so a claim SILENT for longer than the derived bound is treated
-                # as wedged and released — the external-worker wait loop polls this ledger
-                # for a terminal status, so the job can fire again. Silence is measured from
-                # the owner's last ``progress_at`` stamp (the run monitor refreshes it while
-                # the agent is active), so a healthy multi-hour run is never reclaimed while
-                # it is still working. The wedged worker PROCESS is NOT terminated here
-                # (leaked until host restart); rows owned by this process (process_id ==
-                # _PROCESS_ID, in-process runs) are skipped above and remain out of scope.
-                if not stale_after_resolved:
-                    stale_after = _live_owner_stale_after_seconds()
-                    stale_after_resolved = True
-                if (
-                    stale_after is None
-                    or _stale_age_seconds(row["claimed_at"], row["progress_at"]) <= stale_after
-                ):
-                    continue
-                reason = _OWNER_WEDGED_REASON
+            decisions.append((dict(row), _OWNER_WEDGED_REASON, "owner_wedged", None))
+            continue
+        logger.debug(
+            "Cron execution %s (job %s): owner is not live but death is unproved "
+            "(no pid-absence, boot change or recorded fingerprint mismatch)",
+            row["id"], row["job_id"])
+
+    if not decisions:
+        return 0
+    changed = 0
+    with _transaction() as conn:
+        for row, reason, outcome_class, retry_intent in decisions:
             handoff_started_at = row["handoff_started_at"]
             if (
                 row["handoff_pending"]
@@ -540,13 +953,16 @@ def recover_interrupted_executions() -> int:
             # owner may have stamped progress since, so act only on the snapshot that was judged.
             cur = conn.execute(
                 """UPDATE executions
-                   SET status='unknown', finished_at=?, error=?,
+                   SET status='unknown', finished_at=?, error=?, outcome_class=?,
+                       retry_pending=?, retry_at=?,
                        handoff_pending=0, handoff_started_at=NULL
                    WHERE id=? AND status=? AND process_id=? AND pid=?
                      AND handoff_pending=?
                      AND handoff_started_at IS ?
                      AND claimed_at=? AND progress_at IS ?""",
-                (now, reason, row["id"], row["status"], row["process_id"], row["pid"],
+                (now, reason, outcome_class,
+                 1 if retry_intent else 0, retry_intent[0] if retry_intent else None,
+                 row["id"], row["status"], row["process_id"], row["pid"],
                  row["handoff_pending"], row["handoff_started_at"],
                  row["claimed_at"], row["progress_at"]),
             )
@@ -560,6 +976,48 @@ def recover_interrupted_executions() -> int:
     for record in recovered:
         _emit_execution_state(record)
     return changed
+
+
+def pending_retry_intents(limit: int = 8) -> list[dict[str, Any]]:
+    """Retry intents owed by terminal rows, oldest first. The retry planner's only query.
+
+    Indexed by ``idx_executions_retry_pending`` and cheap enough for a throttled idle tick: an
+    empty result means no config or job-store read at all (#33612).
+    """
+    with _transaction() as conn:
+        rows = conn.execute(
+            """SELECT id, job_id, attempt, retry_at
+               FROM executions
+               WHERE retry_pending=1 AND retry_at IS NOT NULL
+               ORDER BY julianday(retry_at) ASC, retry_at ASC, id ASC
+               LIMIT ?""",
+            (max(1, int(limit)),),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def claim_retry_intent(execution_id: str) -> bool:
+    """Claim an owed retry intent (R4): the fenced ``retry_pending 1 -> 0``. Exactly one planner
+    wins, so two schedulers sharing a store cannot both amend the schedule."""
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions SET retry_pending=0
+               WHERE id=? AND retry_pending=1 AND status IN ('unknown','failed')""",
+            (str(execution_id),),
+        )
+    return cur.rowcount == 1
+
+
+def void_retry_intent(execution_id: str) -> bool:
+    """Cancel an owed retry without planning it: the same fenced ``retry_pending 1 -> 0``.
+
+    Used when retries are switched off entirely (``cron.retry_interrupted: false``): an intent
+    that will never be converted must stop keeping its row prune-exempt, or the ledger grows
+    past ``MAX_TERMINAL_EXECUTIONS`` one interruption at a time. ``retry_at`` stays as the
+    record of when the re-run was owed; only the flag gates planning.
+    """
+    return claim_retry_intent(execution_id)
+
 
 
 def terminalize_dead_owner(execution_id: str, *, reason: str) -> bool:
