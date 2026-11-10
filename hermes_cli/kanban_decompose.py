@@ -114,9 +114,10 @@ in the Hermes repo:
     such a child — the system resolves it, and a path the worker cannot resolve
     fails dispatch.
   - Their bodies MUST also carry a fallback for a delivered workspace that is
-    not a linked git worktree (scratch child, legacy card): run the `git
-    worktree add` command above into /home/juozas/tmp-worktrees/<card-id> and
-    do all work there. Either way the deploy checkout is never the workspace.
+    not a linked worktree OF THE HERMES REPO (scratch child, legacy card): run
+    the `git worktree add` command above into
+    /home/juozas/tmp-worktrees/<card-id> and do all work there. Either way the
+    deploy checkout is never the workspace.
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:
@@ -137,6 +138,83 @@ No preamble, no closing remarks, no code fences. Output only the JSON object.
 """
 
 
+def _main_repo_root(path: Optional[Path]) -> Optional[Path]:
+    """Main repo root *path* belongs to, or ``None`` when it is not in a repo.
+
+    ``--show-toplevel`` inside a LINKED worktree returns the worktree itself, so
+    a root task already running in one would nest its children under
+    ``<parent-worktree>/.worktrees/``. Resolve the repo's common dir instead —
+    the main checkout for both a plain and a linked checkout.
+    """
+    from hermes_cli.kanban_db_workspace import _git_common_dir, _git_toplevel
+
+    if path is None:
+        return None
+    try:
+        path = Path(path).expanduser()
+        top = _git_toplevel(path)
+        if top is None:
+            return None
+        common = _git_common_dir(path)
+    except Exception:
+        return None
+    if common is not None:
+        candidate = common.parent if common.name == ".git" else common
+        try:
+            if (candidate / ".git").exists():
+                return candidate.resolve()
+        except Exception:
+            pass
+    return top
+
+
+def _is_hermes_state_root(path: Path) -> bool:
+    """True when *path* is a Hermes home (or a parent of one) — never a repo anchor.
+
+    On this install ``~/.hermes`` is itself a git repo and every scratch
+    workspace lives under ``~/.hermes/kanban/workspaces/<id>``, so the toplevel
+    of a dispatched root's ``workspace_path`` is the CONFIG home. Anchoring a
+    worktree there hands the child a linked checkout with no code in it (and
+    the body's "not a linked git worktree" fallback cannot fire, because it IS
+    one), so the state tree must never be used as the anchor.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+        home = Path(get_hermes_home()).expanduser().resolve(strict=False)
+        resolved = Path(path).expanduser().resolve(strict=False)
+    except Exception:
+        return False
+    return resolved == home or home.is_relative_to(resolved)
+
+
+def _hermes_code_checkout() -> Optional[Path]:
+    """Repo root of the Hermes code checkout (the deploy tree), or ``None``.
+
+    The active ``HERMES_HOME`` comes first, but a profile session points at
+    ``<home>/profiles/<name>`` where no checkout lives, so the default home is
+    tried too. Best effort: no candidate ⇒ ``None``.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+        home = Path(get_hermes_home()).expanduser()
+    except Exception:
+        home = Path.home() / ".hermes"
+    candidates = [home / "hermes-agent"]
+    if home.parent.name == "profiles":
+        candidates.append(home.parent.parent / "hermes-agent")
+    candidates.append(Path.home() / ".hermes" / "hermes-agent")
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate.resolve(strict=False))
+        if key in seen:
+            continue
+        seen.add(key)
+        root = _main_repo_root(candidate)
+        if root is not None and root.is_dir():
+            return root
+    return None
+
+
 def _deploy_tree_state() -> str:
     """One-line live state of the deploy checkout, for the prompt.
 
@@ -148,7 +226,9 @@ def _deploy_tree_state() -> str:
     from hermes_constants import get_hermes_home
     from hermes_cli.source_check import _git_stdout
 
-    root = get_hermes_home() / "hermes-agent"
+    root = _hermes_code_checkout()
+    if root is None:
+        root = get_hermes_home() / "hermes-agent"
     branch = _git_stdout(["rev-parse", "--abbrev-ref", "HEAD"], cwd=root)
     if branch is None:
         return f"Deploy checkout: {root} — state unknown (git could not read it)"
@@ -176,30 +256,28 @@ def _worktree_anchor(root_task: Optional[kb.Task] = None) -> Optional[str]:
     never runs. Naming the anchor explicitly makes a repo-touching child
     dispatchable with no board configuration at all.
 
-    Prefer the repo the root task already lives in, else the deploy checkout.
-    Best effort: an unknown anatomy means "no anchor" and the child keeps the
-    root's kind — its body still names the canonical ``git worktree add``
-    command, so the work is not lost, only the per-child provisioning.
+    The repo the root task lives in wins — normalised to its MAIN repo root and
+    used only when it is a code repo. A dispatched root's scratch workspace
+    sits inside the Hermes state home, which is itself a git repo but holds no
+    code, so that shape falls through to the code checkout. Best effort: an
+    unknown anatomy means "no anchor" and the child keeps the root's kind —
+    its body still names the canonical ``git worktree add`` command, so the
+    work is not lost, only the per-child provisioning.
     """
-    from hermes_cli.kanban_db_workspace import _git_toplevel
-
-    candidates: list[Path] = []
     raw = getattr(root_task, "workspace_path", None)
     if isinstance(raw, str) and raw.strip():
-        candidates.append(Path(raw).expanduser())
-    try:
-        from hermes_constants import get_hermes_home
-        candidates.append(get_hermes_home() / "hermes-agent")
-    except Exception:
-        pass
-    for candidate in candidates:
-        try:
-            top = _git_toplevel(candidate)
-        except Exception:
-            top = None
-        if top is not None:
-            return str(top)
-    return None
+        root = _main_repo_root(Path(raw))
+        if root is not None:
+            if _is_hermes_state_root(root):
+                logger.info(
+                    "decompose: root task %s lives in the Hermes state repo %s — "
+                    "anchoring children on the code checkout, never the state tree",
+                    getattr(root_task, "id", "?"), root,
+                )
+            else:
+                return str(root)
+    checkout = _hermes_code_checkout()
+    return str(checkout) if checkout is not None else None
 
 
 _USER_TEMPLATE = """Task id: {task_id}
