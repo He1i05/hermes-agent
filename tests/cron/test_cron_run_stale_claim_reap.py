@@ -10,6 +10,7 @@ no equivalent moment of its own, so the self-heal never ran for it.
 from __future__ import annotations
 
 import sys
+from datetime import timedelta
 
 
 
@@ -34,10 +35,15 @@ def test_one_shot_cli_path_reaps_dead_owner_row_before_returning_sync(tmp_path, 
     proc = sp.Popen([sys.executable, "-c", "pass"])
     proc.wait()
     dead_pid = proc.pid  # exited: provably dead
+    # The stale row was left by an EARLIER `hermes cron run` invocation: the dead-owner sweep
+    # never judges a claim that postdates the invoking process (#S1 in cron/executions.py), and
+    # this regression is about a SUBSEQUENT invocation reaping it.
+    stale_claim = (executions._hermes_now() - timedelta(seconds=600)).isoformat()
     with sqlite3.connect(tmp_path / "executions.db") as conn:
         conn.execute(
             "UPDATE executions SET status='running', process_id='other-process', pid=?, "
-            "process_started_at=1 WHERE id=?", (dead_pid, row["id"]))
+            "process_started_at=1, claimed_at=? WHERE id=?",
+            (dead_pid, stale_claim, row["id"]))
 
     token = _SESSION_ASYNC_DELIVERY.set(False)
     try:

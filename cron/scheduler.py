@@ -2794,6 +2794,21 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         heartbeat_thread.join(timeout=1.0)
 
 
+def _execution_identity_kwargs(job: dict) -> dict:
+    """``attempt``/``retry_of`` for the execution row this dispatch creates.
+
+    Only a re-run of an occurrence that was killed mid-flight carries an identity beyond attempt
+    1; everything else stays an original fire (``cron/retry_interrupted.dispatch_identity``).
+    """
+    try:
+        from cron.retry_interrupted import dispatch_identity
+
+        attempt, retry_of = dispatch_identity(job)
+    except Exception:
+        return {}
+    return {"attempt": attempt, "retry_of": retry_of} if (attempt > 1 or retry_of) else {}
+
+
 def run_one_job(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None, cancel_event: Optional[_CancelEventLike] = None,
@@ -2808,7 +2823,8 @@ def run_one_job(
     # attempt to adopt before any launch can occur.
     if not job.get("execution_id"):
         execution = create_execution(
-            job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))
+            job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"),
+            **_execution_identity_kwargs(job))
         job["execution_id"] = execution["id"]
 
     execution_id = str(job["execution_id"])
@@ -2843,15 +2859,15 @@ def run_one_job(
                     with _fire_secret_scope():
                         delivery_error, delivery_outcome = _deliver_crash_failure(
                             job, error, adapters=adapters, loop=loop)
-                from cron.unreachable_retry import is_retry_run
+                from cron.retry_interrupted import is_off_lattice_rerun
                 mark_job_run(
                     job["id"],
                     False,
                     error,
                     delivery_error=delivery_error,
                     **({"expected_fire_owner": owner} if owner else {}),
-                    # A ladder re-run's occurrence already counted toward repeat.
-                    **({"ladder_rung": True} if is_retry_run(job) else {}),
+                    # A ladder/retry re-run's occurrence already counted toward repeat.
+                    **({"ladder_rung": True} if is_off_lattice_rerun(job) else {}),
                 )
             finally:
                 finish_execution(
@@ -2909,15 +2925,23 @@ def _record_fire_ownership_lost(
     not a real loss — we still own the claim, so record the interruption via the owner-fenced
     terminal write instead of leaving fire_claim/last_status stale; otherwise discard.
     An interrupted ladder re-run re-ran an occurrence that already counted, so its terminal
-    write must not spend another repeat slot (same as every other terminal path)."""
-    from cron.unreachable_retry import is_retry_run
+    write must not spend another repeat slot (same as every other terminal path).
+    The run was killed mid-flight by the loss, which is no fault of the job: the terminal write
+    carries the ``interrupted`` outcome class and a decided retry intent, so the occurrence is
+    re-run once instead of being lost (``cron/retry_interrupted.py``)."""
+    from cron.retry_interrupted import is_off_lattice_rerun, retry_intent_for
     job_id = job["id"]
     if fire_owner is not None and heartbeat_fire_claim(job_id, expected_owner=fire_owner):
         mark_job_run(
             job_id, False, _OWNERSHIP_LOST_INTERRUPTED, expected_fire_owner=fire_owner,
-            **({"ladder_rung": True} if is_retry_run(job) else {}),
+            **({"ladder_rung": True} if is_off_lattice_rerun(job) else {}),
         )
-        finish_execution(execution_id, success=False, error=_OWNERSHIP_LOST_INTERRUPTED)
+        finish_execution(
+            execution_id, success=False, error=_OWNERSHIP_LOST_INTERRUPTED,
+            outcome_class="interrupted",
+            retry_intent=retry_intent_for(
+                job, execution_id=execution_id, outcome_class="interrupted"),
+        )
     else:
         finish_lost_execution(
             execution_id, "Fire claim ownership lost; stale result was discarded.")
@@ -3279,7 +3303,8 @@ def _run_one_job_body(
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(
-            job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))["id"]
+            job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"),
+            **_execution_identity_kwargs(job))["id"]
     job = dict(job, execution_id=execution_id)
     # The execution id is resolved BEFORE the fence so ``hermes cron cancel`` can join the same
     # cancel seam: the marker it writes is polled by whichever process owns this attempt.
@@ -3462,17 +3487,36 @@ def _run_one_job_body(
                     mark_kwargs["expected_fire_owner"] = fire_owner
                 if contained:
                     mark_kwargs["delivery_error"] = delivery_error
-                from cron.unreachable_retry import is_retry_run
-                if is_retry_run(job):
-                    # A crashed ladder re-run: its occurrence already counted toward repeat.
+                from cron.retry_interrupted import is_off_lattice_rerun
+                if is_off_lattice_rerun(job):
+                    # A crashed ladder/recovery re-run: its occurrence already counted toward repeat.
                     mark_kwargs["ladder_rung"] = True
                 mark_job_run(job["id"], False, _err_text, **mark_kwargs)
         except Exception as record_err:
             # Never let bookkeeping mask the original interruption.
             logger.error("Failed to record interrupted run for job %s: %s", job["id"], record_err)
+        # An interruption that reached here is a kill, not a job failure: CancelledError,
+        # KeyboardInterrupt and SystemExit are BaseExceptions (``contained`` is false for them),
+        # which is exactly the "no fault of the job" class. A contained Exception (auth error,
+        # timeout, script exit) keeps today's no-retry behaviour — retrying a broken key six
+        # times a night is a bug, not a feature. A lost fire claim means a replacement run
+        # exists, so it must not also be retried.
+        interrupted_outcome = (not contained) and not _fire_claim_ownership_lost()
+        retry_intent = None
+        if interrupted_outcome:
+            try:
+                from cron.retry_interrupted import retry_intent_for
+
+                retry_intent = retry_intent_for(
+                    job, execution_id=execution_id, outcome_class="interrupted")
+            except Exception as retry_err:  # never let retry planning block the terminal write
+                logger.debug("Retry planning skipped for job %s: %s", job["id"], retry_err)
         try:
             finish_execution(
-                execution_id, success=False, error=_err_text, delivery_outcome=delivery_outcome)
+                execution_id, success=False, error=_err_text, delivery_outcome=delivery_outcome,
+                outcome_class="interrupted" if interrupted_outcome else None,
+                retry_intent=retry_intent,
+            )
         except Exception as record_err:
             logger.error("Failed to finish execution record for job %s: %s", job["id"], record_err)
         if not contained:
@@ -4299,7 +4343,8 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
     execution = None
     try:
         execution = create_execution(
-            job_id, source="builtin", scheduled_instant=job.get("_scheduled_instant"))
+            job_id, source="builtin", scheduled_instant=job.get("_scheduled_instant"),
+            **_execution_identity_kwargs(job))
         dispatched_job = dict(job, execution_id=execution["id"])
         note_cron_execution(dispatched_job)
         _ctx = contextvars.copy_context()

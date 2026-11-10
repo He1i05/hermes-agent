@@ -175,13 +175,13 @@ def finish_cancelled_run(job: dict[str, Any], execution_id: str, fire_owner: Opt
     job's ``last_status`` — without a failure alert or a failure-streak bump, since the operator
     asked for it. A job removed mid-run has no record left to mark; its ledger row still lands."""
     from cron import scheduler
-    from cron.unreachable_retry import is_retry_run
+    from cron.retry_interrupted import is_off_lattice_rerun
 
     reason = CancelRequest(execution_id).reason
     if not scheduler.self_removal_delivery_allowed(job["id"]):
         owner = {"expected_fire_owner": fire_owner} if fire_owner is not None else {}
-        # A stopped ladder re-run re-ran an occurrence that already counted: no second repeat slot.
-        rung = {"ladder_rung": True} if is_retry_run(job) else {}
+        # A stopped ladder/retry re-run re-ran an occurrence that already counted: no second slot.
+        rung = {"ladder_rung": True} if is_off_lattice_rerun(job) else {}
         scheduler.mark_job_run(
             job["id"], False, f"Cancelled: {reason}", status="cancelled", **owner, **rung)
     scheduler.finish_execution(execution_id, success=False, error=reason, cancelled=True)
