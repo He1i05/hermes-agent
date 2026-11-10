@@ -52,6 +52,11 @@ LIVE_OWNER_STALE_CLAIM_FLOOR_SECONDS = 7200.0
 # 92 min behind on that boot until NTP corrected it.
 SWEEP_START_SLACK_SECONDS = 5.0
 SWEEP_POSTDATING_MIN_AGE_SECONDS = 300.0
+# Portable floor for "when did this process start". Import happens at or just after the true
+# start, so it is an upper bound on it and the slack above absorbs the interpreter-startup gap.
+# Used only when /proc cannot settle the exact instant: an unreadable start used to defer every
+# row, which silently disabled S4 — the backstop that bounds what S1 hides.
+_IMPORT_MONOTONIC = time.monotonic()
 
 # ``cancelled``: an operator stopped the run (``hermes cron cancel``, removing the job mid-run).
 # ``missed``: never started — one row books every occurrence the scheduler skipped past.
@@ -320,22 +325,28 @@ def _process_start_boottime() -> Optional[float]:
 
 
 _MY_START_MONOTONIC: Optional[float] = None
+_MY_START_MONOTONIC_RESOLVED = False
 
 
 def _process_start_monotonic() -> Optional[float]:
-    """The monotonic instant this process started (None when /proc cannot settle it).
+    """The monotonic instant this process started (never None: import time is the floor).
 
-    Derived from the boot clock (``process_started_at`` is ticks-since-boot and cannot be
-    compared with ``claimed_at``), and used only for rows that carry no ``claimed_boottime``
-    stamp — i.e. claims written before that column existed.
+    Preferred reading: derived from the boot clock (``process_started_at`` is ticks-since-boot
+    and cannot be compared with ``claimed_at``). That derivation needs ``/proc/uptime``, which is
+    absent off Linux and can be unreadable; returning None there deferred EVERY row and thereby
+    disabled S4, the wedged backstop that exists precisely to bound rows S1 hides (F1).
+
+    The portable fallback is the instant this module was imported: at or just after the true
+    process start, so it over-estimates the start by the interpreter-startup gap, which
+    ``SWEEP_START_SLACK_SECONDS`` covers on the safe side (a claim is only "postdating" once it
+    is more than the slack *after* that floor).
     """
-    global _MY_START_MONOTONIC
-    if _MY_START_MONOTONIC is not None:
+    global _MY_START_MONOTONIC, _MY_START_MONOTONIC_RESOLVED
+    if _MY_START_MONOTONIC_RESOLVED:
         return _MY_START_MONOTONIC
-    start_mono = _boottime_to_monotonic(_process_start_boottime())
-    if start_mono is None:
-        return None
-    _MY_START_MONOTONIC = start_mono
+    derived = _boottime_to_monotonic(_process_start_boottime())
+    _MY_START_MONOTONIC = derived if derived is not None else _IMPORT_MONOTONIC
+    _MY_START_MONOTONIC_RESOLVED = True
     return _MY_START_MONOTONIC
 
 
@@ -362,10 +373,11 @@ def _claim_precedence(row: dict[str, Any]) -> tuple[Optional[bool], Optional[flo
     claim older than it is, so it can look pre-restart. It still cannot terminalize anything on
     its own — S3 must independently prove the owner dead.
 
-    Returns ``(None, None)`` when neither reading can settle the claim instant.
+    Returns ``(None, None)`` only when no reading can settle the claim instant (an unparseable
+    ``claimed_at``); this process's own start is always available, portably.
     """
     my_start = _process_start_monotonic()
-    if my_start is None:
+    if my_start is None:  # defensive: the portable floor makes this unreachable
         return None, None
     stamp = _row_field(row, "claimed_boottime")
     my_start_boot = _process_start_boottime()
@@ -404,8 +416,12 @@ def _claim_precedence_refusal(row: dict[str, Any], *, pid_absent: bool) -> Optio
     """
     postdates, age = _claim_precedence(row)
     if postdates is None:
-        return ("this process's own start is unreadable (/proc unavailable)"
-                if _process_start_monotonic() is None else "unreadable claim stamp")
+        # Nothing places this claim in time (its ``claimed_at`` will not parse, and no boot stamp
+        # can stand in). The self-sufficient proof still needs an age to know the claim has had
+        # its reap interval, and there is none — refuse; S4 (ages only) remains the backstop for
+        # a live owner. With the portable start floor this branch is the corrupt-row residue: an
+        # unreadable /proc no longer lands here at all.
+        return "unreadable claim stamp"
     if not postdates:
         return None  # claimed before this process started: the pre-restart batch
     if not pid_absent:
@@ -835,19 +851,6 @@ def _pid_absent(pid: int) -> bool:
         return False
 
 
-def _sweep_deferral(row: dict[str, Any], *, pid_absent: bool) -> Optional[str]:
-    """Why this row is out of scope for THIS sweep pass, or None when it is in scope.
-
-    Composed of the two ordering gates that must both hold before any verdict:
-    S2 (machine scope — another machine's pid namespace proves nothing) and S1 (the claim must
-    not postdate this process's own start, measured on the boot clock). S3's proof is evaluated
-    by the caller.
-    """
-    if not _same_machine(row["machine_id"]):
-        return "claimed by another machine's pid namespace (undecidable, never dead)"
-    return _claim_precedence_refusal(row, pid_absent=pid_absent)
-
-
 def recover_interrupted_executions() -> int:
     """Mark abandoned attempts unknown; record a bounded retry for the ones no fault of the job.
 
@@ -858,11 +861,13 @@ def recover_interrupted_executions() -> int:
       machine. ``interrupted``-class evidence is never inferred from prose.
     * **wedged** (S4): a LIVE owner whose claim has been silent past the derived stale bound
       (#115692). Deliberately not retryable: that process was never killed and may still be
-      writing, so re-firing is a concurrent second run, not a recovery.
+      writing, so re-firing is a concurrent second run, not a recovery. S4 compares only ages
+      recorded on the row itself, so it runs even when S1 cannot place a claim instant — it is
+      the backstop that stops S1 from hiding a row forever.
 
     Everything else — a different machine, a claim younger than this process, an unreadable
-    fingerprint with no boot change, an unparseable /proc — is left alone. A lost sweep is
-    recoverable (a later process, or S4); a wrong sweep is not.
+    fingerprint with no boot change, an unparseable claim instant — is left alone. A lost sweep
+    is recoverable (a later process, or S4); a wrong sweep is not.
 
     A retry intent is decided here (``cron/retry_interrupted.retry_intent_for``) and written in
     the SAME fenced UPDATE that terminalizes the row, so the terminal row is never rewritten and
@@ -891,15 +896,23 @@ def recover_interrupted_executions() -> int:
         if row["process_id"] == _PROCESS_ID:
             continue
         pid = int(row["pid"])
-        pid_absent = _pid_absent(pid)
-        deferral = _sweep_deferral(row, pid_absent=pid_absent)
-        if deferral:
+        # S2 first: a row claimed in another machine's pid namespace is undecidable here, so
+        # neither the death proof nor the wedged bound may judge it.
+        if not _same_machine(row["machine_id"]):
             logger.debug(
                 "Cron execution %s (job %s) left to a later sweep: %s",
-                row["id"], row["job_id"], deferral)
+                row["id"], row["job_id"],
+                "claimed by another machine's pid namespace (undecidable, never dead)")
             continue
+        pid_absent = _pid_absent(pid)
         owner_live = _owner_is_live(pid, row["process_started_at"])
-        if _owner_death_proof(row, pid_absent=pid_absent, owner_live=owner_live):
+        postdates, _claim_age = _claim_precedence(row)
+        deferral = _claim_precedence_refusal(row, pid_absent=pid_absent)
+        # S3 keeps its original precedence: an in-scope row with positive proof of death is
+        # terminalized even when a live local pid makes the fingerprint *look* alive (S3(c), a
+        # boot change). S4 must never pre-empt that proof.
+        if deferral is None and _owner_death_proof(
+                row, pid_absent=pid_absent, owner_live=owner_live):
             retry_intent: Optional[tuple[str, int]] = None
             try:
                 from cron.jobs import get_job
@@ -918,24 +931,43 @@ def recover_interrupted_executions() -> int:
             decisions.append((dict(row), _OWNER_GONE_REASON, "owner_gone", retry_intent))
             continue
         if owner_live:
-            # A live owner whose death is unproved is normally a legitimately running job. A
-            # worker permanently deadlocked (e.g. futex_wait behind a route/proxy flip, #115692)
-            # also passes this check, so a claim SILENT for longer than the derived bound is
-            # treated as wedged and released — the external-worker wait loop polls this ledger
-            # for a terminal status, so the job can fire again. Silence is measured from the
-            # owner's last ``progress_at`` stamp (the run monitor refreshes it while the agent is
-            # active), so a healthy multi-hour run is never reclaimed while it is still working.
-            # The wedged worker PROCESS is NOT terminated here (leaked until host restart); rows
-            # owned by this process (process_id == _PROCESS_ID) are skipped above.
+            # S4 — the wedged bound. A live owner whose death is unproved is normally a
+            # legitimately running job. A worker permanently deadlocked (e.g. futex_wait behind
+            # a route/proxy flip, #115692) also passes this check, so a claim SILENT for longer
+            # than the derived bound is treated as wedged and released — the external-worker wait
+            # loop polls this ledger for a terminal status, so the job can fire again. Silence is
+            # measured from the owner's last ``progress_at`` stamp (the run monitor refreshes it
+            # while the agent is active), so a healthy multi-hour run is never reclaimed while it
+            # is still working. The wedged worker PROCESS is NOT terminated here (leaked until
+            # host restart); rows owned by this process (process_id == _PROCESS_ID) are skipped
+            # above.
+            #
+            # S4 compares only ages recorded on this row (claimed_at/progress_at), so it needs no
+            # cross-clock comparison and keeps working when S1 cannot place the claim instant —
+            # it is the backstop S1 relies on. The one claim it must never touch is one that
+            # provably postdates this process: that run is the fresher process's business and
+            # could still be in its first seconds.
+            if postdates:
+                logger.debug(
+                    "Cron execution %s (job %s) left to a later sweep: %s",
+                    row["id"], row["job_id"],
+                    "claimed after this process started (owner still alive)")
+                continue
             if not stale_after_resolved:
                 stale_after = _live_owner_stale_after_seconds()
                 stale_after_resolved = True
-            if (
-                stale_after is None
-                or _stale_age_seconds(row["claimed_at"], row["progress_at"]) <= stale_after
-            ):
+            try:
+                silence = _stale_age_seconds(row["claimed_at"], row["progress_at"])
+            except (TypeError, ValueError):
+                continue  # no readable age: nothing to bound a wedged verdict with
+            if stale_after is None or silence <= stale_after:
                 continue
             decisions.append((dict(row), _OWNER_WEDGED_REASON, "owner_wedged", None))
+            continue
+        if deferral:
+            logger.debug(
+                "Cron execution %s (job %s) left to a later sweep: %s",
+                row["id"], row["job_id"], deferral)
             continue
         logger.debug(
             "Cron execution %s (job %s): owner is not live but death is unproved "
