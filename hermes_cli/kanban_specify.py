@@ -55,6 +55,21 @@ Rules:
     NOT invent a different project.
   - If the original idea is already detailed, preserve its substance and
     just reformat into the sections above.
+  - If the task changes code in the Hermes repo, the **Approach** section
+    MUST name the mechanism, based on the carry lane rather than a frozen
+    SHA:
+
+        git -C /home/juozas/.hermes/hermes-agent worktree add \
+            /home/juozas/tmp-worktrees/<task-id> -b <branch> carry/v0.23.0-main
+
+    and MUST state that the deploy checkout `~/.hermes/hermes-agent` is the
+    tree systemd runs: it stays on `carry/v0.23.0-main` with an empty
+    `git status --porcelain`, and is never checked out, committed in,
+    stashed or reset. Never write "branch from the deploy tree" or "commit
+    in the deploy tree" — that instruction moved the live install onto a
+    feature branch once already.
+  - A task that verifies, reviews or lands another task's output is not
+    parallel work: say so, so the graph serialises it behind the producer.
   - Never add invented requirements the user didn't hint at.
   - No preamble, no closing remarks, no code fences around the JSON.
   - Output only the JSON object and nothing else.

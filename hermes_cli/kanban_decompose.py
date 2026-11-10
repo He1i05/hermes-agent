@@ -55,7 +55,8 @@ Output a single JSON object with this exact shape:
         "title": "<concrete task title, imperative voice, <= 80 chars>",
         "body":  "<detailed spec for the worker on this child task>",
         "assignee": "<profile name from the roster, or null for default>",
-        "parents": [<int>, ...]
+        "parents": [<int>, ...],
+        "workspace_kind": "worktree" | null
       },
       ...
     ]
@@ -65,8 +66,11 @@ Rules:
   - "parents" is a list of INDICES (0-based) into this same "tasks" list,
     expressing actual data dependencies. Tasks with no parents run in
     PARALLEL. Tasks with parents wait until every parent completes.
-  - Prefer parallelism. If two tasks can be done independently, give
-    them no parents so the dispatcher fans them out at once.
+  - Prefer parallelism for work that is genuinely independent. A task that
+    verifies, reviews or lands another task's output is NOT independent:
+    give it that task's index in "parents" so it stays in todo until the
+    work it judges exists. Two tasks that would write to the same working
+    tree are never independent either.
   - Use 2-6 tasks for normal work. Don't create 20 tiny tasks. Don't
     cram everything into 1 task.
   - Pick assignees from the roster by matching the task to the profile's
@@ -74,6 +78,36 @@ Rules:
     and the system will route to the default_assignee.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
+    Never assert a machine fact the worker cannot re-check (a commit SHA,
+    "the tree is clean"): name the command that reads it instead.
+
+Repo work is worktree-only — apply this to EVERY child that changes files
+in the Hermes repo:
+  - The deploy checkout (the git tree named in the prompt below) is the
+    tree systemd runs: every newly spawned worker, `hermes` CLI call and
+    no-agent cron script imports it from disk. A child must NEVER check it
+    out, commit in it, stash in it or reset it, and its body must never say
+    "branch from the deploy tree", "commit in the deploy tree" or "PR
+    against the deploy tree".
+  - Each such child body MUST name this mechanism, based on the carry lane
+    rather than a frozen SHA:
+
+        git -C /home/juozas/.hermes/hermes-agent worktree add \
+            /home/juozas/tmp-worktrees/<card-id> -b <branch> carry/v0.23.0-main
+
+    Use the newest carry lane listed in the prompt's deploy-checkout block
+    — currently `carry/v0.23.0-main`. Never a frozen SHA, and never `main`.
+  - ...and MUST require the child to preflight before it starts: `git -C
+    <deploy checkout> rev-parse --abbrev-ref HEAD` must be the expected
+    carry lane and `git status --porcelain` must be empty; if either fails
+    the child STOPS and reports instead of proceeding against a foreign or
+    dirty tree. Same check at the end: never "fix" the tree, never `git
+    stash` / `git checkout -- .` another worker's files.
+  - Set "workspace_kind": "worktree" on repo-touching children so dispatch
+    materialises a tree per child. An implement child and the child that
+    verifies it get separate worktrees, or the verifier waits for the
+    implementer; a verify pass must never read a tree an implement sibling
+    is mutating.
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:
@@ -94,10 +128,38 @@ No preamble, no closing remarks, no code fences. Output only the JSON object.
 """
 
 
+def _deploy_tree_state() -> str:
+    """One-line live state of the deploy checkout, for the prompt.
+
+    The decomposer used to (re)state "currently <sha>, clean" as fact — that
+    stale snapshot is how a child body ends up telling a worker to branch from
+    the live install. Read the tree instead of asserting it. Best effort: an
+    unreadable checkout degrades to "unknown" and never fails a fan-out.
+    """
+    from hermes_constants import get_hermes_home
+    from hermes_cli.source_check import _git_stdout
+
+    root = get_hermes_home() / "hermes-agent"
+    branch = _git_stdout(["rev-parse", "--abbrev-ref", "HEAD"], cwd=root)
+    if branch is None:
+        return f"Deploy checkout: {root} — state unknown (git could not read it)"
+    dirty = _git_stdout(["status", "--porcelain"], cwd=root)
+    dirty_txt = "unknown" if dirty is None else f"{len(dirty.splitlines())} file(s)"
+    lanes = _git_stdout(["branch", "--list", "carry/*", "--format=%(refname:short)"], cwd=root) or ""
+    lane_txt = ", ".join(ln.strip() for ln in lanes.splitlines() if ln.strip()) or "none"
+    return (
+        f"Deploy checkout: {root}\n"
+        f"  branch={branch or 'DETACHED'}  dirty={dirty_txt}  carry lanes: {lane_txt}\n"
+        f"  (the tree systemd runs — repo work goes in a worktree, never here)"
+    )
+
+
 _USER_TEMPLATE = """Task id: {task_id}
 Title: {title}
 Body:
 {body}
+
+{deploy_tree}
 
 Available profiles (assignees you may pick from):
 {roster}
@@ -261,13 +323,29 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
         parents = entry.get("parents") or []
         if not isinstance(parents, list):
             parents = []
-        children.append({
+        # Workspace overrides: the LLM may ask for a per-child worktree so
+        # siblings never share a checkout (``_insert_decomposed_child``
+        # materialises one per child). Anything unrecognised is dropped and
+        # the child inherits the root's kind.
+        ws_kind = entry.get("workspace_kind")
+        if ws_kind not in kb.VALID_WORKSPACE_KINDS:
+            ws_kind = None
+        ws_path = entry.get("workspace_path")
+        ws_path = ws_path.strip() if isinstance(ws_path, str) and ws_path.strip() else None
+        if ws_kind == "dir" and not ws_path:  # a dir child with no path is unusable
+            ws_kind = None
+        child = {
             "title": title.strip()[:200],
             "body": body.strip() if isinstance(body, str) else "",
             "assignee": chosen,
             # Drop non-int, out-of-range and self parent indices.
             "parents": [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx],
-        })
+        }
+        if ws_kind:
+            child["workspace_kind"] = ws_kind
+            if ws_path:
+                child["workspace_path"] = ws_path
+        children.append(child)
     return children, ""
 
 
@@ -320,6 +398,7 @@ def decompose_task(
             **_task_prompt_fields(task),
             roster=_format_roster(routing.roster),
             default_assignee=routing.default_assignee,
+            deploy_tree=_deploy_tree_state(),
         ),
         max_tokens=4000, timeout=timeout or 180, log=logger,
     )

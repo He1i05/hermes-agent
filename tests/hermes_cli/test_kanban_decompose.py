@@ -250,3 +250,55 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert outcome.ok is False
 
 
+def test_decompose_child_workspace_override_reaches_the_graph(kanban_home):
+    """A child that asks for its own worktree must actually be created with
+    ``workspace_kind='worktree'`` — the mechanism that keeps two repo-touching
+    siblings off one checkout. An unrecognised kind is dropped and the child
+    inherits the root's kind."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="patch the repo", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "implement then verify",
+        "tasks": [
+            {
+                "title": "implement", "body": "do it", "assignee": "engineer", "parents": [],
+                "workspace_kind": "worktree",
+            },
+            {
+                "title": "verify", "body": "check it", "assignee": "scout", "parents": [0],
+                "workspace_kind": "not-a-kind",
+            },
+        ],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "engineer", "scout"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kbc.connect() as conn:
+        impl = kb.get_task(conn, outcome.child_ids[0])
+        verify = kb.get_task(conn, outcome.child_ids[1])
+    assert impl.workspace_kind == "worktree"
+    # Dispatch materialises a per-child tree; a shared path is exactly what we are avoiding.
+    assert impl.workspace_path is None
+    assert verify.workspace_kind == "scratch"
+    # And the verify child still waits for the implement child.
+    assert verify.status == "todo"
+
+
+def test_deploy_tree_state_never_raises_without_a_checkout(kanban_home):
+    """The prompt's deploy-tree line is read, not asserted: an unreadable
+    checkout degrades to a stated unknown instead of failing the fan-out."""
+    state = decomp._deploy_tree_state()
+    assert state.startswith("Deploy checkout:")
+    # Either the live reading, or the stated-unknown fallback — never a raise.
+    assert "branch=" in state or "state unknown" in state
