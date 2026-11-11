@@ -3297,9 +3297,22 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
 
 
 def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
-    """The profile owner executes; this subprocess only waits for its receipt."""
+    """The profile owner executes; this subprocess only waits for its receipt.
+
+    ``-P`` (``sys.flags.safe_path``) is load-bearing, not cosmetic: ``-m`` gives the
+    interpreter a ``sys.path[0]`` of the *process cwd* — the task workspace — and that entry
+    precedes every ``PYTHONPATH`` entry the pin below adds. A worktree workspace is a full
+    checkout, so ``hermes_cli`` and ``hermes_bootstrap`` resolved from the worktree, whose PM
+    install key has no committed dependency generation: the worker died at boot with
+    ``hermes: no dependency environment is committed for this install`` and never reached its
+    first tool call. Any ``hermes_cli/`` in the workspace shadowed ours the same way. ``-P``
+    drops that implicit cwd entry, so the pinned install tree (``PYTHONPATH[0]``) always wins
+    while ``cwd`` stays the workspace — the worker still needs the worktree as its working
+    directory. ``-I`` would do the same and more: it also implies ``-E``, which ignores
+    ``PYTHONPATH`` and with it the dependency-generation pin a PM store interpreter needs.
+    """
     import sys
-    return [sys.executable, "-m", "hermes_cli.kanban_worker_client"]
+    return [sys.executable, "-P", "-m", "hermes_cli.kanban_worker_client"]
 
 
 def _open_worker_log(task: Task, board: Optional[str]):
@@ -3462,11 +3475,14 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     env.pop("HERMES_TUI", None)
 
     cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
-    # The worker is `-m hermes_cli.kanban_worker_client`: Hermes itself, with no console-script
+    # The worker is `-P -m hermes_cli.kanban_worker_client`: Hermes itself, with no console-script
     # bootstrap. The routed-profile scrub above strips Hermes-owned PYTHONPATH entries (user
     # children must not see our tree), so a PYTHONPATH-launched dispatcher spawned a child that
     # died on `No module named 'hermes_cli'` before it ever reached the owner. Same pin as cron's
     # external worker (#112729): applied to the sanitized env, after every other decision stands.
+    # The pin can only lose to `-m`'s implicit cwd entry (the workspace), which is why the argv
+    # carries `-P` — see `_worker_argv`. cwd itself stays the workspace: the pin reorders
+    # sys.path, it never changes the worker's working directory.
     from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
     env = pin_hermes_tree_on_pythonpath(env, Path(__file__).resolve().parent.parent)
     # A worker spawned by a managed systemd gateway must leave the gateway's
