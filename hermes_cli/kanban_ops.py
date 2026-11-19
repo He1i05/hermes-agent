@@ -110,6 +110,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "reason": reason}
                 for (tid, reason) in res.respawn_guarded
             ],
+            "deploy_tree_refused": [
+                {"task_id": tid, "reason": reason}
+                for (tid, reason) in res.deploy_tree_refused
+            ],
             "rate_limited": res.rate_limited,
             "skipped_locked": res.skipped_locked,
             "memory_pressure": res.memory_pressure,
@@ -148,6 +152,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     for tid, reason in res.respawn_guarded:
         print(f"Guarded ({reason}): {tid}")
+    for tid, reason in res.deploy_tree_refused:
+        print(f"Deploy-tree refused: {tid}  {reason}")
     if res.rate_limited:
         print(f"Rate-limited (released to ready, no failure counted): {', '.join(res.rate_limited)}")
     if res.skipped_locked:

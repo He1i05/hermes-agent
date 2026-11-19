@@ -139,6 +139,12 @@ class DispatchResult:
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
     within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    deploy_tree_refused: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reason)`` refused BEFORE spawn because the deploy checkout —
+    the tree systemd runs — was off-lane or dirty
+    (:mod:`hermes_cli.kanban_db_deploy_tree`). The run is closed
+    ``spawn_failed``/``infrastructure`` (no retry budget spent) and the card is
+    blocked ``needs_input`` until a human restores the tree."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
@@ -181,6 +187,10 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             continue
         for _task_id, reason in res.respawn_guarded:
             counts[reason] = counts.get(reason, 0) + 1
+        if res.deploy_tree_refused:
+            counts["deploy_tree_refused"] = (
+                counts.get("deploy_tree_refused", 0) + len(res.deploy_tree_refused)
+            )
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_locked:
@@ -2738,6 +2748,52 @@ def _dispatch_lane_task(
         ):
             result.auto_blocked.append(claimed.id)
         return False
+    # Deploy-tree precondition: a card that can write to the install tree systemd
+    # runs must not spawn while that tree is off-lane or dirty — the worker would
+    # serve unreviewed WIP to every newly spawned process (incident 2026-11-10).
+    # A refusal is booked ``infrastructure`` so the card keeps its retry budget
+    # (the cause is the host's tree, not the card) and blocked ``needs_input`` so
+    # only a human clears it, after restoring the checkout. The escape hatch
+    # covers a repair card: it logs which tree state it overrode.
+    deploy_reason = _kbdt.deploy_tree_precondition(claimed, str(workspace))
+    deploy_bypass = (
+        _kbdt.deploy_tree_bypass(claimed, str(workspace), reason=deploy_reason)
+        if deploy_reason is not None else None
+    )
+    if deploy_bypass is not None:
+        with _kb.write_txn(conn):
+            _kb._append_event(conn, claimed.id, "deploy_tree_bypassed", deploy_bypass)
+        _kb._log.warning(
+            "kanban dispatcher: deploy-tree precondition BYPASSED for %s (%s overrides %s)",
+            claimed.id, deploy_bypass.get("via"), deploy_reason,
+        )
+    elif deploy_reason is not None:
+        _kb._log.warning(
+            "kanban dispatcher: refusing to spawn %s: %s", claimed.id, deploy_reason,
+        )
+        _record_task_failure(
+            conn, claimed.id, deploy_reason,
+            outcome="spawn_failed", failure_limit=failure_limit,
+            release_claim=True, end_run=True, infrastructure=True,
+        )
+        if lane == "review":
+            # A reviewer run's retry phase is `review`, which block_task only
+            # leaves alone; park it in `ready` so the sticky block lands here too.
+            with _kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'review'",
+                    (claimed.id,),
+                )
+        _kb.block_task(
+            conn, claimed.id,
+            reason=(
+                f"{deploy_reason}; restore the deploy checkout to the newest carry/* "
+                "lane with an empty porcelain before unblocking"
+            ),
+            kind="needs_input",
+        )
+        result.deploy_tree_refused.append((claimed.id, deploy_reason))
+        return False
     _kbw.set_workspace_path(conn, claimed.id, str(workspace))
     if claimed.workspace_kind == "worktree":
         _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
@@ -3522,4 +3578,5 @@ def run_daemon(
 from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
 from hermes_cli import kanban_db_default_assignee as _kbda
+from hermes_cli import kanban_db_deploy_tree as _kbdt
 from hermes_cli import kanban_db_workspace as _kbw
