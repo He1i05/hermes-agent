@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 
@@ -15,6 +16,35 @@ def _point_ledger(monkeypatch, tmp_path):
 
     monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
     return executions
+
+
+def _dead_pid() -> int:
+    """PID of a process that has already exited: pid absence is the dead-owner sweep's
+    self-sufficient proof of death (``cron/executions.py`` S3a)."""
+    proc = subprocess.run(
+        [sys.executable, "-c", "import os; print(os.getpid())"],
+        capture_output=True, text=True, check=True,
+    )
+    return int(proc.stdout.strip())
+
+
+def _backdate_claim(executions, execution_id: str, *, seconds: float = 600.0) -> None:
+    """Model a claim left by a PREVIOUS process generation.
+
+    The dead-owner sweep never judges a claim younger than itself (S1 in ``cron/executions.py``:
+    a fresh run must not be declared unaccountable by the process that launched it), so a test
+    that wants the sweep to act must age the claim past this process's own start. These tests
+    are about what happens to a departed owner's claim, not about the ordering rule itself
+    (covered by ``tests/cron/test_sweep_scoping.py``).
+    """
+    from cron.executions import _hermes_now, _now_boottime
+
+    with executions._transaction() as conn:
+        conn.execute(
+            "UPDATE executions SET claimed_at=?, claimed_boottime=? WHERE id=?",
+            ((_hermes_now() - timedelta(seconds=seconds)).isoformat(),
+             (_now_boottime() or 0.0) - seconds, str(execution_id)),
+        )
 
 
 def test_execution_transitions_are_durable(monkeypatch, tmp_path):
@@ -70,9 +100,15 @@ def test_stale_external_handoff_is_recovered_unknown(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     record = executions.create_execution("handoff-job", source="builtin")
     pending = executions.mark_execution_handoff_pending(record["id"])
-
-    monkeypatch.setattr(executions, "_PROCESS_ID", "replacement-gateway")
-    monkeypatch.setattr(executions, "_owner_is_live", lambda _pid, _started: False)
+    # A departed owner: the pid is gone (positive proof of death) and the claim was made by
+    # another process image. A live pid whose fingerprint merely failed to match is NOT proof.
+    with executions._transaction() as conn:
+        conn.execute(
+            "UPDATE executions SET process_id='replacement-gateway', pid=?, "
+            "process_started_at=NULL WHERE id=?",
+            (_dead_pid(), record["id"]),
+        )
+    _backdate_claim(executions, record["id"])
     monkeypatch.setattr(
         executions.time,
         "time",
@@ -92,6 +128,7 @@ def test_recovery_does_not_overwrite_concurrent_worker_adoption(monkeypatch, tmp
     record = executions.create_execution("adoption-race", source="builtin")
     pending = executions.mark_execution_handoff_pending(record["id"])
     assert pending is not None
+    _backdate_claim(executions, record["id"])
     monkeypatch.setattr(executions, "_PROCESS_ID", "replacement-scheduler")
     monkeypatch.setattr(
         executions.time,

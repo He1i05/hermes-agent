@@ -39,3 +39,28 @@ def test_default_and_uncomputable_still_catch_up(tmp_path, monkeypatch, uncomput
         if uncomputable:
             monkeypatch.setattr(jobs, "compute_next_run", lambda *args, **kwargs: None)
         assert [row["id"] for row in jobs.get_due_jobs()] == [job["id"]]
+
+
+@pytest.mark.parametrize("schedule", ["every 1m", "every 5m", "every 1h", "0 9 * * 1"])
+def test_a_promptly_fired_retry_is_never_classified_catch_up(schedule):
+    """The interrupted-run retry rides the ONE due scan, so "retry vs catch-up" is not a race
+    between two dispatchers: the retry delay never exceeds the job's own grace window, so the
+    parked instant is inside grace and firing it promptly classifies ``on_time``/``late``.
+    Catch-up only ever acts on an instant already past grace — which is precisely what happens
+    when the host is down at the retry instant (one fire, owned by catch-up; see
+    ``test_retry_interrupted.py::test_a_retry_that_outlived_a_second_outage_is_handled_by_catch_up_not_twice``).
+    Neither reading allows two fires for the one retry row.
+    """
+    from cron.retry_interrupted import delay_seconds
+
+    parsed = jobs.parse_schedule(schedule)
+    grace = jobs._compute_grace_seconds(parsed, None)
+    assert grace > 0
+    for attempt in range(1, 7):  # past the 5-attempt ceiling on purpose: the cap must hold
+        delay = delay_seconds({"schedule": parsed}, attempt)
+        assert delay <= grace
+        for lateness in (0.0, 1.0, grace - 1.0, float(grace)):
+            assert jobs._classify_dispatch_lateness(lateness, grace) != "catch_up"
+    # Control: one second past grace IS the catch-up branch, which only the natural schedule
+    # can reach (an outage, not a retry).
+    assert jobs._classify_dispatch_lateness(grace + 1, grace) == "catch_up"

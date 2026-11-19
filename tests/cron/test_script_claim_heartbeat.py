@@ -469,7 +469,10 @@ def test_self_removed_job_crash_skips_mark_job_run(tmp_path, monkeypatch):
     marked.assert_not_called()
     finished.assert_called_once_with(
         "self-removal-crash-execution", success=False,
-        error="boom after self-removal", delivery_outcome="delivered")
+        error="boom after self-removal", delivery_outcome="delivered",
+        # A RuntimeError is a contained failure, not an interruption: no outcome class and no
+        # retry intent (the job-caused failures are never retried).
+        outcome_class=None, retry_intent=None)
 
 
 def test_self_removal_followed_by_replacement_record_stays_fail_closed(tmp_path, monkeypatch):

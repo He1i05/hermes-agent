@@ -15,7 +15,10 @@ injected into the prompt; `no_agent=True` makes the script the whole job; always
 A's last output into job B's prompt), `workdir` (run with that directory's `AGENTS.md`/`CLAUDE.md`
 loaded), `timezone` (pin the cron expression's wall clock to an IANA zone; absent = the profile's
 zone), `grace_minutes` (override the catch-up window; `0` = never catch up, cron only),
-multi-platform delivery.
+`retry` (per-job policy for attempts KILLED through no fault of the job:
+`{max_attempts 0-5, backoff_seconds 0-3600, max_backoff_seconds 0-21600}`, defaults
+`1/60/1800`; `max_attempts: 0` opts a job with non-idempotent side effects out), multi-platform
+delivery.
 
 Hardening invariants — each guards a real failure; don't weaken without answering for it:
 - **Inactivity watchdog** on cron agent sessions (`_cron_inactivity_seconds()`): default 600s idle,
@@ -40,6 +43,24 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   finds the stamp with a dead owner restores the instant ONCE (`cron/occurrences.py`), the
   executions ledger's `scheduled_instant` blocks a second fire, `cron.catch_up_missed: false`
   skips past-grace misses with a logged reason. Never drop a slot silently (#107485).
+- **A killed attempt is retried at most once per attempt, never resurrected.** The ledger stays
+  the evidence base (`attempt`/`retry_of`/`outcome_class`/`retry_pending`), the job store says
+  how much (`retry`), and the retry is a *schedule amendment* fired by the one due scan
+  (`cron/retry_interrupted.py`) — never a second dispatch path, so at-most-once, dedupe and
+  ownership fencing hold unchanged. Two invariants keep it from becoming a storm or a double
+  fire: the delay is capped at the job's own grace window (a planned retry can only classify
+  `on_time`/`late`, never `catch_up`, so it cannot race the catch-up path) and rule R1 refuses
+  any retry whose natural occurrence fires at or before it. `owner_wedged` is never retried — a
+  live `no_agent` script run is reclaimed that way today, so a retry there is a real second
+  concurrent execution.
+- **The dead-owner sweep demands positive proof, and never judges a claim younger than itself.**
+  S2: a row from another machine's pid namespace is undecidable, never dead. S3: death is
+  pid-absence, a RECORDED fingerprint mismatch, or a boot change on the same machine — a
+  fingerprint that could not be read at claim time is not proof. S1: a claim that postdates this
+  process's own start (monotonic clock, so a clock step changes nothing) is out of scope; the
+  one exemption is pid absence after a full reap interval, which is what keeps a crashed
+  `hermes cron run` row clearing without a gateway restart. S4's wedged bound still releases a
+  live-but-silent owner.
 - Per-home tick lock `<home>/cron/.tick.lock` prevents duplicate ticks across processes for
   that profile's store; never a `~/.hermes/...` literal.
 - **Headless ticks refuse, never spawn.** `hermes cron tick` (system crontab / external scheduler)

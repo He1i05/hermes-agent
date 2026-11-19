@@ -45,3 +45,43 @@ class TestIdleTickSkipsConfigLoad:
         rc, calls = _run_idle_tick(verbose=False)
         assert rc == 0
         assert calls["sweep"] == 1, "idle tick must still reap orphaned MCP children"
+
+    def test_idle_tick_with_no_retry_candidates_loads_no_config(self, monkeypatch, tmp_path):
+        """The interrupted-run retry planner runs on every tick: with no owed intent it must do
+        one indexed ledger query and NOT load config or the job store (#33612). Everything is
+        pointed at a tmpdir, so the live board and cron store are never touched.
+        """
+        import cron.executions as executions_mod
+        import cron.retry_interrupted as retry_mod
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+        monkeypatch.setattr(executions_mod, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
+        # Backstop sweep stays off the live ledger; the retry planner is the path under test.
+        monkeypatch.setattr(scheduler_mod, "_maybe_reap_dead_owners", lambda: None)
+        monkeypatch.setattr("cron.scheduler_tick._last_retry_plan_at", {})
+        monkeypatch.setattr("cron.scheduler_tick._RETRY_PLAN_INTERVAL_SECONDS", 0.0)
+        observed = {"retry_enabled": 0, "planner": 0}
+
+        def _retry_enabled(cfg=None):
+            observed["retry_enabled"] += 1
+            return True
+
+        real_plan = retry_mod.plan_pending_retries
+
+        def _counting_plan(limit=retry_mod.MAX_INTENTS_PER_PASS):
+            observed["planner"] += 1
+            return real_plan(limit)
+
+        monkeypatch.setattr(retry_mod, "retry_enabled", _retry_enabled)
+        monkeypatch.setattr(retry_mod, "plan_pending_retries", _counting_plan)
+
+        rc, calls = _run_idle_tick(verbose=False)
+
+        assert rc == 0
+        assert calls["sweep"] == 1, "the MCP orphan sweep must still run on an idle tick"
+        assert observed["planner"] == 1, "the retry planner must be consulted every tick"
+        assert observed["retry_enabled"] == 0, (
+            "no retry candidate means no config read — the planner must stop at the query")
+        assert calls["load_config"] == 0

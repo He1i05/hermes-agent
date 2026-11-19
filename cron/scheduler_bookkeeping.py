@@ -14,7 +14,12 @@ def fail_empty_response(d, final_response):
 
 
 def finish_interrupted_run(job, execution_id, delivery_error):
-    """Shutdown already advanced this run; update a failed notice without spending another fire."""
+    """Shutdown already advanced this run; update a failed notice without spending another fire.
+
+    The run was killed by the gateway's own shutdown — no fault of the job — so the terminal
+    write carries the ``interrupted`` outcome class and a decided retry intent: the occurrence is
+    re-run once after the restart instead of being lost (``cron/retry_interrupted.py``).
+    """
     from cron import scheduler
     logger = scheduler.logger
     if delivery_error:
@@ -23,8 +28,16 @@ def finish_interrupted_run(job, execution_id, delivery_error):
             update_job(job['id'], {'last_delivery_error': delivery_error})
         except Exception as exc:
             logger.debug('Failed recording delivery_error for interrupted job %s: %s', job['id'], exc, exc_info=True)
+    retry_intent = None
+    try:
+        from cron.retry_interrupted import retry_intent_for
+
+        retry_intent = retry_intent_for(job, execution_id=execution_id, outcome_class="interrupted")
+    except Exception as exc:  # best effort: a retry-planning bug must not block the terminal write
+        logger.debug('Retry planning skipped for interrupted job %s: %s', job['id'], exc)
     scheduler.finish_execution(execution_id, success=False,
-                               error='Interrupted by gateway shutdown before terminal completion.')
+                               error='Interrupted by gateway shutdown before terminal completion.',
+                               outcome_class="interrupted", retry_intent=retry_intent)
 
 
 def _classify_delivery_outcome(
@@ -69,8 +82,8 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
         # Never-reached-the-model failure: schedule the Cowork-style bounded re-run
         # (cron/unreachable_retry.py) inside the same fenced store write.
         mark_kwargs["model_unreachable"] = True
-    from cron.unreachable_retry import is_retry_run
-    if is_retry_run(job):
+    from cron.retry_interrupted import is_off_lattice_rerun
+    if is_off_lattice_rerun(job):
         # A re-run of an occurrence that already counted: must not spend another repeat slot.
         mark_kwargs["ladder_rung"] = True
     _hold_s = job.pop("_quota_hold_seconds", None)

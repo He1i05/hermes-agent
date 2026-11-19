@@ -24,6 +24,11 @@ def test_adopted_worker_failure_is_visible(tmp_path, monkeypatch, manual, death)
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(executions, "EXECUTIONS_FILE", home / "cron" / "executions.db")
+    # The crashed worker's claim is seconds old and was made after this gateway started; S1
+    # hands a postdating claim to a later sweep unless its owner pid is gone (which it is — the
+    # worker exited). Collapse the reap-interval floor so the race this test forces is
+    # deterministic; the ordering rule itself is covered by tests/cron/test_sweep_scoping.py.
+    monkeypatch.setattr(executions, "SWEEP_POSTDATING_MIN_AGE_SECONDS", 0.0)
     monkeypatch.setattr(scheduler, "load_config_readonly", dict)
     if death == "concurrent_recovery":
         terminalize = scheduler.terminalize_dead_owner
@@ -122,7 +127,13 @@ else:
         assert result["claim_released"], result
         assert "worker-probe-startup-sentinel" in (result["job_error"] or ""), result
         assert len(delivered) == 1, result
-        assert len(executions.list_executions()) <= executions.MAX_TERMINAL_EXECUTIONS
+        # Retention keeps the terminal history bounded — except a row that still OWES a retry
+        # (that intent is the only evidence the re-run is owed, cron/executions.py
+        # _prune_unlocked). So the bound applies on top of the rows carrying an owed intent.
+        rows = executions.list_executions()
+        owing = [r for r in rows if r["retry_pending"]]
+        assert all(r["status"] in {"unknown", "failed"} for r in owing), rows
+        assert len(rows) <= executions.MAX_TERMINAL_EXECUTIONS + len(owing)
         from cron.scheduler_worker_failure import record_unknown_worker_outcome
 
         # Re-observing an old terminal row cannot notify twice or erase a newer fire.

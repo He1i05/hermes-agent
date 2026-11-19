@@ -10,6 +10,8 @@ reading is still fail-safe.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 
 import cron.executions as executions_mod
@@ -25,12 +27,23 @@ def _ledger(monkeypatch, tmp_path):
 
 
 def _seed_external_running(monkeypatch, *, claimed_start_time: int) -> str:
-    """Running row owned by a foreign process, with the given claim-time fingerprint."""
+    """Running row owned by a foreign process, with the given claim-time fingerprint.
+
+    The claim is backdated: the dead-owner sweep never judges a claim that postdates its own
+    start (S1 in ``cron/executions.py``), and these cases are about the fingerprint rule for a
+    claim that predates the sweep.
+    """
     with monkeypatch.context() as m:
         m.setattr(executions_mod, "_PROCESS_ID", "ext-proc")
         m.setattr(executions_mod, "_process_start_time", lambda pid: claimed_start_time)
         record = executions_mod.create_execution("job-drift", source="cron")
         executions_mod.mark_execution_running(record["id"])
+    with executions_mod._transaction() as conn:
+        conn.execute(
+            "UPDATE executions SET claimed_at=?, claimed_boottime=? WHERE id=?",
+            ((executions_mod._hermes_now() - timedelta(seconds=600)).isoformat(),
+             (executions_mod._now_boottime() or 0.0) - 600.0, record["id"]),
+        )
     return record["id"]
 
 

@@ -166,6 +166,10 @@ def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
                 "success": False,
                 "error": "Gemini HTTP 503 (UNAVAILABLE)",
                 "delivery_outcome": "delivered",
+                # A job-caused failure (an HTTP error) is NOT an interruption: no outcome class
+                # and no retry intent — retrying a broken upstream six times a night is a bug.
+                "outcome_class": None,
+                "retry_intent": None,
             },
         )
     ]
@@ -365,6 +369,12 @@ def test_run_one_job_keyboard_interrupt_skips_delivery_and_reraises(monkeypatch)
                 "success": False,
                 "error": "KeyboardInterrupt",
                 "delivery_outcome": "suppressed",
+                # A kill, not a job failure: the class is recorded so the interrupted-run retry
+                # path can plan a re-run. The fake record carries no schedule, so the policy
+                # refuses (recurring jobs only) and no intent is decided here — the retry gate
+                # itself is covered by tests/cron/test_retry_interrupted.py.
+                "outcome_class": "interrupted",
+                "retry_intent": None,
             },
         )
     ]

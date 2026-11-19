@@ -1751,6 +1751,44 @@ def _normalize_catch_up(value: Any) -> Optional[bool]:
     raise ValueError("catch_up must be true, false, or null (use the default).")
 
 
+_RETRY_KEYS = frozenset({"max_attempts", "backoff_seconds", "max_backoff_seconds"})
+
+
+def _normalize_job_retry(value: Any) -> Optional[dict[str, int]]:
+    """Per-job retry policy for attempts killed through no fault of the job (see
+    ``cron/retry_interrupted.py``): ``{max_attempts, backoff_seconds, max_backoff_seconds}``.
+
+    Omitted sub-keys take their default, so ``{"max_attempts": 0}`` alone means "never retry this
+    job". ``max_attempts: 0`` is a real value (at-most-once for this job), so no
+    ``in {None, "", False}`` test may appear here — ``0 == False`` would silently clear it.
+    ``bool`` is rejected explicitly: Python's ``True`` is an ``int``.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(
+            "retry must be an object with max_attempts/backoff_seconds/max_backoff_seconds.")
+    unknown = set(value) - _RETRY_KEYS
+    if unknown:
+        raise ValueError(f"retry has unknown key(s): {', '.join(sorted(unknown))}.")
+
+    def _int(key: str, default: int, low: int, high: int, label: str) -> int:
+        raw = value.get(key, default)
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise ValueError(f"retry.{key} must be an integer ({label}).")
+        if raw < low or raw > high:
+            raise ValueError(f"retry.{key} must be between {low} and {high} ({label}).")
+        return raw
+
+    max_attempts = _int("max_attempts", 1, 0, 5, "0 = never retry this job, up to 5 re-runs")
+    backoff = _int("backoff_seconds", 60, 0, 3600, "first retry delay")
+    cap = _int("max_backoff_seconds", 1800, 0, 21600, "ceiling for the exponential backoff")
+    if cap < backoff:
+        raise ValueError("retry.max_backoff_seconds must be >= retry.backoff_seconds.")
+    return {"max_attempts": max_attempts, "backoff_seconds": backoff,
+            "max_backoff_seconds": cap}
+
+
 _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "model": _normalize_job_optional_text,
     "provider": _normalize_job_optional_text,
@@ -1767,6 +1805,7 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
+    "retry": _normalize_job_retry,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
@@ -1781,6 +1820,9 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
+    # ``None`` clears the policy back to the defaults; a partial dict fills its omitted keys
+    # from the defaults rather than merging with what is stored.
+    "retry": _normalize_job_retry,
 }
 
 
@@ -1829,6 +1871,7 @@ def create_job(
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[str] = None,
     catch_up: Optional[bool] = None,
+    retry: Optional[dict[str, int]] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
     pinned: bool = False,
@@ -1847,7 +1890,10 @@ def create_job(
     interpreter: absolute/``~`` Python for ``.py`` script/monitor_script, validated at run time
     (a venv can be rebuilt or moved after creation). timezone: IANA key pinning the schedule's
     wall clock (None/'' = inherit the profile zone). grace_minutes: catch-up window override
-    (0 = never catch up)."""
+    (0 = never catch up). retry: per-job policy for attempts killed through no fault of the job
+    (cron/retry_interrupted.py) — {max_attempts (0-5, default 1), backoff_seconds (0-3600,
+    default 60), max_backoff_seconds (>= backoff, <= 21600, default 1800)}; max_attempts 0 =
+    never retry this job, and None/absent leaves the defaults in force."""
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     if paused_reason is not None and not isinstance(paused_reason, str):
@@ -1938,7 +1984,7 @@ def create_job(
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]), ("interpreter", f["interpreter"]),
         ("timezone", f["timezone"]), ("grace_minutes", f["grace_minutes"]),
-        ("catch_up", f["catch_up"]),
+        ("catch_up", f["catch_up"]), ("retry", f["retry"]),
     ):
         if value is not None:
             job[key] = value
@@ -2540,6 +2586,7 @@ def mark_job_run(
         else:
             _advance_after_run(job, now, ladder_rung=ladder_rung)
         from cron import quota_hold
+        from cron.retry_interrupted import clear_state as clear_retry_interrupted
         from cron.unreachable_retry import clear_state, plan_retry
 
         if not success and model_unreachable and not is_terminal_job(job):
@@ -2547,6 +2594,9 @@ def mark_job_run(
         else:
             # Any run that reached the model (either outcome) resets the re-run ladder.
             clear_state(job)
+        # The parked interrupted-run retry is spent by this run (or invalidated by the schedule
+        # recompute above); its marker must not survive to authorize an unrelated fire.
+        clear_retry_interrupted(job)
         if not success and quota_hold_seconds and not is_terminal_job(job):
             quota_hold.plan_hold(job, quota_hold_seconds, recover_consumed_fire=recover_consumed_fire)
         else:
@@ -3082,8 +3132,13 @@ def _reanchor_stale_cron(d: _DueJob) -> bool:
     stale_class = _classify_stale_cron_next_run(d.schedule, d.raw_next_run_dt, d.next_run_dt)
     if stale_class == STALE_CRON_EXPR_EDIT:
         from cron.quota_hold import is_recovery_fire
+        from cron.retry_interrupted import is_retry_interrupted_fire
         from cron.unreachable_retry import is_retry_fire
-        if is_recovery_fire(d.job, d.next_run) or is_retry_fire(d.job, d.next_run):
+        if (
+            is_recovery_fire(d.job, d.next_run)
+            or is_retry_fire(d.job, d.next_run)
+            or is_retry_interrupted_fire(d.job, d.next_run)
+        ):
             logger.info(
                 "cron.off_lattice_fire job='%s' id=%s expr=%r at=%s",
                 d.label, d.job.get("id"), d.schedule.get("expr"), d.next_run)
