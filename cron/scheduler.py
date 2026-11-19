@@ -2566,6 +2566,11 @@ def run_job(
         from cron.scheduler_authority import run_canonical_job
         return run_canonical_job(job, extra_prompt=extra_prompt, cancel_event=cancel_event,
                                  execution_id=execution_id)
+    if execution_id and not job.get("execution_id"):
+        # The attempt id also travels on the job dict (as ``run_one_job`` sets it): the script
+        # path stamps ``progress_at`` on this row while the script runs, so the live-owner stale
+        # sweep measures silence rather than run length for a long ``no_agent`` job.
+        job = dict(job, execution_id=execution_id)
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 

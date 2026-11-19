@@ -1,5 +1,6 @@
 """Cron pre-run script execution: timeouts, Windows venv bootstrap, process-tree termination,
-and the claim-heartbeat thread that keeps a long script's run claim alive.
+the claim-heartbeat thread that keeps a long script's run claim alive, and the execution-ledger
+progress stamp that keeps a long script's live-owner stale bound measuring silence.
 
 Split out of ``cron.scheduler``. Import names from this module directly (``cron.scheduler`` only
 imports the few it calls itself). Origin-resident helpers and sibling split modules are reached
@@ -429,9 +430,31 @@ def _script_argv(
     return [python_exe, str(path)], env_overlay, None
 
 
+def _progress_stamp_interval() -> float:
+    """How often a running script stamps its execution row's ``progress_at`` — the same cadence
+    the agent path's ``ExecutionProgressStamper`` uses (``_RUN_CLAIM_HEARTBEAT_SECONDS``), read
+    late-bound from ``cron.scheduler`` to avoid an import cycle."""
+    try:
+        every = float(_sched._RUN_CLAIM_HEARTBEAT_SECONDS)
+    except Exception:
+        return 60.0
+    return every if every > 0 else 60.0
+
+
+def _stamp_execution_progress(progress_cb: Optional[Callable[[], None]]) -> None:
+    """One progress stamp; a ledger failure must never interrupt the script run."""
+    if progress_cb is None:
+        return
+    try:
+        progress_cb()
+    except Exception:
+        logger.debug("Cron script: execution progress stamp failed", exc_info=True)
+
+
 def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
+    progress_cb: Optional[Callable[[], None]] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -442,7 +465,8 @@ def _run_job_script(
     Absolute and ~-prefixed paths are also validated to ensure they stay within the scripts dir. workdir:
     Optional absolute path to use as the script's cwd. When set, the subprocess runs in this directory
     instead of the scripts-dir parent. See #69396. interpreter: the job's optional Python for
-    ``.py`` scripts (#8714).
+    ``.py`` scripts (#8714). progress_cb: called on the wait loop's cadence while the script is still
+    running, so the ledger's ``progress_at`` measures the supervisor's silence, not run length.
     """
     path, err = _resolve_script_path(script_path)
     if path is None:
@@ -489,6 +513,9 @@ def _run_job_script(
             argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             cwd=workdir or str(path.parent), env=env, **popen_kwargs)
         deadline = time.monotonic() + script_timeout
+        # Same shape as the agent path's run monitor: the loop that waits on the work is also the
+        # one that stamps progress, so a wedged supervisor (not a long script) goes silent.
+        next_progress_stamp = time.monotonic() + _progress_stamp_interval()
         while True:
             # Tree-kill on cancel AND timeout: killpg misses setsid grandchildren (watchdogs,
             # backgrounded shell jobs); kill_process_tree snapshots descendants BEFORE signalling.
@@ -512,6 +539,9 @@ def _run_job_script(
                 stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
                 break
             except subprocess.TimeoutExpired:
+                if time.monotonic() >= next_progress_stamp:
+                    next_progress_stamp = time.monotonic() + _progress_stamp_interval()
+                    _stamp_execution_progress(progress_cb)
                 continue
 
         stdout = (stdout_raw or "").strip()
@@ -552,6 +582,24 @@ def _start_heartbeat_thread(loop_fn, name: str, fail_log) -> Optional[threading.
     return thread
 
 
+def _execution_progress_stamp(execution_id: str, job_id: str) -> Optional[Callable[[], None]]:
+    """``progress_at`` stamp for the attempt the script is running, or None when the run has no
+    ledger row (a bare unit-test/legacy call). The row is owned by the process that runs the
+    script, so ``touch_execution_progress`` fences the write on pid/process_id there; a False
+    return only means the row moved on (already terminal or reclaimed)."""
+    if not execution_id:
+        return None
+
+    def _stamp() -> None:
+        from cron.executions import touch_execution_progress
+
+        if not touch_execution_progress(execution_id):
+            logger.debug(
+                "Job '%s': script progress stamp did not land (row no longer ours)", job_id)
+
+    return _stamp
+
+
 def _run_job_script_with_claim_heartbeat(
     job: dict, script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
@@ -559,10 +607,19 @@ def _run_job_script_with_claim_heartbeat(
     """Run a cron script while heartbeating its owned one-shot claim. A long script can outlive
     the stale-claim TTL; without a heartbeat another scheduler would re-dispatch the one-shot.
     Recurring/unclaimed runs have no durable claim → no thread. The owner is captured from the
-    dispatched job, never re-read, so a stale runner cannot extend a replacement owner's claim."""
+    dispatched job, never re-read, so a stale runner cannot extend a replacement owner's claim.
+
+    Every run also stamps ``progress_at`` on its execution row while the script keeps running
+    (recurring jobs included — they have no claim thread at all), so the live-owner stale sweep
+    measures silence since the last stamp instead of the row's age. Without it a healthy
+    multi-hour ``no_agent`` job was reclaimed as ``owner_wedged`` mid-run.
+    """
+    progress_cb = _execution_progress_stamp(
+        str(job.get("execution_id") or ""), str(job.get("id") or ""))
+
     def run() -> tuple[bool, str]:
         return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
-                               interpreter=job.get("interpreter"))
+                               interpreter=job.get("interpreter"), progress_cb=progress_cb)
 
     schedule = job.get("schedule")
     claim = job.get("run_claim")
