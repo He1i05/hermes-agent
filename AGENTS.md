@@ -143,6 +143,12 @@ per variant and a name → variant table (`tools/environments/`, its table still
 - **A new config key or slash command ships with its docs** (`tests/ci/test_docs_drift.py`).
 - **Commits and PRs:** rebase onto `main` before merging (a squash from a stale branch silently
   reverts newer fixes); 1–2 invariant tests per fix, proven red on the base.
+- **Repo work happens in a worktree, never in the installed checkout.** The checkout systemd runs is
+  what every newly spawned worker, `hermes` CLI call and no-agent cron script imports from disk, so a
+  branch in it is a live deploy of unreviewed code. Branch a worktree off the newest `carry/*` lane — a
+  lane, never a frozen SHA. Preflight before the first edit and again when done:
+  `rev-parse --abbrev-ref HEAD` names the carry lane and `status --porcelain` is empty; if either fails,
+  stop and report — never stash or revert another worker's files.
 - **Tests:** always `scripts/run_tests.sh`, never bare `pytest`; behaviour contracts, never
   change-detectors or source-reading tests; host-specific behaviour is tested on that host with
   `@pytest.mark.platforms(...)`, never by faking `sys.platform`; tests never write to `~/.hermes/`.
