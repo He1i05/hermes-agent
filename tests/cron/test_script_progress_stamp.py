@@ -191,14 +191,19 @@ def test_silent_no_agent_script_run_is_still_reclaimed_at_the_bound(ledger):
     bound = executions_mod._live_owner_stale_after_seconds()
     execution_id = executions_mod.create_execution("silent-script-job", source="cron")["id"]
     # Same live pid, but a foreign process_id — exactly how a sweeper sees another worker's row.
+    # BOTH claim clocks are backdated: ``claimed_boottime`` is what S1 reads first (the boot clock
+    # survives a wall-clock step), so backdating only ``claimed_at`` left the row looking claimed
+    # by a process younger than this one and S1 rightly deferred it. This models the incident
+    # shape instead: a claim made by a process that predates the sweeper and went silent.
     with executions_mod._transaction() as conn:
         conn.execute(
             """UPDATE executions
                   SET status='running', process_id='wedged-worker', pid=?,
-                      process_started_at=?, claimed_at=?
+                      process_started_at=?, claimed_at=?, claimed_boottime=?
                 WHERE id=?""",
             (os.getpid(), executions_mod._process_start_time(os.getpid()),
-             (_hermes_now() - timedelta(seconds=bound + 600)).isoformat(), execution_id),
+             (_hermes_now() - timedelta(seconds=bound + 600)).isoformat(),
+             (executions_mod._now_boottime() or 0.0) - (bound + 600), execution_id),
         )
     assert _progress_at(execution_id) is None
 
